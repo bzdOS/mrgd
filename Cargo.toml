@@ -1,0 +1,81 @@
+[package]
+name = "mrgd"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "matrix-hs"
+path = "src/main.rs"
+
+[lib]
+name = "mrgd"
+path = "src/lib.rs"
+
+# the scope-separation record (kept private) §10: makes scope separation observable instead of merely
+# intended. required-features keeps it out of non-cluster builds entirely.
+[[bin]]
+name = "scope-canary"
+path = "src/bin/scope_canary.rs"
+required-features = ["cluster"]
+
+[dependencies]
+thiserror     = "1"
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+tokio         = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+axum          = "0.8"
+tower         = "0.5"
+tower-http    = { version = "0.6", features = ["trace"] }
+zenoh         = { version = "1", default-features = false, features = ["transport_tcp"], optional = true }
+sha2          = "0.10"
+base64        = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand          = "0.8"
+chacha20poly1305 = "0.10"
+
+# Scripting: DC++-hub-style Lua hooks (on_room_visible, on_message, ...)
+# `send` makes mlua types Send+Sync (AppState is held in an Arc across axum).
+# `vendored` builds Lua5.4 from source so no system liblua dev package is needed.
+mlua        = { version = "0.10", features = ["lua54", "vendored", "send"] }
+
+# Auth: password hashing + signed tokens
+argon2      = "0.5"
+hmac        = "0.12"
+sha1        = "0.10"
+image       = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+
+# Push Gateway API client (outbound POST to a pusher's data.url — see routes/push.rs).
+reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+axum-test   = "21"
+tokio       = { version = "1", features = ["test-util"] }
+
+[features]
+default  = []
+cluster  = ["dep:zenoh"]
+
+# ── DPI-resistant Zenoh transport (the scope-separation record (kept private) §5) ─────────────────────────
+# Zenoh 1.x has no runtime link-type registry: a new transport must be compiled
+# into the `zenoh-link` dispatcher. These two entries swap in the bsdOS fork that
+# routes the `obfs/` locator prefix to zenoh-link-obfs — ChaCha20-Poly1305 over
+# raw TCP with an X25519+PSK handshake and no TLS ClientHello, so a relay can
+# forward the bytes without being able to read them and a DPI box has no
+# handshake to fingerprint.
+#
+# Both entries are required together: zenoh-link-obfs depends on the patched
+# zenoh-link-commons by path, so without the second entry the tree would contain
+# two different `zenoh_link_commons` crates and fail to unify their types.
+#
+# Cost, stated plainly: this forks zenoh-link for EVERY build of this crate, not
+# just for deployments that use obfs. `[patch.crates-io]` is global and cannot be
+# feature-gated. The fork tracks =1.9.0 and must be re-based whenever zenoh is
+# upgraded.
+[patch.crates-io]
+# Vendored 2026-08-23 (were absolute host-local paths before): the
+# obfs transport is REQUIRED by any node that speaks an obfs/ locator, and a
+# build on any other machine (e.g. the Phase 4 laptop) must resolve these —
+# absolute paths made `cargo build` fail at dependency resolution anywhere
+# but Alpha. Keep the forks tracking zenoh =1.9.0 and re-base on upgrade.
+zenoh-link         = { path = "vendor/zenoh-link-patched" }
+zenoh-link-commons = { path = "vendor/zenoh-link-commons-patched" }

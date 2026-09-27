@@ -1,0 +1,6 @@
+[toolchain]
+# Verified-good toolchain for this project (see docs/SETUP.md).
+# rustup auto-installs this on first `cargo` invocation; on a plain rustc install
+# that does not match, this file is informational — install Rust >= 1.85 (edition 2021).
+channel = "1.96.0"
+components = ["rustfmt"]

@@ -1,0 +1,76 @@
+#
+# bsdOS — zenoh-link-obfs
+#
+# DPI-resistant Zenoh unicast transport (AEAD-framed over raw TCP).
+# Structurally modelled on zenoh-link-tls; rustls is replaced by an SS-AEAD style
+# stack built from audited crypto crates (no hand-rolled primitives).
+#
+# SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+#
+[package]
+name = "zenoh-link-obfs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+description = "bsdOS DPI-resistant AEAD link for Zenoh (internal crate)."
+license = "EPL-2.0 OR Apache-2.0"
+repository = "https://github.com/eclipse-zenoh/zenoh"
+# Keep the crate self-contained; no build script, no autodiscovery.
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+name = "zenoh_link_obfs"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { version = "0.1.89" }
+base64 = { version = "0.22" }
+tracing = { version = "0.1.41" }
+
+# --- Async runtime / sockets (same surface the TLS link uses) ---
+tokio = { version = "1.47.1", default-features = false, features = ["fs", "io-util", "net", "sync", "time"] }
+tokio-util = { version = "0.7.16", features = ["rt"] }
+
+# --- AEAD obfuscation stack (audited crates only; NO hand-rolled crypto) ---
+# REVIEW (BUILD GATE — UNVERIFIED): versions below are chosen for mutual
+# compatibility but the lockfile has NOT been resolved/compiled in this
+# environment (VM busy; crypto crates absent from the local cargo cache). The
+# gating check is `cargo build -p zenoh-link-obfs` (Makefile target `build-obfs`)
+# on a free machine. Confirm specifically that:
+#   - chacha20poly1305 0.10 -> aead 0.5, rand_core 0.6
+#   - x25519-dalek    2.0   -> rand_core 0.6
+#   - hkdf 0.12 / sha2 0.10 -> share digest 0.10
+#   - rand_core resolves to a SINGLE unified 0.6 (x25519-dalek 2 + chacha20poly1305
+#     0.10 RNG path) with the getrandom feature enabled (declared below), AND
+#   - all of the above co-resolve against the pinned zenoh-* =1.9.0 tree (the cache
+#     also holds 0.11.0 of some zenoh-* crates — make sure 1.9.0 is selected).
+# Until that build runs, this crate is NOT confirmed to compile.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+hkdf = { version = "0.12" }
+sha2 = { version = "0.10" }
+# OsRng for ephemeral key + scalar generation. getrandom backs OsRng.
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Elligator2 uniform-representative encoding for ephemeral X25519 pubkeys.
+# Replaces raw X25519 pubkeys on the wire with ~uniform 32-byte representatives
+# so passive DPI cannot distinguish the handshake prefix from random noise.
+# This is a temporary fork of curve25519-dalek pending upstream integration;
+# it will be yanked and replaced with the upstream API when merged.
+# REVIEW (BUILD GATE — UNVERIFIED): version 0.1.0-alpha.2 (latest as of 2024-07).
+# Confirm that this crate resolves cleanly against the pinned zenoh-* = 1.9.0
+# tree (it depends on curve25519-dalek which may conflict with x25519-dalek 2's
+# transitive dep on the same crate). Run `cargo build -p zenoh-link-obfs` to gate.
+curve25519-elligator2 = { version = "0.1.0-alpha.2", features = ["elligator2"] }
+
+# --- Zenoh internals (patched, path-pinned via workspace [patch.crates-io]) ---
+zenoh-config = { version = "=1.9.0" }
+zenoh-core = { version = "=1.9.0" }
+zenoh-link-commons = { version = "=1.9.0", path = "../zenoh-link-commons-patched" }
+zenoh-protocol = { version = "=1.9.0", default-features = false }
+zenoh-result = { version = "=1.9.0", default-features = false }
+zenoh-runtime = { version = "=1.9.0" }

@@ -1,0 +1,23 @@
+#!/bin/sh
+# Refuse to push material that names a private deployment. Install with:
+#   ln -s ../../scripts/hooks/pre-push .git/hooks/pre-push
+#
+# Two passes, because a leak and a secret leak through different cracks:
+#   * the secrets rules over the whole tracked tree — content that arrived in
+#     an earlier commit is just as published as content added in this one;
+#   * the fleet-identity rules over the UNPUBLISHED RANGE — the commit messages
+#     of origin/main..HEAD and the lines those commits add.  A branch name and a
+#     few commit messages once carried the operator's task numbers and his
+#     machines' names into a public remote with every file clean, so this pass
+#     exists.  It needs origin/main to be present: if it is not, the gate
+#     refuses (exit 2) instead of reporting a clean tree.
+# Before a FIRST push to a new remote also run `python3
+# scripts/check_no_private.py --history`, which is the case a range check cannot
+# cover.
+set -e
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "pre-push: python3 not found -- cannot run the private-deployment gate." >&2
+    echo "  Install python3, or bypass with --no-verify if you have checked by hand." >&2
+    exit 1
+fi
+exec python3 "$(git rev-parse --show-toplevel)/scripts/check_no_private.py"

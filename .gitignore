@@ -1,0 +1,21 @@
+/target/
+
+# Cargo.lock IS committed: this workspace produces a binary (matrix-hs),
+# so a reproducible build on any server requires the lockfile. (mrgd is a lib,
+# but the binary half of the workspace wins the convention.)
+#
+# Cargo.lock
+
+# Local editor / agent configuration (machine-specific, never transfer)
+/.claude/
+
+# Local runtime data & secrets (never commit — see .env.example for the template)
+.env
+*.env
+!/.env.example
+/Matrix_HS_DATA/
+
+# Forensic / working scratch docs (machine-specific paths, not for transfer)
+/matrix-hs/STATUS_*.md
+
+.hubd
