@@ -32,7 +32,9 @@ Two properties shape everything below:
 
 - **Zenoh pub/sub has no replay.** A subscriber that was not connected when a
   sample was published never sees it. This is why §7's query plane exists, why
-  key announcements repeat every 5 s, and why claims repeat every 5 ticks.
+  key announcements repeat every 5 s, and why claims repeat every 5 ticks **only
+  within a bounded AntiEntropyPolicy burst** (see §X — the 2026-09-23 fix limits
+  re-publish to 3 eligible ticks after last activity, then silence).
 - **Delivery is at-least-once and unordered.** Every payload here is therefore
   idempotent and order-independent. Receiving the same delta twice, or out of
   causal order, must converge to the same state; §8 is where that is made
@@ -511,7 +513,101 @@ makes the conflict invisible.
 
 Republished periodically, because there is no replay.
 
-## 10. Timeouts and bounds
+## 10a. E2EE envelope — per-scope ChaCha20-Poly1305 encryption
+
+Encrypted payloads are so that replicated CRDT data for one scope remains opaque
+to nodes not participating in that scope.
+
+### E2EE key derivation — `src/substrate/encrypted_crdt.rs:25:derive_scope_key`_
+`derive_scope_key(psk)` = `SHA256(PSK || "mrgd-scope-key")` → 32-byte key for
+ChaCha20-Poly1305.  Each scope gets its own key; cross-scope reads see only
+ciphertext.
+
+### `EncryptedCrdtSink` — `src/substrate/encrypted_crdt.rs:38:new`_
+Wraps a `CrdtSink` and encrypts/decrypts every payload with ChaCha20-Poly1305.
+`encrypt(plaintext)` generates a random 12-byte nonce, encrypts, and prepends the
+nonce to ciphertext for transport (`encrypted_crdt.rs:52-67`).  `decrypt`
+extracts the nonce (first 12 bytes) and decrypts (`encrypted_crdt.rs:70-80`).
+Different scope keys cannot decrypt each other's ciphertext
+(`encrypted_crdt.rs:150:different_scope_keys_cannot_decrypt`).
+
+### CrdtSink impl — `encrypted_crdt.rs:83:publish` / `drain`_
+`publish(key, bytes)` encrypts `bytes` then delegates to the inner sink
+(`encrypted_crdt.rs:84-87`).
+`drain(key)` pulls blobs from the inner sink and decrypts each (`encrypted_crdt.rs:89-96`).
+
+## 10b. Selective PublicationSink — cross-scope federation publication
+
+Selective sharing of CRDT data from one scope to another, by forwarding chosen
+keys from a source scope's CRDT sink to a target scope's CRDT sink.
+
+### `PublicationRule` — `src/substrate/publication.rs:17`_
+A rule defining which keys to publish from source to target scope.
+`source_pattern` supports `*` wildcard at end (`publication.rs:19-20`).
+`target_prefix` prepended when forwarding (`publication.rs:21-23`).
+`filter_contains` optional substring filter (`publication.rs:24-26`).
+`matches(key)` returns true when key starts with the pattern prefix or equals it
+(`publication.rs:30-33`).  `transform_key(key)` maps source key to target form
+(`publication.rs:47-61`).
+
+### `PublicationPolicy` — `src/substrate/publication.rs:65`_
+Ordered list of rules; first match wins (`publication.rs:67-69`).
+`match_rule(key)` finds the first matching rule (`publication.rs:82-84`).
+
+### `PublicationSink` — `src/substrate/publication.rs:90:CrtdSink impl`_
+`publish(key, bytes)`:
+1. Always publishes to the **inner** (source) sink first
+   (`publication.rs:125-127`).
+2. If a rule matches, transforms the key and forwards to the **target** sink
+   (`publication.rs:130-133`).
+3. `drain(key)` passes through only to the inner sink (`publication.rs:138-139`).
+
+### Presets — `src/substrate/publication.rs:144:presets`_
+- `publish_all(prefix)`: match `*`, forward with prefix
+- `publish_counters(target_prefix)`: match `counter/*`, forward with prefix
+- `publish_orset(prefix, target_prefix)`: match `{prefix}/*`, forward with prefix
+  (`publication.rs:148-172`).
+
+## 10c. Bounded AntiEntropyPolicy — quiescence fix (2026-09-23)
+
+The fix for the 2026-09-07..11 incident where ~200 claims/5s were
+re-published forever, costing 9.5 GB RSS.  The policy grants a **bounded burst**
+of eligible ticks after last observed activity, then goes silent.
+
+### Policy structure — `src/substrate/barrier_growset.rs:369:AntiEntropyPolicy`_
+`max_rounds: u32 = 3` (`barrier_growset.rs:337`), `rounds_left`, `last_own_hash`,
+`initialized: bool`, `known_peers: HashSet<String>` (`barrier_growset.rs:369-377`).
+
+### Burst granting rules — `barrier_growset.rs:397-429`_
+- `note_own(own_hash)`: if hash changes (new local claim), grant fresh burst:
+  `rounds_left = max_rounds` (`barrier_growset.rs:397-402`).
+- `note_remote(new_records, remote_node_ids)`: only genuinely new information
+  extends the burst.  A never-before-seen `node_id` (unknown peer) grants a burst
+  so late/restarted peers can converge.  **Duplicate echo** (including the Zenoh
+  self-echo of our own re-publish) does **not** extend the burst
+  (`barrier_growset.rs:411-420`).  This is what lets two nodes ping-pong into
+  silence instead of forever.
+- `should_republish()`: returns `rounds_left > 0` (`barrier_growset.rs:423`).
+- `did_republish()`: decrements `rounds_left` by 1 (`barrier_growset.rs:428`).
+
+### Tick cycle — `barrier_growset.rs:540:tick`_
+Every `REPUBLISH_EVERY_TICKS = 5` ticks: call `note_own` (own hash change),
+then `should_republish`.  If true, re-publish own claims and decrement
+`rounds_left`.  After each drain, call `note_remote` with newly seen records and
+node IDs (`barrier_growset.rs:577-580`).
+With unchanged state the burst runs out and this tick publishes **nothing at
+all**, guaranteeing quiescence rather than a forever flood
+(`barrier_growset.rs:545-550`).
+
+### Republish own claims — `barrier_growset.rs:593:republish_own_claims`_
+Re-publishes every `ClaimRecord` in the synced view belonging to this node
+(`barrier_growset.rs:593-618`).  Idempotent on the receiver side: dedup in
+`drain_and_reconcile` prevents duplicate conflict detection.
+
+The burst decays to exactly zero instead of flooding forever — the fix for the
+2026-09-07..11 incident.  Late-starting or restarted peers catch up via: (a) the
+initial burst at startup, and (b) a fresh burst triggered by any new activity
+own publish or remote records seen.
 
 Values from the reference implementation. An implementation may choose others;
 these are what the deployed mesh currently expects.
