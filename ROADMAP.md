@@ -84,6 +84,7 @@ rejection of the personal homeserver: it is what the homeserver is a window
 onto.
 
 ## Where we actually are: v1.0 (tagged 2026-08-21)
+> Note: the v1.0 tag was removed from the remote in the 2026-09-27 history rewrite; the heading above is historical.
 
 The honest read as of 2026-08-19 was 0.x — foundation real, code healthy, but
 not yet what its own thesis claimed. That gap is closed as of 2026-08-21: the
