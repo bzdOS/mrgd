@@ -30,7 +30,7 @@ Run each step and verify against the sources listed. Every command/unit/path mus
 
 **[agent]** — the agent documents the timing; the agent does not decide.
 
-**Reference:** `docs/WIRE.md:710 (§16)`, `src/substrate/barrier_growset.rs:337` (ANTI_ENTROPY_ROUNDS=3), `:328` (REPUBLISH_EVERY_TICKS=5). Worst-case convergence ≈14 min.
+**Reference:** `docs/WIRE.md:710 (§16)`, `src/substrate/barrier_growset.rs:337` (ANTI_ENTROPY_ROUNDS=3), `:328` (REPUBLISH_EVERY_TICKS=5).
 
 **Verification marker:** If the exact replay-timing data is not in the repo or the private incident record, mark `не удалось верифицировать из доступных источников` and list it in the report.
 
@@ -42,13 +42,13 @@ Run each step and verify against the sources listed. Every command/unit/path mus
 
 - **Option A — Startup catch-up via Zenoh queryables:** Per `ROADMAP.md` and `docs/WIRE.md`, the node uses wildcard queryables (`<prefix>/*/history`, `<prefix>/*/state`) to learn all rooms and state from live peers. `MATRIX_HS_CATCHUP_PEER_WAIT_MS` (default 3000 ms from `.env.example`) gives up if no peer appears; `MATRIX_HS_CATCHUP_KEY_WAIT_MS` (default 12000 ms from `.env.example`) waits for the peer's signing key. After the key lands, every PDU is verified against canonical bytes and the `event_id` content address. The node then converges in line with the GC watermark and power-level gate.
 
-- **Option B — Start without mesh peers.** The node starts in isolation; no room/membership convergence occurs until a peer appears and re-publishes. Scope-canary remains silent (no false claims), and retained/RSS bounds from the deployment card hold (the card records that retained events stay within O(1) per room; see `ROADMAP.md:296` ("Garbage collection / anti-entropy tombstones")).
+- **Option B — Start without mesh peers.** The node starts in isolation; no room/membership convergence occurs until a peer appears and re-publishes. Scope-canary remains silent (no false claims), and retained/RSS bounds hold per `ROADMAP.md:296` ("Garbage collection / anti-entropy tombstones"); the O(1)-per-room figure itself is **не удалось верифицировать из доступных источников** (recorded outside this repo), listed in report.
 
 **[agent]** — the agent documents the start-order and convergence procedure; the agent does not decide whether to start.
 
 **[owner]** — the owner owns the decision to start the node in a given environment; the owner accepts the convergence risk.
 
-**Reference:** `ROADMAP.md:195` (Phase 1), `docs/WIRE.md:24` (§1), `docs/WIRE.md:253` (§6), `.env.example:161-162` (catchup variables), `ROADMAP.md:296` ("Garbage collection / anti-entropy tombstones").
+**Reference:** `ROADMAP.md:195` (Phase 1), `docs/WIRE.md:24` (§1), `docs/WIRE.md:253` (§6), `.env.example:162-163` (catchup variables), `ROADMAP.md:296` ("Garbage collection / anti-entropy tombstones").
 
 **Verification marker:** If the exact catch-up procedure or scope-canary behavior is not documented in the repo, mark `не удалось верифицировать из доступных источников` and list it in the report.
 
@@ -74,7 +74,7 @@ Every decision point (items 2, 3 & 4) presents exactly two options with conseque
 - Zero genericity in step content — every claim carries a path:line from the repo, or is marked `не удалось верифицировать из доступных источников` and listed in the report.
 - Three decision points are present: **third-node cluster mode**, restart timing, start order/convergence.
 - No service-automation mechanism is described (the button is a marker only).
-- Numbers referenced are from `.env.example`, `ROADMAP.md`, or the hub card — nothing from external restart/SSH actions.
+- Numbers referenced are from this repo (`.env.example`, `ROADMAP.md`, `README.md`) — nothing from external systems, restarts, or SSH actions.
 - Privacy gates: both grep checks for prohibited patterns are empty.
 - No binaries included.
 

@@ -520,7 +520,7 @@ these are what the deployed mesh currently expects.
 
 | Parameter | Value | Configurable as |
 |---|---|---|
-| Catch-up GET and per-reply budget | 2 s | — (start-up wait is a separate knob: `MATRIX_HS_CATCHUP_PEER_WAIT_MS`, `.env.example:161`) |
+| Catch-up GET and per-reply budget | 2 s | — (start-up wait is a separate knob: `MATRIX_HS_CATCHUP_PEER_WAIT_MS`, `.env.example:162`) |
 | Startup wait for a peer | 3 s (`0` disables) | `MATRIX_HS_CATCHUP_PEER_WAIT_MS` |
 | Startup wait for a peer's signing key | 12 s | `MATRIX_HS_CATCHUP_KEY_WAIT_MS` |
 | Periodic re-query | 300 s (`0` disables) | `MATRIX_HS_CATCHUP_INTERVAL_SECS` |
