@@ -14,8 +14,8 @@
 
 ### a. Register tenant-MXID via AS bearer (UIA‑bypass, unusable password)
 
-- **Route:** `POST /register` with AS bearer token
-- **Anchor:** `as_register_no_uia` test case (`src/as_socket_test.rs:56-62`)
+- **Route:** `POST /_matrix/client/v3/register` with AS bearer token (test :48)
+- **Anchor:** `as_register_no_uia` test case (`src/as_socket_test.rs:64`)
 - **Flow:**
   1. Client sends `POST /register` with `Authorization: Bearer <AS_TOKEN>` and desired `@tenant:domain`
   2. Server creates tenant account with unusable password (random hash), returns access_token
@@ -24,19 +24,18 @@
 
 ### b. Login type=m.login.application_service → passwordless per-device session
 
-- **Route:** `POST /login type=m.login.application_service`
-- **Anchor:** `as_login_passwordless_per_device` test case (`src/as_socket_test.rs:130-138`)
+- **Route:** `POST /_matrix/client/v3/login` with AS token (test :149)
+- **Anchor:** `as_login_passwordless_per_device` test case (`src/as_socket_test.rs:140`)
 - **Flow:**
   1. Client sends login with AS token and a `device_id` (worker identifier)
   2. Server mints a passwordless session; the device is registered under the tenant
-  3. Each session carries its own device; other participants get `device_lists.changed`
 - **Result:** Worker logs in as a device of the tenant MXID; no password ever used
 
 ### c. Sync / send
 
-- **Real endpoint:** standard Matrix sync endpoint `GET /_matrix/client/sync` (with appropriate since/timeout)
+- **Route:** `GET /_matrix/client/v3/sync` (from `src/routes/sync.rs:3`, test end-to-end with steps a+b)
 - **After steps a+b:** the agent/device is registered and can sync room state, send PDUs
-- **Anchor:** verified by `as_socket_test.rs` flow end-to-end; no additional route needed beyond standard Matrix sync
+- **Anchor:** verified by `as_socket_test.rs` flow end-to-end; uses the standard Matrix v3 sync path
 
 ## Negative cases (what is rejected)
 
