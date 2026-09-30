@@ -14,11 +14,35 @@
 // The line is CSV, one row per sample:
 //   epoch_s,seq,trigger,allocated,resident,mapped,retained,
 //   arenas,dirty_purged,dirty_npurge,muzzy_purged,muzzy_npurge,
-//   dirty_decay_ms,muzzy_decay_ms
+//   dirty_decay_ms,muzzy_decay_ms,metadata,active,dirty
 // allocated/resident/mapped/retained are bytes, from the four top-level stats
 // mallctls. The rest is per-arena, summed over the arenas that answer. trigger
 // is "start" for the row written at install time and "usr2" afterwards, so a
 // row can always be placed.
+//
+// THE LAST THREE COLUMNS, and why they are empty-able. metadata and active are
+// the top-level stats mallctls of the same names; on this node both answer and
+// both are BYTES, measured rather than assumed: a probe on this host read
+// allocated 28672, active 32768, resident 7942144, mapped 8421376,
+// metadata 7931888, which only orders correctly if active and metadata are
+// bytes (active as pages would be 128 MiB against an 7.9 MiB resident, which is
+// impossible). dirty is read as a top-level name on purpose even though this
+// build does not have it -- the same probe returned ENOENT for stats.dirty, for
+// stats.arenas.0.dirty and for stats.arenas.0.ndirty, while
+// stats.arenas.0.pdirty does answer and is in PAGES. So the dirty cell is EMPTY
+// here, never 0: a name this build lacks must not be indistinguishable from a
+// real zero, which is the whole reason the per-arena walk above tolerates ENOENT.
+// What the three columns are FOR: window #6 left a structural floor of roughly
+// 0.9 MiB (mapped minus allocated, on a fresh room, with no replay) and spikes
+// whose epochs are not periodic, and neither fact can be attributed to a part of
+// the allocator from the four totals alone. metadata is what the allocator holds
+// for its own bookkeeping, active is the extent set it is actively using, and
+// dirty would be the pages awaiting decay -- the three candidates for a floor
+// that does not shrink with the live set.
+//
+// These three are appended at the END, so columns 1-14 keep the positions they
+// have in every row already recorded in the field; an older series file still
+// lines up with a newer reader for those columns.
 //
 // THE COUNTER THAT IS MISSING, and it matters. "How many dirty pages is the
 // allocator holding right now" is what a decay change is supposed to move, and
@@ -114,6 +138,17 @@ fn required(name: &str) -> u64 {
     size_stat(name).unwrap_or_else(|| panic!("mallctl {name} is required by memprobe but unavailable"))
 }
 
+/// One CSV field for a counter that this build may not have: the number, or an
+/// EMPTY field when the name is absent. Empty and 0 are different facts — a
+/// missing counter is missing, and writing 0 for it would put a number in the
+/// data that no allocation ever produced.
+fn opt_field(v: Option<u64>) -> String {
+    match v {
+        Some(n) => n.to_string(),
+        None => String::new(),
+    }
+}
+
 extern "C" fn on_sigusr2(_sig: i32) {
     // The only thing that happens in signal context.
     TRIGGERED.store(true, Ordering::SeqCst);
@@ -150,6 +185,14 @@ fn sample(trigger: &str) {
         muzzy_decay_ms = size_stat(&format!("stats.arenas.{i}.muzzy_decay_ms")).unwrap_or(muzzy_decay_ms);
     }
 
+    // The three top-level totals the four above cannot break down. Read through
+    // size_stat (not `required`): each is a name this build may not carry, and
+    // an absent one must reach the row as an empty cell rather than a zero or a
+    // panic on a probe whose whole purpose is to keep running.
+    let metadata = size_stat("stats.metadata");
+    let active = size_stat("stats.active");
+    let dirty = size_stat("stats.dirty");
+
     let epoch_s = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -157,7 +200,11 @@ fn sample(trigger: &str) {
     let seq = SEQ.fetch_add(1, Ordering::SeqCst);
     let line = format!(
         "{epoch_s},{seq},{trigger},{allocated},{resident},{mapped},{retained},\
-{arenas},{dirty_purged},{dirty_npurge},{muzzy_purged},{muzzy_npurge},{dirty_decay_ms},{muzzy_decay_ms}\n"
+{arenas},{dirty_purged},{dirty_npurge},{muzzy_purged},{muzzy_npurge},{dirty_decay_ms},{muzzy_decay_ms},\
+{},{},{}\n",
+        opt_field(metadata),
+        opt_field(active),
+        opt_field(dirty),
     );
     if let Ok(mut f) = log.lock() {
         let _ = f.write_all(line.as_bytes());
