@@ -77,6 +77,7 @@ use std::{net::SocketAddr, path::PathBuf};
 #[cfg(feature = "cluster")]
 use std::{sync::Arc, time::Duration};
 
+#[cfg(target_os = "freebsd")]
 mod memprobe;
 
 #[tokio::main]
@@ -84,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Allocator statistics on SIGUSR2, when MATRIX_HS_MEMPROBE_LOG is set.
     // Inert otherwise — see src/memprobe.rs. Installed before anything is
     // built or served so the first sample is the startup baseline.
+    #[cfg(target_os = "freebsd")]
     memprobe::install();
 
     let listen: SocketAddr = std::env::var("MATRIX_HS_LISTEN")
