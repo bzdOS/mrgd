@@ -27,6 +27,7 @@ axum          = "0.8"
 tower         = "0.5"
 tower-http    = { version = "0.6", features = ["trace"] }
 zenoh         = { version = "1", default-features = false, features = ["transport_tcp"], optional = true }
+libc          = "0.2"
 sha2          = "0.10"
 base64        = "0.22"
 ed25519-dalek = { version = "2", features = ["rand_core"] }

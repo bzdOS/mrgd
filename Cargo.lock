@@ -1703,6 +1703,7 @@ dependencies = [
  "ed25519-dalek",
  "hmac",
  "image",
+ "libc",
  "mlua",
  "rand 0.8.6",
  "reqwest",
