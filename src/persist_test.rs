@@ -1458,6 +1458,93 @@ mod persist_tests {
         let _ = std::fs::remove_dir_all(&data_dir);
         Ok(())
     }
+
+    // test:persist:every_constructor_honours_the_retention_caps:start
+    //   purpose: Regression test for the constructor that silently removed the
+    //            retention caps. AppState::with_server_name hardcoded
+    //            timeline_max_events and roomlog_max_events to 0 -- 0 means
+    //            UNLIMITED -- so a deployment built through that path ran with no
+    //            bound at all, and nothing in the running process said so: the
+    //            only evidence was a line of source. The cap is the whole
+    //            protection between a long-lived node and unbounded growth, and a
+    //            protection that a constructor can switch off by being called is
+    //            not one.
+    //            Two claims, one per way the caps are supposed to arrive:
+    //              1. passed explicitly, they land on the state AND the timeline
+    //                 cap actually trims (plumbing, not just a stored field);
+    //              2. left to the environment, with_server_name reads them
+    //                 instead of overriding them.
+    //            The value in (2) is deliberately enormous rather than small:
+    //            environment variables are process-global and libtest runs tests
+    //            in parallel threads, so any other test that reads these two
+    //            variables while this one holds them set would see a cap of
+    //            100_000. A cap that large trims nothing, so a leak of the
+    //            setting can only make another test behave like the default
+    //            (unlimited) -- it cannot make one fail by truncating. A small
+    //            value would have been the opposite: harmless here, dangerous to
+    //            a neighbour. Both variables are removed again before returning.
+    //   input:  none (no filesystem; environment variables set and restored)
+    //   output: all assertions pass
+    //   sideEffects: sets and then removes MATRIX_HS_TIMELINE_MAX_EVENTS and
+    //                MATRIX_HS_ROOMLOG_MAX_EVENTS
+    // test:persist:every_constructor_honours_the_retention_caps:end
+    #[test]
+    fn every_constructor_honours_the_retention_caps() {
+        use serde_json::json;
+
+        // ── 1. explicit caps, and the timeline cap really trims ──────────────
+        let state = AppState::with_server_name_and_caps("localhost".to_string(), 1, 5);
+        assert_eq!(
+            state.timeline_max_events, 1,
+            "an explicitly passed timeline cap must reach the state"
+        );
+        assert_eq!(
+            state.roomlog_max_events, 5,
+            "an explicitly passed roomlog cap must reach the state"
+        );
+        for i in 0..3 {
+            state.append_room_timeline(
+                "!cap_probe:localhost",
+                json!({ "type": "m.room.message", "body": format!("cap-{i}") }),
+            );
+        }
+        {
+            let rt = state.room_timeline.lock().expect("room_timeline lock");
+            let live = rt.get("!cap_probe:localhost").map_or(0, |v| v.len());
+            assert_eq!(
+                live, 1,
+                "with timeline_max_events=1 the timeline must hold one entry, not {live} -- \
+                 a cap that is stored but not consulted is the same defect as no cap"
+            );
+        }
+
+        // ── 2. caps left to the environment ──────────────────────────────────
+        const HUGE: &str = "100000";
+        std::env::set_var("MATRIX_HS_TIMELINE_MAX_EVENTS", HUGE);
+        std::env::set_var("MATRIX_HS_ROOMLOG_MAX_EVENTS", HUGE);
+        let from_env = AppState::with_server_name("localhost".to_string());
+        std::env::remove_var("MATRIX_HS_TIMELINE_MAX_EVENTS");
+        std::env::remove_var("MATRIX_HS_ROOMLOG_MAX_EVENTS");
+
+        assert_eq!(
+            from_env.timeline_max_events, 100_000,
+            "with_server_name must read MATRIX_HS_TIMELINE_MAX_EVENTS, not hardcode 0 \
+             (0 means unlimited: a node configured with a cap would run without one)"
+        );
+        assert_eq!(
+            from_env.roomlog_max_events, 100_000,
+            "with_server_name must read MATRIX_HS_ROOMLOG_MAX_EVENTS, not hardcode 0"
+        );
+
+        // ── 3. unset means unlimited, and that is still the default ──────────
+        let defaults = AppState::with_server_name("localhost".to_string());
+        assert_eq!(
+            (defaults.timeline_max_events, defaults.roomlog_max_events),
+            (0, 0),
+            "with the variables unset both caps must be 0 (unlimited) -- the fix must not \
+             invent a bound that the operator did not ask for"
+        );
+    }
 }
 
     // doc_markers_balanced:start

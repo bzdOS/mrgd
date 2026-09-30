@@ -1507,11 +1507,10 @@ pub struct AppState {
 // timeline_max_events_from_env:start
 //   purpose: Read the Phase 1 GC retention cap from MATRIX_HS_TIMELINE_MAX_EVENTS.
 //            0 (the default when unset/unparseable) means unlimited, preserving the
-//            original append-only behaviour. Shared by every constructor that reads
-//            environment config (Default::default, with_data_dir, with_cluster) so
-//            the cap actually takes effect in the persistence-enabled and cluster
-//            configurations where it matters — with_server_name intentionally
-//            bypasses this, same as its other env lookups (test isolation).
+//            original append-only behaviour. Shared by EVERY constructor, including
+//            with_server_name: a constructor that hardcoded 0 here would silently
+//            remove the only bound there is between a deployment and unbounded
+//            growth, and the bound is invisible in the process once it is gone.
 //   input:  none
 //   output: usize
 //   sideEffects: reads an environment variable
@@ -1603,13 +1602,43 @@ impl AppState {
     }
 
     // AppState::with_server_name:start
-    //   purpose: Construct an AppState with an explicit server_name (for tests).
-    //            Bypasses environment variable lookup; persistence disabled (no data_dir).
+    //   purpose: Construct an AppState with an explicit server_name.
+    //            Reads the two retention caps from the environment, like every other
+    //            constructor; see with_server_name_and_caps to pass them explicitly.
     //   input:  name — server name string (e.g. "localhost")
     //   output: Arc<AppState>
-    //   sideEffects: none
+    //   sideEffects: reads the two cap environment variables
     // AppState::with_server_name:end
     pub fn with_server_name(name: String) -> Arc<Self> {
+        Self::with_server_name_and_caps(
+            name,
+            timeline_max_events_from_env(),
+            roomlog_max_events_from_env(),
+        )
+    }
+
+    // AppState::with_server_name_and_caps:start
+    //   purpose: Construct an AppState with an explicit server_name AND explicit
+    //            retention caps. This is the constructor with_server_name delegates
+    //            to, and the one a test should call when it wants a specific cap
+    //            without touching the process environment: environment variables
+    //            are process-global, so a test that sets one to pin a cap also
+    //            changes it for every other test running in parallel.
+    //            Passing the caps in is also the reason with_server_name can read
+    //            them from the environment without creating a hidden dependency:
+    //            the values have exactly one place they enter the state.
+    //   input:  name — server name string
+    //            timeline_max_events — retention cap for the per-room timeline
+    //                                    (0 = unlimited)
+    //            roomlog_max_events — GC cap for the RoomLog CRDT set (0 = unlimited)
+    //   output: Arc<AppState>
+    //   sideEffects: none
+    // AppState::with_server_name_and_caps:end
+    pub fn with_server_name_and_caps(
+        name: String,
+        timeline_max_events: usize,
+        roomlog_max_events: usize,
+    ) -> Arc<Self> {
         let token_secret = crate::auth::TokenSecret::global().bytes().to_vec();
         let (signer, key_store) = build_signer(&name, None);
         Arc::new(AppState {
@@ -1646,8 +1675,8 @@ impl AppState {
             push: PushState::default(),
             account_data: AccountData::default(),
             scripting: crate::scripting::Scripting::default(),
-            timeline_max_events: 0,
-            roomlog_max_events: 0,
+            timeline_max_events,
+            roomlog_max_events,
         })
     }
 
