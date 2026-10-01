@@ -180,7 +180,23 @@ cleanup() {
 }
 # INT/TERM as well as EXIT: a walkthrough interrupted at the prompt should not
 # leave a response-body temp dir behind.
-trap cleanup EXIT INT TERM
+#
+# But a cleanup handler alone is not an interrupt. `trap cleanup EXIT INT TERM`
+# ran the handler and then carried on into the next step, so an aborted run went
+# on to fail on whatever it touched next and exited 1 blaming that — measured on a
+# request to an unroutable address: SIGTERM at 3 s, the handler never even got to
+# run until curl gave up at the 25 s timeout, and the run ended "FAILED (exit 1):
+# register: transport error", which is exactly what a genuine network fault looks
+# like. The signal traps now END the script with the signal's own status, so an
+# abort is distinguishable from a fault by the exit code alone.
+#
+# What this does NOT do: interrupt the request already in flight. The handler runs
+# only once the foreground command returns, so the wait is still bounded by
+# HTTP_TIMEOUT. Killing the curl child would need its PID, which `$(curl ...)`
+# does not expose. Flagged, not silently half-done.
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 # Replace any known secret with $MASK_LABEL so a DRY_RUN transcript — and an
 # ordinary run's log — is safe to paste. REVEAL_TOKENS=1 opts out.
