@@ -1,0 +1,19 @@
+[Unit]
+Description=hubd queue replication daemon (Zenoh CLIENT to local hubd-queue-router)
+After=network-online.target hubd-queue-router.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Client topology: connect to the local router (127.0.0.1:7449). The router brokers
+# pub/sub between nodes; the only internet-crossing zenoh link rides the offsite ssh -L
+# tunnel (see hubd-queue-tunnel.service on the NATed node). No plaintext zenoh on wire.
+Environment=HUBD_QUEUE_MODE=client
+Environment=HUBD_QUEUE_ZENOH_CONNECT=tcp/127.0.0.1:7449
+EnvironmentFile=-/root/hubd-queue-repl.env
+ExecStart=/root/bin/hubd-queue-repl
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

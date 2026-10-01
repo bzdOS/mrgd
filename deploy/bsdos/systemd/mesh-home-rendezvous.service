@@ -1,0 +1,21 @@
+[Unit]
+Description=Phase 4 rendezvous - TCP forward to offsite's home-scope obfs listener
+After=network-online.target
+Wants=network-online.target
+# SCOPES.md 7: build-host is RENDEZVOUS, never participant. This forward carries
+# obfs-encrypted bytes it cannot read: the PSK lives on offsite and the laptop
+# only, never on this host. Topology note: SCOPES Phase 4 originally sketched
+# socat to 192.0.2.2, which is behind NAT and unreachable from here — the
+# working path is ssh -L through offsite's own reverse tunnel (Host offsite =
+# 127.0.0.1:19288). offsite binds its obfs listener on 127.0.0.1:7450, so the
+# forward is the ONLY way in and the LAN sees nothing either.
+# Inert until offsite activates the listener (connections fail, unit stays up).
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -L 0.0.0.0:18453:127.0.0.1:7450 -o BatchMode=yes -o ConnectTimeout=10 -o ExitOnForwardFailure=yes -o ServerAliveInterval=25 -o ServerAliveCountMax=3 offsite
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,61 @@
+[package]
+name        = "couplingd"
+version     = "0.1.0"
+edition     = "2021"
+description = "bsdOS coupling-store daemon — session/lease, distributed lock, KV/CAS, queue, service-registry (SPEC_coupling_v1 §3)"
+
+[[bin]]
+name = "couplingd"
+path = "src/main.rs"
+
+[lib]
+name = "couplingd"
+path = "src/lib.rs"
+
+[dependencies]
+tokio       = { workspace = true }
+thiserror   = { workspace = true }
+libc        = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+# zenoh is only needed for the multi-node cluster phase (raft/gossip). M1 is in-mem
+# single-node and does not reference zenoh, so it is gated behind the `cluster`
+# feature: the default build skips the large zenoh dependency graph (keeps the
+# FreeBSD dev-VM build light — the full graph OOM-kills rustc on limited RAM).
+zenoh     = { workspace = true, optional = true }
+
+[features]
+default = []
+cluster = ["dep:zenoh"]
+
+# ── Self-contained workspace ────────────────────────────────────────────────
+# The mrgd root has no [workspace] (this crate was lifted from the bzdOS
+# monorepo, where it was a workspace member), so `workspace = true` above had
+# nothing to resolve and cargo stopped with "failed to find a workspace root".
+# Declaring a minimal workspace here makes this crate build on its own. Versions
+# and features are copied verbatim from the bzdOS monorepo root [workspace.dependencies]
+# (github.com/bzdOS/bzdOS @ b5d939e) so the code compiles against the same
+# dependency set it was written for. Deliberately NOT folded into the mrgd
+# workspace: the fleet decided these stay standalone.
+[workspace]
+
+[workspace.dependencies]
+tokio       = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+zenoh       = { version = "=1.9.0", default-features = false, features = ["transport_tcp", "transport_tls", "transport_ws"] }
+libc        = "0.2"
+thiserror   = "1"
+
+# ── zenoh on FreeBSD ────────────────────────────────────────────────────────
+# zenoh-util defines set_bind_to_device_tcp_socket only for linux/android and
+# macos/ios/windows, while zenoh-link-commons/src/tcp.rs calls it
+# unconditionally — so on FreeBSD any build with the TCP transport dies with
+# E0425. bsdOS publishes a patched zenoh 1.9.0; patch the four crates the TCP
+# path pulls in, verbatim from the bzdOS monorepo root @ b5d939e. The obfs
+# forks are deliberately NOT pulled in here: that is matrix-hs's business.
+[patch.crates-io]
+zenoh-util         = { git = "https://github.com/bzdOS/zenoh-freebsd" }
+zenoh-link-commons = { git = "https://github.com/bzdOS/zenoh-freebsd" }
+zenoh-link-tls     = { git = "https://github.com/bzdOS/zenoh-freebsd" }
+zenoh-link         = { git = "https://github.com/bzdOS/zenoh-freebsd" }

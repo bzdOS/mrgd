@@ -1,0 +1,29 @@
+[Unit]
+Description=matrix-hs local edge node (bsdOS multimaster Matrix, node-edge-linux)
+After=network-online.target hubd-queue-router.service
+Wants=network-online.target
+# Zenoh carrier is the local hubd queue router, so prefer it up first.
+After=hubd-queue-router.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/fleet/matrix-hs.env
+# Stable install path, NOT a cargo target/ directory. Pointing a unit into
+# target/ is what broke this service on 2026-07-29: `cargo clean` deleted the
+# binary and left an 885,000-restart 203/EXEC loop. Reinstall with:
+#   cargo build --release --features cluster && install -m0755 \
+#     target/release/matrix-hs /usr/local/bin/matrix-hs
+# The --features cluster part is load-bearing: a plain build writes the same
+# path and silently produces a single-node binary that converges nothing.
+ExecStart=/usr/local/bin/matrix-hs
+Restart=on-failure
+RestartSec=3
+# Listens on 127.0.0.1:8449 (MATRIX_HS_LISTEN). NOT 8448 — a barechat Synapse
+# container publishes 0.0.0.0:8448, which covers loopback.
+# East-west rides Zenoh to tcp/127.0.0.1:7449, the hubd queue router; remote
+# nodes reach that router over their existing ssh -L tunnels. The old
+# tcp/...guest-a:7448,tcp/...guest-b:7448 pair was measured filtered on 2026-08-03 and
+# again on 2026-08-19 and never worked.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=Zenoh carrier tunnel to offsite bus node (ssh -R 7451 -> local router)
+After=network-online.target hubd-queue-router.service
+Wants=network-online.target
+# East-west carrier for the offsite BUS-scope node (second process, SCOPES.md
+# interlock 4). offsite is behind home NAT; build-host reaches it through offsite's
+# own reverse tunnel at 127.0.0.1:19288 (build-host-tunnel.service on offsite,
+# SCOPES.md section 8). The -R lands offsite's 127.0.0.1:7451 on build-host's zenoh
+# router. Port 7450 on offsite is the HOME obfs listener — deliberately not
+# touched; this tunnel carries bus traffic only.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -R 7451:127.0.0.1:7449 -p 19288 -o BatchMode=yes -o ConnectTimeout=10 -o ExitOnForwardFailure=yes -o ServerAliveInterval=25 -o ServerAliveCountMax=3 root@127.0.0.1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
