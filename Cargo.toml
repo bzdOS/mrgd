@@ -73,6 +73,7 @@ cluster  = ["dep:zenoh"]
 # feature-gated. The fork tracks =1.9.0 and must be re-based whenever zenoh is
 # upgraded.
 [patch.crates-io]
+zenoh-util         = { git = "https://github.com/bzdOS/zenoh-freebsd" }
 # Vendored 2026-08-23 (were absolute host-local paths before): the
 # obfs transport is REQUIRED by any node that speaks an obfs/ locator, and a
 # build on any other machine (e.g. the Phase 4 laptop) must resolve these —

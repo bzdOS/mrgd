@@ -4149,8 +4149,7 @@ dependencies = [
 [[package]]
 name = "zenoh-util"
 version = "1.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b10369df18a781a3e675c9a2cbf54adb44c9dc2a376c1014c5e488410df2179"
+source = "git+https://github.com/bzdOS/zenoh-freebsd#d589a542427d10afffb5cf4fb880b94b86be76e7"
 dependencies = [
  "async-trait",
  "const_format",

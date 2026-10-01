@@ -17,7 +17,12 @@
 //! scope-canary                                  # defaults below, runs forever
 //! CANARY_SECONDS=30 scope-canary                # one-shot check, exits non-zero on a leak
 //! CANARY_WATCH='home/**' CANARY_CONNECT=tcp/127.0.0.1:7449 scope-canary
+//! CANARY_SCOUTING=on scope-canary               # opt back into multicast/gossip discovery
 //! ```
+//!
+//! It never listens: `listen/endpoints` is forced empty and scouting is off
+//! unless `CANARY_SCOUTING=on` says otherwise, so the only socket it can hold
+//! is the outbound one in `CANARY_CONNECT`.
 //!
 //! Exit codes: 0 = nothing seen, 1 = a leak was observed, 2 = could not start.
 //!
@@ -42,6 +47,19 @@ async fn main() {
         .unwrap_or(0);
 
     let mut cfg = zenoh::Config::default();
+
+    // ── Egress-only, always ───────────────────────────────────────────────
+    // The canary detects leaks; it serves nothing. Leaving zenoh's default
+    // listen/endpoints in place gave this process a reachable port on every
+    // interface (and, with multicast scouting, UDP discovery as well) — which
+    // is exposure, not capability: the subscriber works fine on a session that
+    // only dials out. So the listening side is emptied explicitly rather than
+    // left to a default that changes under us.
+    if let Err(e) = cfg.insert_json5("listen/endpoints", "[]") {
+        eprintln!("scope-canary: cannot clear listen/endpoints: {e}");
+        std::process::exit(2);
+    }
+
     if !connect.is_empty() {
         let json5 = format!(
             "[{}]",
@@ -56,14 +74,19 @@ async fn main() {
             std::process::exit(2);
         }
     }
-    // Scouting stays ON by default: a leak that arrives by local discovery is
-    // still a leak, and this host is exactly where such a peer would appear.
-    if matches!(
+    // Scouting is OFF unless asked for by name. It used to be on by default, on
+    // the reasoning that a leak delivered by local discovery is still a leak —
+    // true, but it costs this host multicast/UDP listeners to catch a case that
+    // is reproduced deliberately far more often than it happens by accident.
+    // Opt back in with CANARY_SCOUTING=on when working on that case; the
+    // security-relevant default is off.
+    if !matches!(
         std::env::var("CANARY_SCOUTING").unwrap_or_default().as_str(),
-        "off" | "0" | "false"
+        "on" | "1" | "true"
     ) {
         let _ = cfg.insert_json5("scouting/multicast/enabled", "false");
         let _ = cfg.insert_json5("scouting/gossip/enabled", "false");
+        let _ = cfg.insert_json5("scouting/automatic", "false");
     }
 
     let session = match zenoh::open(cfg).await {
