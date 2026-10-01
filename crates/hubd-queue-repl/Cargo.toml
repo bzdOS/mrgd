@@ -26,3 +26,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 zenoh       = { version = "=1.9.0", default-features = false, features = ["transport_tcp", "transport_tls", "transport_ws"] }
 sha2        = "0.10"
+
+# ── zenoh on FreeBSD ────────────────────────────────────────────────────────
+# zenoh-util defines set_bind_to_device_tcp_socket only for linux/android and
+# macos/ios/windows, while zenoh-link-commons/src/tcp.rs calls it
+# unconditionally — so on FreeBSD any build with the TCP transport dies with
+# E0425. bsdOS publishes a patched zenoh 1.9.0; patch the four crates the TCP
+# path pulls in, verbatim from the bzdOS monorepo root @ b5d939e. The obfs
+# forks are deliberately NOT pulled in here: that is matrix-hs's business.
+[patch.crates-io]
+zenoh-util         = { git = "https://github.com/bzdOS/zenoh-freebsd" }
+zenoh-link-commons = { git = "https://github.com/bzdOS/zenoh-freebsd" }
+zenoh-link-tls     = { git = "https://github.com/bzdOS/zenoh-freebsd" }
+zenoh-link         = { git = "https://github.com/bzdOS/zenoh-freebsd" }
