@@ -1,0 +1,12 @@
+[package]
+name        = "hubd-queue-repl"
+version     = "0.1.0"
+edition     = "2021"
+description = "Native Zenoh replication of hubd team queues — dir-watch append-only *.queue.md, publish deltas over Zenoh (replaces git mesh-sync). Task #8."
+
+[dependencies]
+tokio = { workspace = true }
+zenoh = { workspace = true }
+sha2  = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

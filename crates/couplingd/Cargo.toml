@@ -1,0 +1,29 @@
+[package]
+name        = "couplingd"
+version     = "0.1.0"
+edition     = "2021"
+description = "bsdOS coupling-store daemon — session/lease, distributed lock, KV/CAS, queue, service-registry (SPEC_coupling_v1 §3)"
+
+[[bin]]
+name = "couplingd"
+path = "src/main.rs"
+
+[lib]
+name = "couplingd"
+path = "src/lib.rs"
+
+[dependencies]
+tokio       = { workspace = true }
+thiserror   = { workspace = true }
+libc        = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+# zenoh is only needed for the multi-node cluster phase (raft/gossip). M1 is in-mem
+# single-node and does not reference zenoh, so it is gated behind the `cluster`
+# feature: the default build skips the large zenoh dependency graph (keeps the
+# FreeBSD dev-VM build light — the full graph OOM-kills rustc on limited RAM).
+zenoh     = { workspace = true, optional = true }
+
+[features]
+default = []
+cluster = ["dep:zenoh"]
