@@ -1,0 +1,19 @@
+[Unit]
+Description=Zenoh carrier tunnel to fedora bus node (ssh -R 7451 -> local router)
+After=network-online.target hubd-queue-router.service
+Wants=network-online.target
+# East-west carrier for the fedora BUS-scope node (second process, SCOPES.md
+# interlock 4). fedora is behind home NAT; Buildhost reaches it through fedora's
+# own reverse tunnel at 127.0.0.1:19288 (buildhost-tunnel.service on fedora,
+# SCOPES.md section 8). The -R lands fedora's 127.0.0.1:7451 on Buildhost's zenoh
+# router. Port 7450 on fedora is the HOME obfs listener — deliberately not
+# touched; this tunnel carries bus traffic only.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -R 7451:127.0.0.1:7449 -p 19288 -o BatchMode=yes -o ConnectTimeout=10 -o ExitOnForwardFailure=yes -o ServerAliveInterval=25 -o ServerAliveCountMax=3 root@127.0.0.1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,43 @@
+#!/bin/sh
+# mrgd_node — matrix-hs mesh node (185/186; docs/TOPOLOGY.md 3c/3e).
+# daemon -r -R 5: respawn a child that exits (e.g. carrier blink at boot).
+# STOP PITFALL fixed 2026-08-23: with -r, killing the child (what -p records)
+# makes the supervisor respawn it — "stop" did not stop. -P records the
+# supervisor too; stop kills BOTH. Restart is clean, no AddrInUse race.
+# Runs unprivileged as `freebsd`; env from ~/mhs.env; log ~/mhs.log.
+#
+# PROVIDE: mrgd_node
+# REQUIRE: NETWORKING DAEMON
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="mrgd_node"
+rcvar="mrgd_node_enable"
+pidfile="/var/run/mrgd-node.pid"
+sup_pidfile="/var/run/mrgd-node.sup.pid"
+command="/usr/local/bin/matrix-hs-mesh"   # 185 overrides in its own copy
+start_cmd="${name}_start"
+stop_cmd="${name}_stop"
+
+mrgd_node_start()
+{
+	echo "Starting ${name}."
+	/usr/sbin/daemon -r -R 5 \
+		-P ${sup_pidfile} -p ${pidfile} -u freebsd -o /home/freebsd/mhs.log \
+		/bin/sh -c 'set -a; . /home/freebsd/mhs.env; set +a; exec /usr/local/bin/matrix-hs-mesh'
+}
+
+mrgd_node_stop()
+{
+	for f in ${sup_pidfile} ${pidfile}; do
+		if [ -f $f ]; then
+			kill $(cat $f) 2>/dev/null
+			rm -f $f
+		fi
+	done
+	sleep 1
+}
+
+load_rc_config ${name}
+run_rc_command "$1"

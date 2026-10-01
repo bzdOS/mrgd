@@ -1,0 +1,19 @@
+[Unit]
+Description=Zenoh carrier tunnel to 186 (ssh -R 7449 -> local hubd-queue-router)
+After=network-online.target hubd-queue-router.service
+Wants=network-online.target
+# East-west carrier for the 186 mesh node (docs/TOPOLOGY.md 3e). Same shape as
+# mesh-tunnel-185.service: the remote node dials its own 127.0.0.1:7449, which
+# this forward lands on Buildhost's hubd-queue-router. -L 18452 is the CS-API of
+# the 186 node for local poking. The OLD pre-scope matrix-hs on 186 (ports
+# 8448/7448, server_name localhost) is unrelated and untouched.
+
+[Service]
+EnvironmentFile=/etc/bsdos/hosts.env
+Type=simple
+ExecStart=/usr/bin/ssh -N -R 7449:127.0.0.1:7449 -L 18452:127.0.0.1:8452 -i ${BSDOS_SSH_KEY} -o BatchMode=yes -o ConnectTimeout=10 -o ExitOnForwardFailure=yes -o ServerAliveInterval=25 -o ServerAliveCountMax=3 freebsd@${BSDOS_MYVM_IP}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

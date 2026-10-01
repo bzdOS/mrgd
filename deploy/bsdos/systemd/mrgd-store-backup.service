@@ -1,0 +1,11 @@
+[Unit]
+Description=Cross-host backup of the three mesh node stores (bus-to-bus)
+After=network-online.target
+Wants=network-online.target
+# See deploy/bsdos/scripts/backup-mesh-stores.sh for topology and scope
+# reasoning. Non-zero exit = a leg failed; check journal.
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /usr/local/libexec/bsdos/backup-mesh-stores.sh
+TimeoutStartSec=600

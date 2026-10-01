@@ -1,0 +1,15 @@
+[Unit]
+Description=Refresh the off-site /opt/mrgd copy on fedora (git pull over reverse tunnel)
+After=network-online.target
+Wants=network-online.target
+# The repo history exists in two places (AGENTS.md): Buildhost's /opt/mrgd and the
+# worktree clone on fedora. Until now the refresh was manual after each commit.
+# Pull is a no-op when nothing changed; safe to run unattended.
+
+[Service]
+EnvironmentFile=/etc/bsdos/hosts.env
+Type=oneshot
+# fedora pulls from root@${BSDOS_HOST_IP}:/opt/mrgd using its own key, already
+# authorized. -n and explicit redirects so nothing hangs the unit.
+ExecStart=/usr/bin/ssh -n -o BatchMode=yes -o ConnectTimeout=15 fedora "git -C /opt/mrgd pull </dev/null 2>&1"
+TimeoutStartSec=120

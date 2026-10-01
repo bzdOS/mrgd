@@ -1,0 +1,15 @@
+# SCOPES.md section 10: a canary on every bus host. fedora-bus watches that
+# nothing home-scoped ever appears on the bus carrier (the local tunnel end).
+[Unit]
+Description=scope-canary: home/** must never appear on the bus carrier
+After=network-online.target matrix-hs-bus.service
+
+[Service]
+Environment=CANARY_WATCH=home/**
+Environment=CANARY_CONNECT=tcp/127.0.0.1:7451
+ExecStart=/opt/matrix-hs-bus/scope-canary
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

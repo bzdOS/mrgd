@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly refresh of the off-site /opt/mrgd copy on fedora
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

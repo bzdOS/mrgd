@@ -1,0 +1,196 @@
+#!/bin/sh
+[ -r "${BSDOS_HOSTS_ENV:-/etc/bsdos/hosts.env}" ] && . "${BSDOS_HOSTS_ENV:-/etc/bsdos/hosts.env}"
+# PROVIDE: bsdos_matrix
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# matrix-hs: Matrix homeserver with multi-master delta-CRDT cluster support
+# (append-only persistence, coordination-free grow-set barrier, Zenoh mesh).
+#
+# Hardened daemon supervision: explicit start/stop/status keyed off pidfile.
+# daemon(8) writes the wrapper PID to -p; _stop sends SIGTERM to that PID which
+# daemon(8) propagates to the child; rm -f then cleans the stale pidfile.
+# Same pattern as bsdos_core_server / bsdos_lifecycled.
+#
+# ── QUICK INSTALL ────────────────────────────────────────────────────────────
+# 1. Place binary:  install -m 755 matrix-hs /usr/local/bin/matrix-hs
+# 2. Install rc.d:  install -m 555 infra/rc.d/bsdos_matrix /etc/rc.d/bsdos_matrix
+# 3. Configure via sysrc (see per-node blocks below), then:
+#    service bsdos_matrix start
+#
+# ── PER-NODE SYSRC CONFIGURATION ─────────────────────────────────────────────
+#
+# NODE 185 (preprod — listener hub; no connect outbound):
+#   sysrc bsdos_matrix_enable=YES
+#   sysrc bsdos_matrix_zenoh_listen=tcp/0.0.0.0:7448
+#   sysrc bsdos_matrix_zenoh_connect=""
+#   sysrc bsdos_matrix_node_id=node-185-preprod
+#   sysrc bsdos_matrix_data_dir=/var/db/matrix-hs
+#   sysrc bsdos_matrix_barrier_key=bsdos/coupling/barrier
+#   sysrc bsdos_matrix_observ=1
+#   # bsdos_matrix_listen defaults to 0.0.0.0:8448 — override if needed
+#
+# NODE 186 (prod — peers with 185):
+#   sysrc bsdos_matrix_enable=YES
+#   sysrc bsdos_matrix_zenoh_listen=tcp/0.0.0.0:7448
+#   sysrc bsdos_matrix_zenoh_connect=tcp/${BSDOS_DEV_IP}:7448
+#   sysrc bsdos_matrix_node_id=node-186-prod
+#   sysrc bsdos_matrix_data_dir=/var/db/matrix-hs
+#   sysrc bsdos_matrix_barrier_key=bsdos/coupling/barrier
+#   sysrc bsdos_matrix_observ=1
+#
+# EDGE (Fedora, non-FreeBSD — NOT this rc.d; launch manually):
+#   MATRIX_HS_ZENOH_CONNECT=tcp/${BSDOS_DEV_IP}:7448,tcp/${BSDOS_MYVM_IP}:7448
+#   MATRIX_HS_NODE_ID=node-edge-fedora
+#   matrix-hs
+#
+# NOTE: node_id MUST be unique per node — the coordination-free barrier uses it
+# for deterministic conflict tiebreaking (min ts, then node_id). Duplicate
+# node_id across nodes causes incorrect barrier resolution.
+#
+# ── ZENOH PORT NOTE ──────────────────────────────────────────────────────────
+# matrix-hs uses port 7448 (not 7447) to avoid colliding with bsdos-core's
+# Zenoh mesh (7447). Both services can coexist on the same host.
+# ─────────────────────────────────────────────────────────────────────────────
+
+. /etc/rc.subr
+
+name="bsdos_matrix"
+rcvar="bsdos_matrix_enable"
+load_rc_config "$name"
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+: ${bsdos_matrix_enable:="NO"}
+: ${bsdos_matrix_bin:="/usr/local/bin/matrix-hs"}
+: ${bsdos_matrix_log:="/var/log/bsdos_matrix.log"}
+
+# MATRIX_HS_LISTEN — HTTP bind address (Matrix client-server API)
+: ${bsdos_matrix_listen:="0.0.0.0:8448"}
+
+# Zenoh mesh endpoints (comma-separated; empty = peer/scouting mode)
+: ${bsdos_matrix_zenoh_listen:=""}
+: ${bsdos_matrix_zenoh_connect:=""}
+
+# CRDT key prefix for room delta pub/sub
+: ${bsdos_matrix_prefix:="bsdos/matrix/room"}
+
+# Coordination-free grow-set barrier key prefix
+: ${bsdos_matrix_barrier_key:="bsdos/coupling/barrier"}
+
+# On-disk persistence directory (empty = pure in-memory, no replay)
+: ${bsdos_matrix_data_dir:="/var/db/matrix-hs"}
+
+# Stable node identifier for barrier tiebreaking (REQUIRED unique per node)
+: ${bsdos_matrix_node_id:="$(hostname)"}
+
+# Observability toggle: non-empty enables BSDOS_OBSERV
+: ${bsdos_matrix_observ:=""}
+
+pidfile="/var/run/${name}.pid"
+start_cmd="_start"
+stop_cmd="_stop"
+status_cmd="_status"
+
+_running() {
+    [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null
+}
+
+_start() {
+    if _running; then
+        echo "$name already running as pid $(cat "$pidfile")."
+        return 0
+    fi
+
+    if [ ! -x "$bsdos_matrix_bin" ]; then
+        echo "$name: binary not found or not executable: $bsdos_matrix_bin"
+        return 1
+    fi
+
+    # Ensure persistence directory exists before the process starts.
+    if [ -n "$bsdos_matrix_data_dir" ]; then
+        mkdir -p "$bsdos_matrix_data_dir" || {
+            echo "$name: cannot create data_dir: $bsdos_matrix_data_dir"
+            return 1
+        }
+    fi
+
+    echo "Starting $name."
+
+    # Build env for daemon(8) → matrix-hs.
+    # Only export MATRIX_HS_ZENOH_LISTEN / MATRIX_HS_ZENOH_CONNECT when non-empty
+    # so the binary enters peer/scouting mode when the vars are absent (not blank).
+    _env_args="/usr/bin/env MATRIX_HS_LISTEN=${bsdos_matrix_listen}"
+    _env_args="${_env_args} MATRIX_HS_ZENOH_PREFIX=${bsdos_matrix_prefix}"
+    _env_args="${_env_args} MATRIX_HS_BARRIER_KEY=${bsdos_matrix_barrier_key}"
+    _env_args="${_env_args} MATRIX_HS_NODE_ID=${bsdos_matrix_node_id}"
+
+    if [ -n "$bsdos_matrix_data_dir" ]; then
+        _env_args="${_env_args} MATRIX_HS_DATA_DIR=${bsdos_matrix_data_dir}"
+    fi
+    if [ -n "$bsdos_matrix_zenoh_listen" ]; then
+        _env_args="${_env_args} MATRIX_HS_ZENOH_LISTEN=${bsdos_matrix_zenoh_listen}"
+    fi
+    if [ -n "$bsdos_matrix_zenoh_connect" ]; then
+        _env_args="${_env_args} MATRIX_HS_ZENOH_CONNECT=${bsdos_matrix_zenoh_connect}"
+    fi
+    if [ -n "$bsdos_matrix_observ" ]; then
+        _env_args="${_env_args} BSDOS_OBSERV=${bsdos_matrix_observ}"
+    fi
+
+    # daemon(8) flags:
+    #   -f  — redirect stdin/stdout/stderr to -o logfile (no controlling terminal)
+    #   -o  — logfile for stdout + stderr
+    #   -p  — write wrapper PID here (used for reliable stop/status)
+    # daemon(8) writes its own PID (the wrapper) to -p. Sending SIGTERM to that
+    # PID causes daemon(8) to SIGTERM the child and wait; the process group is
+    # cleanly reaped. No need to hunt the child PID separately.
+    /usr/sbin/daemon -f -o "$bsdos_matrix_log" -p "$pidfile" \
+        ${_env_args} "$bsdos_matrix_bin"
+}
+
+_stop() {
+    if ! _running; then
+        echo "$name is not running."
+        rm -f "$pidfile"
+        return 0
+    fi
+
+    _pid="$(cat "$pidfile" 2>/dev/null)"
+    echo "Stopping $name (pid ${_pid})."
+
+    # SIGTERM → daemon(8) wrapper, which forwards to child and waits.
+    kill "$_pid" 2>/dev/null
+
+    # Wait up to 10 s for the wrapper to exit cleanly.
+    _wait=10
+    while [ "$_wait" -gt 0 ] && kill -0 "$_pid" 2>/dev/null; do
+        sleep 1
+        _wait=$(( _wait - 1 ))
+    done
+
+    # If still alive after grace period, force-kill the wrapper + child together
+    # via the process group. daemon(8) creates a new session so the child is in
+    # a separate process group; kill the child directly via the pidfile-held pid
+    # (wrapper) then sweep for orphans sharing the same parent.
+    if kill -0 "$_pid" 2>/dev/null; then
+        echo "$name: grace period expired, sending SIGKILL."
+        kill -9 "$_pid" 2>/dev/null
+        # Also kill any child that daemon(8) left behind (daemon -r respawn case).
+        _child=$(pgrep -P "$_pid" 2>/dev/null | head -1)
+        if [ -n "$_child" ]; then
+            kill -9 "$_child" 2>/dev/null
+        fi
+    fi
+
+    rm -f "$pidfile"
+}
+
+_status() {
+    if _running; then
+        echo "$name is running as pid $(cat "$pidfile")."
+    else
+        echo "$name is not running."
+    fi
+}
+
+run_rc_command "$1"
