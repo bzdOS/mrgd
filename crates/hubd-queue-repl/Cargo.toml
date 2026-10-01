@@ -10,3 +10,19 @@ zenoh = { workspace = true }
 sha2  = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── Self-contained workspace ────────────────────────────────────────────────
+# Same situation as crates/couplingd: lifted from the bzdOS monorepo, where it
+# was a workspace member, while the mrgd root has no [workspace] table — so
+# `workspace = true` had nothing to resolve. A minimal workspace here makes the
+# crate build standalone. Versions/features copied verbatim from the bzdOS
+# monorepo root [workspace.dependencies] (github.com/bzdOS/bzdOS @ b5d939e);
+# sha2 is not in that table, its "0.10" line is taken from bsdos-pkgd in the
+# same commit (and resolves to 0.10.9, which is what this repo's Cargo.lock
+# already pins). Not folded into the mrgd workspace, by fleet decision.
+[workspace]
+
+[workspace.dependencies]
+tokio       = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+zenoh       = { version = "=1.9.0", default-features = false, features = ["transport_tcp", "transport_tls", "transport_ws"] }
+sha2        = "0.10"

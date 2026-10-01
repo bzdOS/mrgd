@@ -27,3 +27,22 @@ zenoh     = { workspace = true, optional = true }
 [features]
 default = []
 cluster = ["dep:zenoh"]
+
+# ── Self-contained workspace ────────────────────────────────────────────────
+# The mrgd root has no [workspace] (this crate was lifted from the bzdOS
+# monorepo, where it was a workspace member), so `workspace = true` above had
+# nothing to resolve and cargo stopped with "failed to find a workspace root".
+# Declaring a minimal workspace here makes this crate build on its own. Versions
+# and features are copied verbatim from the bzdOS monorepo root [workspace.dependencies]
+# (github.com/bzdOS/bzdOS @ b5d939e) so the code compiles against the same
+# dependency set it was written for. Deliberately NOT folded into the mrgd
+# workspace: the fleet decided these stay standalone.
+[workspace]
+
+[workspace.dependencies]
+tokio       = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+zenoh       = { version = "=1.9.0", default-features = false, features = ["transport_tcp", "transport_tls", "transport_ws"] }
+libc        = "0.2"
+thiserror   = "1"
