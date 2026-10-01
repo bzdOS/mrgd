@@ -1,0 +1,17 @@
+# BUS-scope matrix-hs on offsite — the second process (SCOPES.md interlock 4:
+# one process per scope; the HOME homeserver at /srv/app is untouched).
+# Holds a bus replica + runs hub_replic against /root/.hubd. No queues bridge
+# (the hubd-queue-repl residue on build-host is the owner\x27s pending decision).
+[Unit]
+Description=matrix-hs BUS-scope node (hub replication over the bus mesh)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/srv/app-bus/matrix-hs-bus.env
+ExecStart=/srv/app-bus/matrix-hs
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

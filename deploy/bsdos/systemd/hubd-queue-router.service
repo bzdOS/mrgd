@@ -1,0 +1,14 @@
+[Unit]
+Description=hubd queue-repl Zenoh router (localhost broker, binds 127.0.0.1:7449)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# mode=router; brokering only — no plaintext on any network interface (localhost bind).
+ExecStart=/root/bin/router
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

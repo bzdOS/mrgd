@@ -1,0 +1,19 @@
+[Unit]
+Description=mrgd scope-canary - alarm if home/** appears on the bus carrier
+After=hubd-queue-router.service
+Wants=network-online.target
+After=network-online.target
+# docs/SCOPES.md 10: run on every bus host; silence then means something.
+# Watches home/** on tcp/127.0.0.1:7449 (the bus carrier). Exit 1 = leak seen
+# (logged, then restarted to keep watching), 2 = could not start.
+
+[Service]
+Type=simple
+Environment=CANARY_WATCH=home/**
+Environment=CANARY_CONNECT=tcp/127.0.0.1:7449
+ExecStart=/usr/local/bin/scope-canary
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=Zenoh carrier tunnel to guest-a (ssh -R 7449 -> local hubd-queue-router)
+After=network-online.target hubd-queue-router.service
+Wants=network-online.target
+# East-west carrier for the guest-a mesh node (docs/TOPOLOGY.md 3c). guest-a dials its
+# own 127.0.0.1:7449; this forward lands it on build-host's hubd-queue-router.
+# Replaces the bare `ssh -f -N -R` that did not survive a reboot.
+
+[Service]
+EnvironmentFile=/etc/fleet/hosts.env
+Type=simple
+# No -f: systemd wants the foreground. ExitOnForwardFailure makes a failed
+# forward a failed unit (restartable) instead of a silent no-op tunnel.
+ExecStart=/usr/bin/ssh -N -R 7449:127.0.0.1:7449 -L 18451:127.0.0.1:8451 -i ${BSDOS_SSH_KEY} -o BatchMode=yes -o ConnectTimeout=10 -o ExitOnForwardFailure=yes -o ServerAliveInterval=25 -o ServerAliveCountMax=3 freebsd@${BSDOS_DEV_IP}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

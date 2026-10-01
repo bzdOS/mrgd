@@ -1,0 +1,39 @@
+#!/bin/sh
+# mrgd_canary — scope leak canary (docs/SCOPES.md 10) for the bus carrier as
+# reached from this host: tcp/127.0.0.1:7449, the ssh-forwarded hubd queue
+# router on build-host (mesh-tunnel-guest-b.service). Alarms (log lines) if anything
+# under home/** appears there. Silence means the scopes are still separate.
+#
+# PROVIDE: mrgd_canary
+# REQUIRE: NETWORKING DAEMON
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="mrgd_canary"
+rcvar="mrgd_canary_enable"
+pidfile="/var/run/mrgd-canary.pid"
+start_cmd="${name}_start"
+stop_cmd="${name}_stop"
+
+mrgd_canary_start()
+{
+	echo "Starting ${name}."
+	/usr/sbin/daemon -p ${pidfile} -u freebsd -o /var/log/mrgd-canary.log \
+		/usr/bin/env CANARY_CONNECT=tcp/127.0.0.1:7449 CANARY_WATCH='home/**' \
+		/usr/local/bin/scope-canary
+}
+
+mrgd_canary_stop()
+{
+	if [ -f ${pidfile} ]; then
+		echo "Stopping ${name}."
+		kill $(cat ${pidfile}) 2>/dev/null
+		rm -f ${pidfile}
+	else
+		echo "${name}: no pidfile"
+	fi
+}
+
+load_rc_config ${name}
+run_rc_command "$1"
