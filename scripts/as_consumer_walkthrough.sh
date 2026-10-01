@@ -66,6 +66,10 @@
 #   6 — step e  (sync) failed
 #   7 — step f  (send) failed
 #   8 — usage / environment error
+#   130 / 143 — stopped by SIGINT / SIGTERM; the traps end the run with the
+#               signal's own status so an abort is not reported as a step
+#               failure. These two sit outside 0-8 deliberately: they are
+#               128+n, not a step.
 #
 # Env:
 #   MATRIX_HS_AS_TOKEN  required — the AS bearer. Unset = agent socket off
@@ -190,14 +194,12 @@ cleanup() {
 # like. With the signal traps ending the script, the same experiment ends 143 with
 # no invented failure line.
 #
-# MEASURED, and the two signals are not symmetric. TERM: exit 143, no misleading
-# output — that is verified end to end on this script. INT: a script launched in
-# the background inherits SIGINT ignored, and bash cannot trap a signal that was
-# ignored on entry, so INT could not be exercised the same way; delivering INT
-# directly to the running script during the in-flight request still ended 1 with
-# the transport-error line. The INT trap is kept because the intent is right and
-# it cannot make a run last longer, but do not read 130 into this until it is
-# measured the way TERM was.
+# MEASURED, both signals, on this script. TERM: exit 143. INT: exit 130. In both
+# cases no failure line is invented for a run the operator stopped on purpose.
+# One caveat for whoever re-tests this: a script launched in the BACKGROUND
+# inherits SIGINT ignored, and bash cannot trap a signal that was ignored on
+# entry — so INT must be exercised from a foreground run, or the measurement
+# will be of the harness and not of this script.
 #
 # What neither fix does: interrupt the request already in flight. The handler runs
 # only once the foreground command returns, so the wait is still bounded by
