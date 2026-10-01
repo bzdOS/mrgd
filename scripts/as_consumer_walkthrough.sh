@@ -195,6 +195,25 @@ mask_secrets() {
     printf '%s' "$s" | sed -E "s/mxt_[[:alnum:]_.-]+/${MASK_LABEL}/g"
 }
 
+# body_for_log — the response body, made safe to paste.
+#
+# The three diagnostic dumps below fire exactly when the server misbehaved, which
+# is exactly when the body is most likely to be carrying a live credential: a
+# login that answered 200 while a field went missing still has the token sitting
+# next to it. Those dumps called head directly and so bypassed mask_secrets,
+# while the promise in the comment above is that an ordinary run's log is safe to
+# paste. One path, one rule: everything printed goes through the masker, and
+# REVEAL_TOKENS=1 opts out here exactly as it does in render().
+body_for_log() {
+    local b
+    b=$(head -c 400 "$RESP" 2>/dev/null || true)
+    if [ "$REVEAL_TOKENS" -eq 1 ]; then
+        printf '%s' "$b"
+    else
+        mask_secrets "$b"
+    fi
+}
+
 # render <argv...> — one copy-pasteable command line, exactly the argv used.
 render() {
     local out="" a q
@@ -244,7 +263,7 @@ expect_ok() {
     fi
     if [ "$HTTP_CODE" != 200 ]; then
         log "  $label -> HTTP $HTTP_CODE" >&2
-        log "  body: $(head -c 400 "$RESP" 2>/dev/null || true)" >&2
+        log "  body: $(body_for_log)" >&2
         fail "$code" "$label returned HTTP $HTTP_CODE (expected 200)"
     fi
     log "  $label -> HTTP 200"
@@ -272,7 +291,7 @@ expect_field() {
     local value
     value=$(field "$path")
     if [ -z "$value" ] || [ "$value" = null ]; then
-        log "  body: $(head -c 400 "$RESP" 2>/dev/null || true)" >&2
+        log "  body: $(body_for_log)" >&2
         fail "$code" "$what missing from the response (jq path $path)"
     fi
     case "$value" in
@@ -385,7 +404,7 @@ step_e() {
     # [:288-295] — here the other device of the same tenant account, which is
     # the workers-as-devices claim being walked through.
     if ! jq -e --arg r "$ROOM_ID" 'has("rooms") and (.rooms.join | has($r))' "$RESP" >/dev/null 2>&1; then
-        log "  body: $(head -c 400 "$RESP" 2>/dev/null || true)" >&2
+        log "  body: $(body_for_log)" >&2
         fail 6 "sync did not return room '${ROOM_ID}' in .rooms.join — joined rooms seen: \
 $(jq -c '.rooms.join | keys' "$RESP" 2>/dev/null || echo '<none>')"
     fi
