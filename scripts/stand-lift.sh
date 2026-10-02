@@ -135,6 +135,11 @@ fi
 # поднять сокет (занятый порт, битый конфиг) — и следующий ход увидит стенд
 # лежащим и не поймёт почему.
 _wait=30
+# Итоговое время ожидания держим ОТДЕЛЬНО: счётчик ниже обнуляется циклом, и
+# печатать его в сообщении об отказе нельзя — оператор читал «не поднялся за
+# 0с» после тридцати секунд ожидания и искал не тот адрес (проверено 02.10 на
+# скретч-стенде: замер 31 с, в тексте 0 с).
+_wait_total=$_wait
 while [ "$_wait" -gt 0 ]; do
 	if sockstat -4 -l -p "$LISTEN_PORT" 2>/dev/null | grep -q ":$LISTEN_PORT"; then
 		echo "stand-lift: ПОДНЯТ. $(sockstat -4 -l -p "$LISTEN_PORT" | grep ":$LISTEN_PORT")"
@@ -144,6 +149,6 @@ while [ "$_wait" -gt 0 ]; do
 	_wait=$(( _wait - 1 ))
 done
 
-echo "stand-lift: НЕ поднялся за ${_wait}с — порт $LISTEN_PORT молчит." >&2
+echo "stand-lift: НЕ поднялся за ${_wait_total}с — порт $LISTEN_PORT молчит." >&2
 tail -5 "$LOG" >&2 2>/dev/null || :
 exit 1
