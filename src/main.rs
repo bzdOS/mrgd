@@ -125,9 +125,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::spawn(async_loop_report_rss());
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
+
+// async_shutdown_signal:start
+//   purpose: resolve when the operator asks the process to stop, so it leaves
+//            through main() instead of being stopped at the signal.
+//   why: a process that has no handler for SIGTERM/SIGINT is killed by the
+//        kernel at the signal — nothing the process registered as an exit hook
+//        runs, so MALLOC_CONF=stats_print printed no dump at all and a stopped
+//        service could never show a final snapshot. This resolves on the first
+//        TERM or INT and hands control back to serve(), which then finishes the
+//        requests it already accepted.
+//   kills: (1) the first TERM or INT wins, so a second Ctrl-C is not a question
+//            an unattended stop has to answer; (2) nothing here escalates to
+//            SIGKILL — the allocator has to be able to finish its statistics
+//            before the process exits, and that is the whole point.
+//   exposes: nothing. The future resolves exactly once.
+//   todo: the USR2 allocator sampler is a separate handler and is untouched.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("[matrix-hs] shutdown: SIGTERM handler unavailable: {e}");
+            None
+        }
+    };
+    let mut int = match signal(SignalKind::interrupt()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("[matrix-hs] shutdown: SIGINT handler unavailable: {e}");
+            None
+        }
+    };
+
+    let which = match (term.as_mut(), int.as_mut()) {
+        (Some(t), Some(i)) => tokio::select! {
+            _ = t.recv() => "SIGTERM",
+            _ = i.recv() => "SIGINT",
+        },
+        (Some(t), None) => {
+            t.recv().await;
+            "SIGTERM"
+        }
+        (None, Some(i)) => {
+            i.recv().await;
+            "SIGINT"
+        }
+        // Neither signal can be caught: behave as before rather than inventing
+        // a shutdown nobody asked for.
+        (None, None) => {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    };
+
+    println!(
+        "[matrix-hs] {which} received — draining accepted requests, then exiting through main()"
+    );
+}
+// async_shutdown_signal:end
 
 // async_loop_report_rss:start
 //   purpose: Log VmRSS/VmSwap/VmHWM from /proc/self/status every 10 minutes,
