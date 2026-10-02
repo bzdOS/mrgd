@@ -869,12 +869,35 @@ pub async fn get_room_messages(
         .map_err(|e| HsError::Internal(e.to_string()))?;
 
     let entries = rt.get(&room_id).map(|v| v.as_slice()).unwrap_or(&[]);
-    let messages: Vec<Value> = entries
+    let projected: Vec<Value> = entries
         .iter()
         .filter(|(_, ev)| ev.get("state_key").is_none())
         .map(|(_, ev)| state.apply_redaction(ev))
         .collect();
     drop(rt);
+
+    // When the timeline cap has drained this room, the projection is only the TAIL
+    // of the history. Pagination tokens are positions in the room's chronological
+    // message list, and sync's prev_batch is a position in that same list — so the
+    // dropped head has to be part of the list, or the token points past the events
+    // the client is trying to reach and the backfill silently yields nothing.
+    //
+    // The RoomLog still holds them (only roomlog_max_events deletes, and that is
+    // irreversible by design), so they are rebuilt here rather than lost.
+    let dropped_head = if state.timeline_max_events > 0 {
+        let projection_first = projected
+            .first()
+            .and_then(|ev| ev.get("event_id"))
+            .and_then(|v| v.as_str());
+        state.dropped_head_events(&room_id, projection_first)
+    } else {
+        Vec::new()
+    };
+    let messages: Vec<Value> = if dropped_head.is_empty() {
+        projected
+    } else {
+        dropped_head.into_iter().chain(projected.into_iter()).collect()
+    };
 
     let total = messages.len();
     let backwards = params.dir.as_deref() != Some("f");

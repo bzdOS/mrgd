@@ -3179,6 +3179,102 @@ impl AppState {
         dropped
     }
 
+    // AppState::room_log_depth:start
+    //   purpose: How many events the room's RoomLog holds right now. This is the
+    //            UNTRIMMED depth: room_timeline may hold fewer because
+    //            timeline_max_events drained the oldest, and the difference is
+    //            exactly the tail a client has to backfill.
+    //   input:  room_id
+    //   output: number of PDUs in the RoomLog (0 if the room or log is absent)
+    //   sideEffects: none (locks rooms, then releases)
+    // AppState::room_log_depth:end
+    pub fn room_log_depth(&self, room_id: &str) -> usize {
+        let Ok(rooms) = self.rooms.lock() else {
+            return 0;
+        };
+        rooms.get(room_id).map(|log| log.len()).unwrap_or(0)
+    }
+
+    // AppState::dropped_head_events:start
+    //   purpose: Rebuild the client-event JSON for the OLDEST events that the
+    //            timeline cap already drained, so /rooms/{id}/messages can serve
+    //            them and a client holding sync's prev_batch can backfill the
+    //            hole. The RoomLog keeps them (only roomlog_max_events deletes,
+    //            and that is irreversible by design), so the data is present —
+    //            it was simply unreachable, because /messages paginated over the
+    //            already-trimmed projection and told the client nothing.
+    //
+    //            A Pdu carries the request body as raw JSON bytes (see
+    //            routes/send.rs PDU construction: kind = event type, content =
+    //            raw body, ts = wall-clock ms), which is everything the client
+    //            event JSON needs, so the reconstruction is exact rather than
+    //            approximate.
+    //
+    //            State events (m.room.* membership and the room's own state) are
+    //            skipped: /sync delivers them under state.events, not the timeline,
+    //            and /messages has always filtered them out.
+    //   input:  room_id, stop_at_event_id — walk stops at this event (the projection's
+    //            oldest); None walks the whole log. Returns the non-state events BEFORE it.
+    //   output: Vec of client-event JSON values, chronological
+    //   sideEffects: none (locks rooms, then releases)
+    // AppState::dropped_head_events:end
+    pub fn dropped_head_events(
+        &self,
+        room_id: &str,
+        stop_at_event_id: Option<&str>,
+    ) -> Vec<serde_json::Value> {
+        let Ok(rooms) = self.rooms.lock() else {
+            return Vec::new();
+        };
+        let Some(log) = rooms.get(room_id) else {
+            return Vec::new();
+        };
+        Self::dropped_head_events_from(log, stop_at_event_id)
+    }
+
+    // AppState::dropped_head_events_from:start
+    //   purpose: The same walk, but over a RoomLog the caller ALREADY holds locked.
+    //            It exists because routes::sync::build_join_rooms keeps
+    //            `state.rooms` locked across the whole response: re-locking it
+    //            from there self-deadlocks (std::sync::Mutex is not reentrant),
+    //            and /sync then hangs forever instead of failing. So the locked
+    //            variant is for /messages, and this one for the sync path.
+    //   input:  log — &RoomLog already under the caller's guard
+    //            stop_at_event_id — walk stops at this event (the projection's oldest)
+    //   output: Vec of client-event JSON values, chronological
+    //   sideEffects: none
+    // AppState::dropped_head_events_from:end
+    pub fn dropped_head_events_from(
+        log: &crate::substrate::matrix_events::RoomLog,
+        stop_at_event_id: Option<&str>,
+    ) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        for pdu in log.ordered() {
+            // The projection's OLDEST event is where the tail begins: everything
+            // before it in the log is what the cap already dropped. Bounding the
+            // walk by that event — rather than by a count — is what keeps this
+            // from returning the projection's own events a second time, which is
+            // what made the first attempt build a duplicated /messages page.
+            if stop_at_event_id == Some(pdu.event_id.as_str()) {
+                break;
+            }
+            if pdu.kind.starts_with("m.room.") && !pdu.kind.starts_with("m.room.message") {
+                continue;
+            }
+            let content = serde_json::from_slice::<serde_json::Value>(&pdu.content)
+                .unwrap_or(serde_json::Value::Null);
+            out.push(serde_json::json!({
+                "type": pdu.kind,
+                "event_id": pdu.event_id,
+                "sender": pdu.sender,
+                "room_id": pdu.room_id,
+                "origin_server_ts": pdu.ts,
+                "content": content,
+            }));
+        }
+        out
+    }
+
     pub fn append_room_timeline(&self, room_id: &str, ev: Value) -> u64 {
         use std::sync::atomic::Ordering;
         let mut ev = ev;

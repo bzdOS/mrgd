@@ -392,13 +392,45 @@ fn build_join_rooms(
             continue;
         }
 
+        // ── The limited/prev_batch contract (.env.example, TIMELINE_MAX_EVENTS) ──
+        // A timeline that the retention cap has already drained is NOT a complete
+        // history, and the client must be able to tell that and to backfill. Both
+        // signals used to be hardcoded ("limited": false, "prev_batch": ""), which
+        // a live window measured: at 20016 events under a 20000 cap, /sync returned
+        // 20000 events claiming the history was whole, and the 16 dropped oldest
+        // were unreachable through /sync AND /rooms/{id}/messages.
+        //
+        // prev_batch addresses the boundary in the SAME list /messages paginates
+        // over — the dropped head followed by the projection — so a client walking
+        // backwards from it lands on the events sync could not show.
+        let projection_first = timeline_events
+            .first()
+            .and_then(|ev| ev.get("event_id"))
+            .and_then(|v| v.as_str());
+        // rooms_guard is ALREADY held for the whole of this function — re-locking
+        // state.rooms here would self-deadlock and hang /sync forever.
+        let dropped_head = if state.timeline_max_events > 0 {
+            rooms_guard
+                .get(room_id)
+                .map(|log| AppState::dropped_head_events_from(log, projection_first))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let trimmed = !dropped_head.is_empty();
+        let prev_batch = if trimmed {
+            format!("t{}", dropped_head.len())
+        } else {
+            String::new()
+        };
+
         join_rooms.insert(
             room_id.clone(),
             json!({
                 "timeline": {
                     "events":     timeline_events,
-                    "limited":    false,
-                    "prev_batch": ""
+                    "limited":    trimmed,
+                    "prev_batch": prev_batch
                 },
                 "state":     { "events": state_json_events },
                 "ephemeral": { "events": ephemeral_events },
