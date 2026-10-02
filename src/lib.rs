@@ -164,6 +164,8 @@ mod messages_test;
 #[cfg(test)]
 mod persist_test;
 #[cfg(test)]
+mod timeline_limited_signal_test;
+#[cfg(test)]
 mod push_test;
 #[cfg(test)]
 mod redact_test;
