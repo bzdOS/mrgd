@@ -1,0 +1,31 @@
+[Unit]
+Description=Refresh the guest work tree from the fleet source over the existing route
+After=network-online.target
+Wants=network-online.target
+# The source is the fleet's own node, reached over the route that already exists.
+# Two things are therefore NOT here on purpose: no public hosting address (the
+# owner decided against it), and no ssh invocation at all — this unit cannot open
+# a tunnel or a port forward because it never speaks ssh.
+#
+# Both the work tree and the upstream come from the fleet env file the route
+# already provides, so no host name, no absolute path and no address of the
+# deployment is named in this file. EnvironmentFile is optional (-): a missing
+# file must not silently produce a refresh from somewhere unexpected, so the
+# guards below refuse instead.
+#
+# --ff-only is not decoration: if the guest tree has diverged from main, that is
+# a fact for a human. A pull that quietly reset or merged it away would leave the
+# guest running code nobody reviewed, and this unit exists to run unattended.
+# A pull with nothing new is a no-op and exits 0.
+
+[Service]
+EnvironmentFile=-/etc/fleet/sync-source.env
+Type=oneshot
+ExecStart=/bin/sh -c 'test -n "${SYNC_WORK_TREE:-}" || { echo "sync: SYNC_WORK_TREE is not set by the fleet env" >&2; exit 1; }'
+ExecStart=/bin/sh -c 'test -n "${SYNC_UPSTREAM:-}" || { echo "sync: SYNC_UPSTREAM is not set by the fleet env" >&2; exit 1; }'
+ExecStart=/bin/sh -c 'case "${SYNC_UPSTREAM}" in https://*|http://*) echo "sync: refusing a public http(s) upstream — the source is the fleet node over the existing route" >&2; exit 1;; esac'
+# /usr/bin/env, not a hardcoded git path: this repo's own node keeps git under
+# /usr/local, and a unit that names a path which does not exist on the machine it
+# runs on fails with "No such file or directory" instead of a clear message.
+ExecStart=/usr/bin/env git -C ${SYNC_WORK_TREE} pull --ff-only ${SYNC_UPSTREAM} main
+TimeoutStartSec=120
