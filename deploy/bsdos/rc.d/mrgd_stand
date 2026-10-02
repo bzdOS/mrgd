@@ -1,0 +1,131 @@
+#!/bin/sh
+# mrgd_stand — post-boot lift of a measurement stand.
+#
+# A guest reboot takes the stand down with it, and everything downstream
+# (profiling, measurement windows, client runs) needs it back before it can mean
+# anything. This service makes the lift a boot step instead of a thing an
+# operator has to remember or be dispatched to perform.
+#
+# It starts NOTHING itself. Every decision belongs to scripts/stand-lift.sh:
+# the live-pidfile gate, the "port held by a foreign process" refusal, the
+# wildcard-address refusal, the refusal when the env carries hubd queue dirs,
+# and the post-check that the port really listens. Those gates are what make
+# this service safe to enable — a run against a stand that is already up is a
+# no-op, so the service and a manual lift cannot fight.
+#
+# The service is NOT the rc.d/bsdos_matrix path. That one supervises matrix-hs
+# with its own env block and was left disabled because an earlier grow-set
+# attempt failed to converge; enabling it before convergence is measured puts
+# that failure back unattended on every boot. This one changes nothing about how
+# the process is supervised — it only decides WHO starts it.
+#
+# PROVIDE: mrgd_stand
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# ── INSTALL ──────────────────────────────────────────────────────────────────
+#   install -m 555 deploy/bsdos/rc.d/mrgd_stand /usr/local/etc/rc.d/mrgd_stand
+#   install -m 755 scripts/stand-lift.sh /usr/local/libexec/fleet/stand-lift.sh
+#
+# ── ENABLE ───────────────────────────────────────────────────────────────────
+#   sysrc mrgd_stand_enable=YES
+#   sysrc mrgd_stand_home=<state dir>    # holds mrgd.env, bin/matrix-hs, soak/
+#   sysrc mrgd_stand_user=<node user>    # unprivileged; the lift must not need root
+#
+# Manual test BEFORE the sysrc values are applied: use `onestart`, not `start`.
+# rc.subr refuses `start` while mrgd_stand_enable is unset — and still exits 0,
+# so a plain `start` can look like a successful boot step that lifted nothing.
+#
+# Nothing host-local is baked in: the state dir, the user and the path to the
+# lifter are all sysrc variables, so the file is safe to publish. Leave
+# mrgd_stand_user empty to run the lift as whoever invoked the service — useful
+# for a manual test, not for boot, where the caller is root and the stand must
+# not be.
+
+. /etc/rc.subr
+
+name="mrgd_stand"
+rcvar="mrgd_stand_enable"
+
+: ${mrgd_stand_home:=""}
+: ${mrgd_stand_user:=""}
+: ${mrgd_stand_lifter:="/usr/local/libexec/fleet/stand-lift.sh"}
+
+load_rc_config "$name"
+
+mrgd_stand_start()
+{
+	if [ -z "$mrgd_stand_home" ]; then
+		echo "${name}: mrgd_stand_home is not set — nothing to lift from."
+		echo "${name}: set it to the stand's state dir (sysrc ${name}_home=...)."
+		return 1
+	fi
+	if [ ! -r "$mrgd_stand_lifter" ]; then
+		echo "${name}: lifter not readable: $mrgd_stand_lifter"
+		return 1
+	fi
+
+	echo "Starting ${name} (home ${mrgd_stand_home})."
+	if [ -n "$mrgd_stand_user" ]; then
+		/usr/bin/env STAND_HOME="$mrgd_stand_home" \
+			/usr/bin/su -m "$mrgd_stand_user" -c "$mrgd_stand_lifter"
+	else
+		/usr/bin/env STAND_HOME="$mrgd_stand_home" /bin/sh "$mrgd_stand_lifter"
+	fi
+}
+
+mrgd_stand_stop()
+{
+	# The stand keeps its own pidfile under the state dir; SIGTERM goes to that
+	# exact pid. Never pkill, never a pattern — the point of the pidfile is that
+	# it names one process, and a pattern would also catch a window's launcher.
+	_pf="${mrgd_stand_home}/mrgd.pid"
+	if [ -z "$mrgd_stand_home" ] || [ ! -f "$_pf" ]; then
+		echo "${name}: no pidfile under ${mrgd_stand_home:-<unset>} — nothing to stop."
+		return 0
+	fi
+	_pid=$(cat "$_pf" 2>/dev/null || echo "")
+	if [ -z "$_pid" ] || ! kill -0 "$_pid" 2>/dev/null; then
+		echo "${name}: pidfile is stale (pid ${_pid:-empty}) — cleaning it."
+		rm -f "$_pf"
+		return 0
+	fi
+
+	echo "Stopping ${name} (pid ${_pid})."
+	kill "$_pid" 2>/dev/null
+
+	_wait=10
+	while [ "$_wait" -gt 0 ] && kill -0 "$_pid" 2>/dev/null; do
+		sleep 1
+		_wait=$(( _wait - 1 ))
+	done
+	if kill -0 "$_pid" 2>/dev/null; then
+		echo "${name}: grace period expired, sending SIGKILL to ${_pid}."
+		kill -9 "$_pid" 2>/dev/null
+	fi
+
+	rm -f "$_pf"
+	echo "${name}: stopped."
+}
+
+mrgd_stand_status()
+{
+	_pf="${mrgd_stand_home}/mrgd.pid"
+	if [ -z "$mrgd_stand_home" ] || [ ! -f "$_pf" ]; then
+		echo "${name}: no pidfile under ${mrgd_stand_home:-<unset>}."
+		return 1
+	fi
+	_pid=$(cat "$_pf" 2>/dev/null || echo "")
+	if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+		echo "${name} is running as pid ${_pid}."
+		return 0
+	fi
+	echo "${name} is not running (stale pid ${_pid:-empty})."
+	return 1
+}
+
+start_cmd="mrgd_stand_start"
+stop_cmd="mrgd_stand_stop"
+status_cmd="mrgd_stand_status"
+
+run_rc_command "$1"
