@@ -10,8 +10,8 @@ Type=simple
 # tunnel (see hubd-queue-tunnel.service on the NATed node). No plaintext zenoh on wire.
 Environment=HUBD_QUEUE_MODE=client
 Environment=HUBD_QUEUE_ZENOH_CONNECT=tcp/127.0.0.1:7449
-EnvironmentFile=-/root/hubd-queue-repl.env
-ExecStart=/root/bin/hubd-queue-repl
+EnvironmentFile=-%h/hubd-queue-repl.env
+ExecStart=%h/bin/hubd-queue-repl
 Restart=on-failure
 RestartSec=5
 

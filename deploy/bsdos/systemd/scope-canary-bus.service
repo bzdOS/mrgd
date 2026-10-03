@@ -1,5 +1,6 @@
 # SCOPES.md section 10: a canary on every bus host. offsite-bus watches that
 # nothing home-scoped ever appears on the bus carrier (the local tunnel end).
+# TEMPLATE: <bus-root> is the bus scope's install root; substitute before install.
 [Unit]
 Description=scope-canary: home/** must never appear on the bus carrier
 After=network-online.target matrix-hs-bus.service
@@ -7,7 +8,7 @@ After=network-online.target matrix-hs-bus.service
 [Service]
 Environment=CANARY_WATCH=home/**
 Environment=CANARY_CONNECT=tcp/127.0.0.1:7451
-ExecStart=/srv/app-bus/scope-canary
+ExecStart=<bus-root>/scope-canary
 Restart=on-failure
 RestartSec=10
 

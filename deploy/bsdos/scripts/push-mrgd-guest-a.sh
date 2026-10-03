@@ -15,13 +15,14 @@
 #      the FreeBSD stubs (docs/DESIGN.md "FreeBSD builds")
 #
 # Usage (from anywhere on build-host):  sh deploy/bsdos/scripts/push-mrgd-guest-a.sh
-# Env:   BUILD=0 to skip the rebuild/restart (source refresh only)
+# Env:   BUILD=0 to skip the rebuild/restart (source refresh only);
+#        BSDOS_APP_ROOT is the build root to push from
 
 set -eu
 
 SSH="ssh -i ${BSDOS_SSH_KEY:?set BSDOS_SSH_KEY in /etc/fleet/hosts.env} -o BatchMode=yes"
 REMOTE="freebsd@${BSDOS_DEV_IP:?set BSDOS_DEV_IP in /etc/fleet/hosts.env}"
-SRC=/srv/app
+SRC=${BSDOS_APP_ROOT:?set BSDOS_APP_ROOT in /etc/fleet/hosts.env}
 
 echo "==> [1/4] rsync source (excluding target/, .git/)"
 rsync -a --delete -e "$SSH" \

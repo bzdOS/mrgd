@@ -49,8 +49,8 @@
 # node_id across nodes causes incorrect barrier resolution.
 #
 # ── ZENOH PORT NOTE ──────────────────────────────────────────────────────────
-# matrix-hs uses port 7448 (not 7447) to avoid colliding with bsdos-core's
-# Zenoh mesh (7447). Both services can coexist on the same host.
+# matrix-hs uses port 7448 (not 7447) to avoid colliding with the mesh
+# service's Zenoh port (7447). Both services can coexist on the same host.
 # ─────────────────────────────────────────────────────────────────────────────
 
 . /etc/rc.subr

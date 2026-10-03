@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 # mode=router; brokering only — no plaintext on any network interface (localhost bind).
-ExecStart=/root/bin/router
+ExecStart=%h/bin/router
 Restart=on-failure
 RestartSec=3
 

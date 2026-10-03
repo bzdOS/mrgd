@@ -30,7 +30,7 @@ SSH_A="ssh -i $KEY -o BatchMode=yes -o ConnectTimeout=20"
 SSH_B="ssh -i $KEY -o BatchMode=yes -o ConnectTimeout=20"
 KEEP=7
 TS=$(date +%Y%m%d-%H%M%S)
-HOST_STORE="${BSDOS_ROOT:?set BSDOS_ROOT in /etc/fleet/hosts.env}/artefacts/matrix-hs-data"
+HOST_STORE="${BSDOS_STORE_DIR:?set BSDOS_STORE_DIR (the node's store directory) in /etc/fleet/hosts.env}"
 RC=0
 
 backup() {
