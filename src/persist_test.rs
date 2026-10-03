@@ -1545,6 +1545,90 @@ mod persist_tests {
              invent a bound that the operator did not ask for"
         );
     }
+
+    // prune_then_append_visible:start
+    //   purpose: Regression for the prune/append race — an event appended AFTER
+    //            prune_room_journal must be readable from the live journal, and a second
+    //            prune must not lose it. With a bare fs::rename the process-wide cached
+    //            O_APPEND handle kept pointing at the replaced (unlinked) inode, so that
+    //            append landed in a file nobody reads: present in the pdumeta sidecar and
+    //            in the RoomLog, absent from the journal.
+    //   input:  none — temp data_dir via AppState::with_data_dir
+    //   output: assertions only; a panic names the failing step
+    //   sideEffects: creates and then removes one temp directory
+    // prune_then_append_visible:end
+    #[test]
+    fn prune_then_append_is_visible_and_survives_second_prune() {
+        let data_dir = make_temp_dir();
+        let state = AppState::with_data_dir(data_dir.to_path_buf());
+        let room_id = "!prune_swap_probe:localhost";
+        let journal_path = data_dir
+            .join("rooms")
+            .join(format!("{}.jsonl", crate::persist::sanitize_filename(room_id)));
+
+        let ev = |id: &str, ts: i64| {
+            json!({ "event_id": id, "room_id": room_id, "type": "m.room.message",
+                    "sender": "@u:localhost", "origin_server_ts": ts, "content": {} })
+        };
+        let read_ids = |p: &Path| -> Vec<String> {
+            let txt = std::fs::read_to_string(p).expect("read journal");
+            txt.lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .filter_map(|v| v.get("event_id").and_then(|e| e.as_str()).map(str::to_string))
+                .collect()
+        };
+
+        // 1. Three events through the public writer — this is what populates APPEND_FILES
+        //    with an O_APPEND handle for exactly this path, i.e. the precondition for the bug.
+        state.persist_room_event(room_id, &ev("$p1", 1));
+        state.persist_room_event(room_id, &ev("$p2", 2));
+        state.persist_room_event(room_id, &ev("$p3", 3));
+
+        let before = read_ids(&journal_path);
+        assert_eq!(before.len(), 3, "3 events expected before prune, got {before:?}");
+
+        // 2. Prune keeps two survivors.
+        let kept: std::collections::HashSet<String> =
+            ["$p1".to_string(), "$p2".to_string()].into_iter().collect();
+        crate::persist::prune_room_journal(&data_dir, room_id, &kept);
+
+        let after_prune = read_ids(&journal_path);
+        assert_eq!(
+            after_prune.len(),
+            2,
+            "prune must keep exactly the survivors, got {after_prune:?}"
+        );
+
+        // 3. Append after the prune — the step that used to vanish into the unlinked inode.
+        state.persist_room_event(room_id, &ev("$p4", 4));
+
+        let after_append = read_ids(&journal_path);
+        assert!(
+            after_append.iter().any(|id| id == "$p4"),
+            "append after prune must be visible in the live journal; journal holds {after_append:?}"
+        );
+
+        // 4. Second prune over all three survivors must keep the appended event.
+        let kept2: std::collections::HashSet<String> = ["$p1".to_string(), "$p2".to_string(), "$p4".to_string()]
+            .into_iter()
+            .collect();
+        crate::persist::prune_room_journal(&data_dir, room_id, &kept2);
+
+        let after_second = read_ids(&journal_path);
+        assert_eq!(
+            after_second.len(),
+            3,
+            "second prune must keep 3 events, got {after_second:?}"
+        );
+        assert!(
+            after_second.iter().any(|id| id == "$p4"),
+            "second prune must not lose the post-prune append; journal holds {after_second:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
 }
 
     // doc_markers_balanced:start

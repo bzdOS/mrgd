@@ -624,7 +624,13 @@ pub fn prune_room_journal(dir: &Path, room_id: &str, event_ids_kept: &HashSet<St
         tmp.flush()?;
         tmp.sync_data()?;
         drop(tmp);
-        fs::rename(&tmp_path, &final_path)?;
+        // swap_journal_file, not a bare rename: it takes the append-cache lock and
+        // drops the cached O_APPEND handle in the SAME critical section. A bare
+        // rename leaves that handle pointing at the replaced (now unlinked) inode,
+        // so the next append_line writes into a file nobody reads — the event
+        // exists in the pdumeta sidecar and in the RoomLog, but never reaches the
+        // journal. compact_room/compact_room_pdumeta already go through it.
+        crate::persist::swap_journal_file(&tmp_path, &final_path)?;
         Ok(())
     })();
 
