@@ -940,7 +940,7 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                         &mut stats,
                     )
                     .await;
-                    backoff.note_pass(*stats);
+                    backoff.note_pass(stats);
                     if backoff.delay_secs() > backstop_secs {
                         println!(
                             "cluster mode: {label}: systematic reject, next re-query in {} s",
