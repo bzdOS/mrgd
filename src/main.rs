@@ -849,6 +849,7 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
             }
         }
 
+        let mut startup_stats = mrgd::requery_backoff::CatchupStats::default();
         let converged = catchup_pass(
             &state,
             &catchup_session,
@@ -856,6 +857,7 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
             data_dir.as_deref(),
             catchup_timeout,
             "startup catch-up",
+            &mut startup_stats,
         )
         .await;
         if !converged.is_empty() {
@@ -893,6 +895,12 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                 let mut seen_peers: std::collections::HashSet<_> =
                     session_bg.info().peers_zid().await.collect();
                 let mut since_backstop = Duration::ZERO;
+                // Re-query backoff: a peer whose PDUs are systematically rejected
+                // (TOFU key mismatch, bad signature) must not cost a full-history
+                // re-query every MATRIX_HS_CATCHUP_INTERVAL_SECS forever.
+                let mut backoff =
+                    mrgd::requery_backoff::RequeryBackoff::new(backstop_secs);
+                let mut stats = mrgd::requery_backoff::CatchupStats::default();
                 loop {
                     tokio::time::sleep(poll).await;
                     since_backstop += poll;
@@ -902,8 +910,8 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                     let grew = peers.difference(&seen_peers).next().is_some();
                     seen_peers = peers;
 
-                    let backstop_due =
-                        backstop_secs > 0 && since_backstop >= Duration::from_secs(backstop_secs);
+                    let backstop_due = backstop_secs > 0
+                        && since_backstop >= Duration::from_secs(backoff.delay_secs());
                     if !grew && !backstop_due {
                         continue;
                     }
@@ -921,6 +929,7 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                     } else {
                         "re-query (periodic)"
                     };
+                    stats.reset();
                     let converged = catchup_pass(
                         &state_bg,
                         &session_bg,
@@ -928,8 +937,16 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                         dir_bg.as_deref(),
                         catchup_timeout,
                         label,
+                        &mut stats,
                     )
                     .await;
+                    backoff.note_pass(*stats);
+                    if backoff.delay_secs() > backstop_secs {
+                        println!(
+                            "cluster mode: {label}: systematic reject, next re-query in {} s",
+                            backoff.delay_secs()
+                        );
+                    }
                     if !converged.is_empty() {
                         println!(
                             "cluster mode: {label}: {} room(s) answered",
@@ -1014,6 +1031,7 @@ async fn catchup_pass(
     data_dir: Option<&std::path::Path>,
     timeout: Duration,
     label: &str,
+    stats: &mut mrgd::requery_backoff::CatchupStats,
 ) -> std::collections::HashSet<String> {
     let mut converged: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -1052,7 +1070,7 @@ async fn catchup_pass(
                 }
                 // May be a room this node has never heard of: merge_catchup_delta
                 // creates the RoomLog and room state for it.
-                merge_catchup_delta(state, room_id, &delta, data_dir);
+                merge_catchup_delta(state, room_id, &delta, data_dir, stats);
                 converged.insert(room_id.to_string());
             }
         }
@@ -1128,6 +1146,7 @@ fn merge_catchup_delta(
     room_id: &str,
     delta: &mrgd::substrate::matrix_events::RoomLogDelta,
     data_dir: Option<&std::path::Path>,
+    stats: &mut mrgd::requery_backoff::CatchupStats,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -1209,6 +1228,8 @@ fn merge_catchup_delta(
             .collect();
         (new_pdus, rejected_count)
     };
+    stats.rejected += rejected;
+    stats.applied += new_pdus.len();
 
     if rejected > 0 {
         if mrgd::substrate::observ::enabled() {

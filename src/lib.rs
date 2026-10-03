@@ -23,6 +23,7 @@ pub mod error;
 pub mod hubd_bridge;
 pub mod hub_replic;
 pub mod persist;
+pub mod requery_backoff;
 pub mod routes;
 pub mod scripting;
 pub mod substrate;
