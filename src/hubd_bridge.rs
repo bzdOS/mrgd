@@ -91,7 +91,7 @@ use crate::state::{AppState, StateEvent};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -729,16 +729,98 @@ fn discover_roles(state: &Arc<AppState>, cfg: &BridgeConfig) -> Vec<String> {
     roles
 }
 
+// block_content_id:start
+//   purpose: The identity of a hubd block by its CONTENT, so re-publishing the same
+//            block is recognisable as the same block.  Needed because the ingest
+//            cursor is a byte offset written AFTER the chunk is published: a node
+//            killed in that window comes back, re-reads the same blocks, and
+//            insert_pdu — which mints event_id from wall-clock ts + depth +
+//            prev_events — gives every one of them a NEW id.  The grow-set cannot
+//            dedup that, the room grows a second copy, and every consumer appends
+//            the block twice.  Keyed by role, origin, hubd ts, from and body:
+//            exactly the fields block_from_event reads back, so the id computed on
+//            ingest and the id computed from a room event are the same string.
+//            NUL-separated with a domain prefix, so no combination of fields can
+//            imitate another.
+//   input:  role, origin, ts, from, body
+//   output: "$" + base64url-nopad(sha256)
+//   sideEffects: none
+// block_content_id:end
+pub fn block_content_id(role: &str, origin: &str, ts: &str, from: &str, body: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(b"hubd-queue-block\0");
+    for field in [role, origin, ts, from, body] {
+        h.update(field.as_bytes());
+        h.update([0u8]);
+    }
+    format!("${}", URL_SAFE_NO_PAD.encode(h.finalize()))
+}
+
+// room_block_ids:start
+//   purpose: Every queue-block id already present in a role's room, computed the
+//            same way ingest computes it.  Built once per room per process and then
+//            extended in memory, so the dedup costs one room scan at start-up and
+//            O(1) per block afterwards.
+//   input:  state, room_id
+//   output: HashSet of block content ids
+//   sideEffects: none (reads under the rooms lock, releases it before returning)
+// room_block_ids:end
+fn room_block_ids(state: &Arc<AppState>, room_id: &str) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let Ok(rooms) = state.rooms.lock() else {
+        return ids;
+    };
+    let Some(log) = rooms.get(room_id) else {
+        return ids;
+    };
+    for pdu in log.ordered() {
+        if pdu.kind != "m.room.message" {
+            continue;
+        }
+        let Ok(content) = serde_json::from_slice::<Value>(&pdu.content) else {
+            continue;
+        };
+        let q = content.get(CONTENT_KEY);
+        let Some(role) = q.and_then(|q| q.get("role")).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let origin = origin_of(&content, &pdu.signer_node);
+        let ts = q
+            .and_then(|q| q.get("ts"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let from = q
+            .and_then(|q| q.get("from"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let body = content
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        ids.insert(block_content_id(role, &origin, ts, from, body));
+    }
+    ids
+}
+
 // ingest_role:start
 //   purpose: Read whatever hubd appended to THIS node's queue file since the last
 //            pass and turn each new block into a room message. Only this node's own
 //            file is ever read here — that asymmetry is the loop prevention.
-//   input:  state, cfg, role
+//            A block whose content id is already in the room is skipped rather than
+//            re-published: the byte-offset cursor is written after the chunk, so an
+//            ungraceful stop between the two makes this pass see the same blocks
+//            again, and without the check every one of them would land twice.
+//   input:  state, cfg, role, seen — per-room content ids, carried across passes
 //   output: number of blocks ingested
 //   sideEffects: inserts PDUs (which persist, notify and, in cluster mode, publish);
 //                advances the persisted byte offset
 // ingest_role:end
-pub(crate) async fn ingest_role(state: &Arc<AppState>, cfg: &BridgeConfig, role: &str) -> usize {
+pub(crate) async fn ingest_role(
+    state: &Arc<AppState>,
+    cfg: &BridgeConfig,
+    role: &str,
+    seen: &mut HashMap<String, HashSet<String>>,
+) -> usize {
     let file = queue_file_name(role, &cfg.node);
     let path = cfg.queues_dir.join(&file);
     let Ok(meta) = std::fs::metadata(&path) else {
@@ -781,8 +863,15 @@ pub(crate) async fn ingest_role(state: &Arc<AppState>, cfg: &BridgeConfig, role:
 
     let room_id = ensure_queue_room(state, role);
     let sender = format!("@hubd:{}", state.server_name);
+    let ids = seen
+        .entry(room_id.clone())
+        .or_insert_with(|| room_block_ids(state, &room_id));
     let mut n = 0usize;
     for b in &blocks {
+        let content_id = block_content_id(role, &cfg.node, &b.ts, &b.from, &b.body);
+        if ids.contains(&content_id) {
+            continue; // already in the room — re-read after an ungraceful stop
+        }
         let content = json!({
             "msgtype": "m.text",
             "body": b.body,
@@ -810,7 +899,10 @@ pub(crate) async fn ingest_role(state: &Arc<AppState>, cfg: &BridgeConfig, role:
         )
         .await
         {
-            Ok(_) => n += 1,
+            Ok(_) => {
+                ids.insert(content_id);
+                n += 1;
+            }
             Err(e) => {
                 // Stop at the first failure and leave the offset where it is, so the
                 // whole remaining chunk is retried rather than silently dropped.
@@ -959,11 +1051,12 @@ pub fn spawn(state: Arc<AppState>) -> bool {
     );
     tokio::spawn(async move {
         let mut counts: HashMap<PathBuf, (u64, usize)> = HashMap::new();
+        let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
         loop {
             drain_cluster(&state).await;
             for role in discover_roles(&state, &cfg) {
                 ensure_queue_room(&state, &role);
-                ingest_role(&state, &cfg, &role).await;
+                ingest_role(&state, &cfg, &role, &mut seen).await;
                 materialize_role(&state, &cfg, &role, &mut counts);
             }
             tokio::time::sleep(std::time::Duration::from_millis(cfg.poll_ms)).await;

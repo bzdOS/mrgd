@@ -687,7 +687,11 @@ mod tests {
         cfg: &BridgeConfig,
         role: &str,
     ) -> usize {
-        crate::hubd_bridge::ingest_role(state, cfg, role).await
+        // A fresh content-id cache per call, exactly like a process that has just
+        // started: the cache is an optimisation, and the dedup itself comes from
+        // scanning the room, so every call must stand on its own.
+        let mut seen = std::collections::HashMap::new();
+        crate::hubd_bridge::ingest_role(state, cfg, role, &mut seen).await
     }
 
     fn materialize_role_for_test(

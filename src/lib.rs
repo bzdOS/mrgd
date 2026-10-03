@@ -169,6 +169,8 @@ mod timeline_limited_signal_test;
 #[cfg(test)]
 mod push_test;
 #[cfg(test)]
+mod bridge_rehearsal_test;
+#[cfg(test)]
 mod profile_displayname_test;
 #[cfg(test)]
 mod redact_test;
