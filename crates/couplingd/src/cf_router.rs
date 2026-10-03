@@ -167,7 +167,7 @@ pub struct Route {
     pub class: RouteClass,
     /// Opaque address/locator string for this route.
     /// Internal: private-network locator (e.g. "192.0.2.2:7447").
-    /// Public:   dotted-decimal IPv4 (e.g. "1.2.3.4").
+    /// Public:   dotted-decimal IPv4 (e.g. "203.0.113.4").
     /// Cloudflare: CF-tunnel hostname (e.g. "<tunnel_id>.cfargotunnel.com").
     pub locator: String,
     /// True only for Cloudflare routes — traffic traverses the CF edge.
@@ -486,7 +486,7 @@ mod tests {
     fn desired_for_datacenter_node_returns_direct_a() {
         let node = NodeMeta {
             node_id:       "dc-fra-01".to_string(),
-            public_ip:     Some(Ipv4Addr::new(1, 2, 3, 4)),
+            public_ip:     Some(Ipv4Addr::new(203, 0, 113, 4)),
             cf_tunnel_id:  None,
             internal_addr: None,
         };
@@ -496,7 +496,7 @@ mod tests {
             rec,
             DesiredRecord::DirectA {
                 host: "matrix.example.com".to_string(),
-                ip:   Ipv4Addr::new(1, 2, 3, 4),
+                ip:   Ipv4Addr::new(203, 0, 113, 4),
             },
             "DirectA must carry the node's public IP"
         );
@@ -532,7 +532,7 @@ mod tests {
         // direct path wins (public_ip match arm is first).
         let node = NodeMeta {
             node_id:       "dc-both".to_string(),
-            public_ip:     Some(Ipv4Addr::new(5, 6, 7, 8)),
+            public_ip:     Some(Ipv4Addr::new(203, 0, 113, 8)),
             cf_tunnel_id:  Some("should-be-ignored".to_string()),
             internal_addr: None,
         };
@@ -698,7 +698,7 @@ mod tests {
     fn routes_for_datacenter_node_returns_internal_then_public() {
         let node = NodeMeta {
             node_id:       "dc-fra-01".to_string(),
-            public_ip:     Some(Ipv4Addr::new(1, 2, 3, 4)),
+            public_ip:     Some(Ipv4Addr::new(203, 0, 113, 4)),
             cf_tunnel_id:  None,
             internal_addr: Some("192.0.2.2:7447".to_string()),
         };
@@ -709,7 +709,7 @@ mod tests {
         assert_eq!(routes[0].locator, "192.0.2.2:7447");
         assert_eq!(routes[1].class, RouteClass::Public, "second must be Public");
         assert_eq!(routes[1].proxied, false, "Public must not be proxied");
-        assert_eq!(routes[1].locator, "1.2.3.4");
+        assert_eq!(routes[1].locator, "203.0.113.4");
     }
 
     // ── routes_for: NAT node (tunnel + internal) → [Internal, Cloudflare] ─────
@@ -736,7 +736,7 @@ mod tests {
     fn routes_for_all_three_returns_all_three_in_order() {
         let node = NodeMeta {
             node_id:       "full-node".to_string(),
-            public_ip:     Some(Ipv4Addr::new(9, 8, 7, 6)),
+            public_ip:     Some(Ipv4Addr::new(203, 0, 113, 9)),
             cf_tunnel_id:  Some("tid-xyz".to_string()),
             internal_addr: Some("198.51.100.1:7447".to_string()),
         };
@@ -786,7 +786,7 @@ mod tests {
     fn select_route_on_mesh_prefers_internal() {
         let node = NodeMeta {
             node_id:       "dc-node".to_string(),
-            public_ip:     Some(Ipv4Addr::new(1, 1, 1, 1)),
+            public_ip:     Some(Ipv4Addr::new(203, 0, 113, 11)),
             cf_tunnel_id:  Some("t-id".to_string()),
             internal_addr: Some("192.0.2.1:7447".to_string()),
         };
@@ -802,7 +802,7 @@ mod tests {
     fn select_route_off_mesh_prefers_public() {
         let node = NodeMeta {
             node_id:       "dc-node-2".to_string(),
-            public_ip:     Some(Ipv4Addr::new(2, 2, 2, 2)),
+            public_ip:     Some(Ipv4Addr::new(203, 0, 113, 22)),
             cf_tunnel_id:  Some("t-id-2".to_string()),
             internal_addr: Some("192.0.2.2:7447".to_string()),
         };
