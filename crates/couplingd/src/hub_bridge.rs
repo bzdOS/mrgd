@@ -23,7 +23,7 @@
 //          event_id dedup as backstop).
 //
 // INTENT: PoC for the hub↔Matrix channel. Mem-impl for unit tests; File-impl for
-//         host integration tests (temp files only — never /root/.hubd).
+//         host integration tests (temp files only — never a live hub directory).
 // DEPENDENCIES: std, crate::matrix_events::{Pdu, RoomLog}
 // PUBLIC_API: HubEventKind, HubEvent, HubCommand, BridgeError,
 //             HubSource (trait), MemHubSource, FileHubSource,
@@ -1262,7 +1262,7 @@ mod tests {
     }
 
     // ── FILE-APPEND MODEL TESTS ──────────────────────────────────────────────
-    // All tests use temp files in the OS temp dir — never /root/.hubd.
+    // All tests use temp files in the OS temp dir — never a live hub directory.
 
     fn tmp_journal() -> std::path::PathBuf {
         // Use a unique filename per test by including the thread id.

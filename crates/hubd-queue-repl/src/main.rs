@@ -41,7 +41,7 @@
 //       forwards its localhost port over `autossh -N -L 7449:127.0.0.1:7449 <peer>`
 //       and the local daemon CONNECTs to tcp/127.0.0.1:7449. Traffic rides ssh (TLS).
 //   (B) Zenoh TLS/QUIC locators (tls/<host>:<port>) with mutual certs/PSK — reuse the
-//       zenoh transport_tls feature already in the workspace (cf. bsdos-core F2 mTLS).
+//       zenoh transport_tls feature already in the workspace (cf. the F2 mTLS notes).
 // CAVEAT: on ТСПУ/DPI-filtered ISPs `ssh -L` may be cut — fall back to (B) or the
 // obfs link; see see the DPI notes below (Zenoh-over-ssh-exec) for the extreme-DPI path.
 // END_AI_HEADER

@@ -34,8 +34,8 @@ use thiserror::Error;
 //            `bsdos/net/node/<node_id>` KV (SPEC_net_v1 §3a.2, §3b, §9).
 //            `public_ip` present → ЦОД-direct; absent + `cf_tunnel_id` present → NAT-relay.
 //            `internal_addr` present → node reachable inside the trusted overlay (Internal route).
-//            The `internal_addr` string is opaque: it may be a Tailscale 100.x address, a
-//            Zenoh-mesh locator such as "tcp/100.64.0.2:7447", or any other private-network
+//            The `internal_addr` string is opaque: it may be a carrier-grade-NAT overlay
+//            address, a mesh locator such as "tcp/192.0.2.2:7447", or any other private-network
 //            reachability hint — the model does not hardcode the underlying technology.
 //            See SPEC_net_v1 §3b for the open Tailscale-vs-Zenoh-mesh decision.
 //   input:  populated from KV watch on `bsdos/net/node/*`
@@ -51,7 +51,7 @@ pub struct NodeMeta {
     /// Cloudflare Tunnel ID for NAT nodes (format: UUID, cfargotunnel.com suffix).
     pub cf_tunnel_id: Option<String>,
     /// Opaque private/mesh locator for the Internal route class (SPEC_net_v1 §3b).
-    /// Examples: "100.64.0.2:7447" (Tailscale 100.x), "tcp/100.64.0.2:7447" (Zenoh locator).
+    /// Examples: "192.0.2.2:7447" (overlay range), "tcp/192.0.2.2:7447" (mesh locator).
     /// None if the node has no known internal-network address.
     pub internal_addr: Option<String>,
 }
@@ -166,7 +166,7 @@ pub struct Route {
     /// Which class of connectivity this route represents.
     pub class: RouteClass,
     /// Opaque address/locator string for this route.
-    /// Internal: private-network locator (e.g. "100.64.0.2:7447").
+    /// Internal: private-network locator (e.g. "192.0.2.2:7447").
     /// Public:   dotted-decimal IPv4 (e.g. "1.2.3.4").
     /// Cloudflare: CF-tunnel hostname (e.g. "<tunnel_id>.cfargotunnel.com").
     pub locator: String,
@@ -700,13 +700,13 @@ mod tests {
             node_id:       "dc-fra-01".to_string(),
             public_ip:     Some(Ipv4Addr::new(1, 2, 3, 4)),
             cf_tunnel_id:  None,
-            internal_addr: Some("100.64.0.2:7447".to_string()),
+            internal_addr: Some("192.0.2.2:7447".to_string()),
         };
         let routes = routes_for(&node).expect("DC node with public+internal must succeed");
         assert_eq!(routes.len(), 2, "DC node: exactly two routes (Internal + Public)");
         assert_eq!(routes[0].class, RouteClass::Internal, "first must be Internal");
         assert_eq!(routes[0].proxied, false, "Internal must not be proxied");
-        assert_eq!(routes[0].locator, "100.64.0.2:7447");
+        assert_eq!(routes[0].locator, "192.0.2.2:7447");
         assert_eq!(routes[1].class, RouteClass::Public, "second must be Public");
         assert_eq!(routes[1].proxied, false, "Public must not be proxied");
         assert_eq!(routes[1].locator, "1.2.3.4");
@@ -720,7 +720,7 @@ mod tests {
             node_id:       "nat-home-01".to_string(),
             public_ip:     None,
             cf_tunnel_id:  Some("abc123def456".to_string()),
-            internal_addr: Some("100.64.0.5:7447".to_string()),
+            internal_addr: Some("192.0.2.5:7447".to_string()),
         };
         let routes = routes_for(&node).expect("NAT node with tunnel+internal must succeed");
         assert_eq!(routes.len(), 2, "NAT node: exactly two routes (Internal + Cloudflare)");
@@ -738,7 +738,7 @@ mod tests {
             node_id:       "full-node".to_string(),
             public_ip:     Some(Ipv4Addr::new(9, 8, 7, 6)),
             cf_tunnel_id:  Some("tid-xyz".to_string()),
-            internal_addr: Some("100.64.1.1:7447".to_string()),
+            internal_addr: Some("198.51.100.1:7447".to_string()),
         };
         let routes = routes_for(&node).expect("node with all three must succeed");
         assert_eq!(routes.len(), 3, "expected exactly three routes");
@@ -755,7 +755,7 @@ mod tests {
             node_id:       "mesh-only-01".to_string(),
             public_ip:     None,
             cf_tunnel_id:  None,
-            internal_addr: Some("100.64.2.3:7447".to_string()),
+            internal_addr: Some("203.0.113.3:7447".to_string()),
         };
         let routes = routes_for(&node).expect("internal-only node must succeed");
         assert_eq!(routes.len(), 1);
@@ -788,7 +788,7 @@ mod tests {
             node_id:       "dc-node".to_string(),
             public_ip:     Some(Ipv4Addr::new(1, 1, 1, 1)),
             cf_tunnel_id:  Some("t-id".to_string()),
-            internal_addr: Some("100.64.0.1:7447".to_string()),
+            internal_addr: Some("192.0.2.1:7447".to_string()),
         };
         let routes = routes_for(&node).expect("routes must be non-empty");
         let chosen = select_route(&routes, true).expect("must choose a route");
@@ -804,7 +804,7 @@ mod tests {
             node_id:       "dc-node-2".to_string(),
             public_ip:     Some(Ipv4Addr::new(2, 2, 2, 2)),
             cf_tunnel_id:  Some("t-id-2".to_string()),
-            internal_addr: Some("100.64.0.2:7447".to_string()),
+            internal_addr: Some("192.0.2.2:7447".to_string()),
         };
         let routes = routes_for(&node).expect("routes must be non-empty");
         let chosen = select_route(&routes, false).expect("must choose a route");
@@ -820,7 +820,7 @@ mod tests {
             node_id:       "nat-node".to_string(),
             public_ip:     None,
             cf_tunnel_id:  Some("t-nat".to_string()),
-            internal_addr: Some("100.64.0.3:7447".to_string()),
+            internal_addr: Some("192.0.2.3:7447".to_string()),
         };
         let routes = routes_for(&node).expect("routes must be non-empty");
         let chosen = select_route(&routes, false).expect("must choose a route");

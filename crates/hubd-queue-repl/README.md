@@ -33,7 +33,7 @@ cargo build -p hubd-queue-repl --release   # → target/release/hubd-queue-repl
 > §"East–west vs north–south"; measurements in `docs/TOPOLOGY.md`.
 >
 > **Known violation (2026-08-03):** the deployed matrix-hs env
-> (`/srv/mesh/artefacts/matrix-hs-bridge.env`) sets
+> (`<mesh-root>/<store-dir>/matrix-hs-bridge.env`) sets
 > `MATRIX_HS_ZENOH_CONNECT=tcp/203.0.113.11:7448,tcp/203.0.113.12:7448` —
 > plaintext Zenoh aimed at public IPs, exactly what this section forbids. It is
 > also moot in practice: both ports measure **filtered**, while ssh is open on
@@ -71,7 +71,7 @@ plaintext Zenoh port to the internet.
 ### (B) Zenoh TLS/QUIC locators with certs
 
 Use `tls/<host>:<port>` endpoints with mutual certs/PSK (the `transport_tls`
-feature is already in the workspace; cf. `bsdos-core` F2 mTLS, task F2 (mTLS)). No ssh
+feature is already in the workspace; cf. the F2 mTLS notes, task F2 (mTLS)). No ssh
 tunnel needed; Zenoh itself is encrypted.
 
 ## Config (env)

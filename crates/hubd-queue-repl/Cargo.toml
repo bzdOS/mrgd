@@ -17,9 +17,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `workspace = true` had nothing to resolve. A minimal workspace here makes the
 # crate build standalone. Versions/features copied verbatim from the bzdOS
 # monorepo root [workspace.dependencies] (github.com/bzdOS/bzdOS @ b5d939e);
-# sha2 is not in that table, its "0.10" line is taken from bsdos-pkgd in the
-# same commit (and resolves to 0.10.9, which is what this repo's Cargo.lock
-# already pins). Not folded into the mrgd workspace, by fleet decision.
+# sha2 is not in that table, its "0.10" line is taken from the sibling packaging
+# manifest in the same commit (and resolves to 0.10.9, which is what this repo's
+# Cargo.lock already pins). Not folded into the mrgd workspace, by fleet decision.
 [workspace]
 
 [workspace.dependencies]
