@@ -169,6 +169,8 @@ mod timeline_limited_signal_test;
 #[cfg(test)]
 mod push_test;
 #[cfg(test)]
+mod profile_displayname_test;
+#[cfg(test)]
 mod redact_test;
 #[cfg(test)]
 mod register_test;
@@ -369,6 +371,10 @@ fn cs_api_routes() -> Router<Arc<AppState>> {
         )
         .route("/joined_rooms", get(routes::account::get_joined_rooms))
         .route("/profile/{user_id}", get(routes::account::get_profile))
+        .route(
+            "/profile/{user_id}/displayname",
+            get(routes::account::get_displayname),
+        )
         .route("/devices", get(routes::account::get_devices))
         // ── Room join & directory ─────────────────────────────────────────────
         .route(

@@ -5,8 +5,8 @@
 //          and deactivate.
 // DEPENDENCIES: axum, AppState, auth
 // PUBLIC_API: get_whoami, get_capabilities, get_pushrules, post_user_filter,
-//             get_user_filter, get_joined_rooms, get_profile, get_devices,
-//             post_deactivate, post_logout, post_logout_all,
+//             get_user_filter, get_joined_rooms, get_profile, get_displayname,
+//             get_devices, post_deactivate, post_logout, post_logout_all,
 //             post_user_directory_search
 // END_AI_HEADER
 
@@ -220,20 +220,66 @@ pub async fn get_joined_rooms(
     Ok(Json(json!({ "joined_rooms": joined })))
 }
 
+// displayname_of:start
+//   purpose: The ONE place that turns a Matrix user id into the displayname both
+//            profile routes answer with.  Returns None when the id carries no
+//            localpart ("@:server", or a bare server name), so a caller can tell
+//            "this user has no displayname" from "this user is called alice".
+//            Both /profile/{userId} and /profile/{userId}/displayname go through
+//            it, which is what keeps them in agreement: the sub-resource can
+//            never disagree with the full profile about the same user.
+//   input:  user_id — Matrix user id ("@localpart:server") or a bare name
+//   output: Option<String> — the localpart, or None when there is none
+//   sideEffects: none (pure)
+// displayname_of:end
+fn displayname_of(user_id: &str) -> Option<String> {
+    let localpart = user_id
+        .strip_prefix('@')
+        .unwrap_or(user_id)
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    if localpart.is_empty() {
+        None
+    } else {
+        Some(localpart.to_string())
+    }
+}
+
 // get_profile:start
-//   purpose: Return profile information for a user (stub).
+//   purpose: Return profile information for a user.
 //   input:  userId path param
-//   output: JSON {"displayname":"<localpart>"}
+//   output: JSON {"displayname":"<localpart>"}; an id with no localpart is
+//           echoed back as the displayname rather than answered with an empty
+//           string, which is what this route has always done for such an id.
 //   sideEffects: none
 // get_profile:end
 pub async fn get_profile(Path(user_id): Path<String>) -> Json<Value> {
-    let displayname = user_id
-        .strip_prefix('@')
-        .and_then(|s| s.split(':').next())
-        .unwrap_or(&user_id)
-        .to_string();
+    let displayname = displayname_of(&user_id).unwrap_or(user_id);
 
     Json(json!({ "displayname": displayname }))
+}
+
+// get_displayname:start
+//   purpose: GET /_matrix/client/{v3,r0}/profile/{userId}/displayname — the
+//            displayname sub-resource clients call instead of parsing the full
+//            profile.  Same source of truth as get_profile, so for every user the
+//            two agree on the name; the only difference is the body: a user with
+//            a displayname gets {"displayname": …}, a user without one gets {}
+//            (the field is absent, not null and not an empty string).  An unknown
+//            user is NOT an error here: it answers exactly what the full profile
+//            answers for it today, because a client that gets 404 from the
+//            sub-resource and 200 from the full profile has to treat the user as
+//            present.  Requires no access token, like the full profile.
+//   input:  userId path param
+//   output: JSON {"displayname": "<name>"} or {}
+//   sideEffects: none
+// get_displayname:end
+pub async fn get_displayname(Path(user_id): Path<String>) -> Json<Value> {
+    match displayname_of(&user_id) {
+        Some(name) => Json(json!({ "displayname": name })),
+        None => Json(json!({})),
+    }
 }
 
 // get_devices:start
