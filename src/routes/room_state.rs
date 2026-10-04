@@ -183,6 +183,11 @@ pub async fn post_join_room_or_alias(
     let user_id = extract_token_user(&headers, &state.token_secret, &state.server_name)
         .ok_or_else(|| HsError::UnknownToken("missing or invalid token".to_string()))?;
     let room_id = resolve_room_id(&state, &room_id_or_alias)?;
+    // Same rule as the room-id path: a resolvable alias is not a licence
+    // to invent the room behind it.
+    if !room_is_known(&state, &room_id) {
+        return Err(HsError::RoomNotFound(room_id));
+    }
     state.ensure_room_state(&room_id);
     #[cfg_attr(not(feature = "cluster"), allow(unused_variables))]
     let ev = add_member_state_event(&state, &room_id, &user_id, "join", &user_id, None)?;
@@ -206,6 +211,13 @@ pub async fn post_join_room(
 ) -> Result<Json<Value>, HsError> {
     let user_id = extract_token_user(&headers, &state.token_secret, &state.server_name)
         .ok_or_else(|| HsError::UnknownToken("missing or invalid token".to_string()))?;
+    // The spec answer for a room this node has never heard of is 404
+    // M_NOT_FOUND. The ensure_room_state() below used to create it instead, so a
+    // join for a typo or a not-yet-arrived room id silently produced an
+    // empty shell: one membership event, no content, forever in the room list.
+    if !room_is_known(&state, &room_id) {
+        return Err(HsError::RoomNotFound(room_id));
+    }
     state.ensure_room_state(&room_id);
     #[cfg_attr(not(feature = "cluster"), allow(unused_variables))]
     let ev = add_member_state_event(&state, &room_id, &user_id, "join", &user_id, None)?;
@@ -1240,4 +1252,34 @@ pub(crate) async fn drain_cluster_state(state: &Arc<AppState>) -> Result<(), HsE
     }
 
     Ok(())
+}
+
+// room_is_known:start
+//   purpose: Whether this node can answer a join for `room_id` at all. Three sources count
+//            as known: local state events, a local RoomLog (a room pulled in by catch-up
+//            has a log but no member state yet), and a room the cluster has discovered
+//            from a peer. This is what stops join from inventing rooms.
+//   input:  state, room_id
+//   output: bool
+//   sideEffects: none — read-only locks, no mutation
+//
+//   Known gap, stated rather than hidden: a room that exists ONLY on a peer and has not
+//   been pulled yet is not known here, so join answers 404 until the next catch-up brings
+//   it. Pulling on demand is a separate feature — not something to fake by creating an
+//   empty shell, which is the defect this replaces.
+// room_is_known:end
+fn room_is_known(state: &Arc<AppState>, room_id: &str) -> bool {
+    if state.room_state.lock().map(|rs| rs.contains_key(room_id)).unwrap_or(false) {
+        return true;
+    }
+    if state.rooms.lock().map(|r| r.contains_key(room_id)).unwrap_or(false) {
+        return true;
+    }
+    #[cfg(feature = "cluster")]
+    if let Some(c) = state.cluster.as_ref() {
+        if c.list_room_ids().iter().any(|r| r == room_id) {
+            return true;
+        }
+    }
+    false
 }
