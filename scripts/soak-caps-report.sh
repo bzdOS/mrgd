@@ -21,6 +21,10 @@
 # depth per room through the messages endpoint; feed it with --token to get it, otherwise
 # skip it. Guessing a number for an invisible counter is worse than printing nothing.
 #
+# ENDPOINT. Pass the scheme the server actually speaks — this one answers plain HTTP, so
+# an https:// here fails the TLS handshake with "wrong version number" and reads as a dead
+# server rather than as a wrong flag.
+#
 # TRAFFIC CLASSES. Checkpoints carry the trigger that produced them, so automated and
 # interactive stretches are separable: pass --class-regex to tag one subset (e.g. rows
 # poked while the console client was driving). Rows are counted per trigger, so an
@@ -36,7 +40,12 @@
 
 set -eu
 
-CAPS_FILE=deploy/soak-caps.env.example.example
+# Resolved from this script's own location, not from the caller's cwd: the first
+# version used a relative path, so running the reporter from the stand's home
+# — the natural place to run it — printed "fragment not readable" for a file that
+# was sitting right there in the tree.
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+CAPS_FILE=$SCRIPT_DIR/../deploy/soak-caps.env.example
 PID=""
 MEMPROBE=""
 TOKEN=""
@@ -75,19 +84,44 @@ echo
 echo "== 2. caps IN EFFECT in a live process (read-only) =="
 if [ -z "$PID" ]; then
 	echo "   no --pid given; skipped. Without this row, 'caps were set' is an assumption."
-elif ! kill -0 "$PID" 2>/dev/null; then
-	echo "   pid $PID is not running — a flat RSS line from a dead process looks like success."
+elif ! ps -p "$PID" >/dev/null 2>&1; then
+	# Liveness is asked with ps, NOT with `kill -0`. `kill -0` returns EPERM when the
+	# process belongs to another user — the normal case here, since this reporter is
+	# meant to be runnable by whoever is watching, not only by the process owner. The
+	# first version read that EPERM as "not running" and refused to print the caps of a
+	# perfectly healthy server. Two different failures, one check.
+	echo "   pid $PID does not exist — a flat RSS line from a dead process looks like success."
 	echo "   STOP: there is nothing to read."
 	exit 1
 else
 	echo "   pid $PID alive"
-	ps -o pid=,rss=,vsz=,etime= -p "$PID" 2>/dev/null \
+	# Separate -o flags, deliberately. On FreeBSD `ps -o pid=,rss=,vsz=,etime=` prints
+	# the literal header ",rss=,vsz=,etime=" and then a bare pid, so every awk field
+	# after $1 is empty: the reporter showed rss=0.0 MiB for a process using 275 MiB,
+	# twice — once for the bogus header, once for the pid.
+	ps -o pid= -o rss= -o vsz= -o etime= -p "$PID" 2>/dev/null \
 		| awk '{printf "   rss=%.1f MiB  vsz=%.1f MiB  elapsed=%s\n", $2/1024, $3/1024, $4}'
 	# The environment of the running process, caps only. Read-only; no secrets printed.
-	ps eww -p "$PID" 2>/dev/null \
+	#
+	# The result is CAPTURED and then judged, not piped straight to a fallback. The
+	# previous version ended the pipeline with `| sed ... || echo "no cap variables"` —
+	# and sed exits 0 on empty input, so the fallback could never fire. Run by anyone
+	# who is not the process owner, `ps eww` yields no environment at all (FreeBSD
+	# restricts it), the grep found nothing, and the reporter printed NOTHING where the
+	# caps should be — an empty line that reads exactly like "no caps are set". That is
+	# the one false negative this whole reporter exists to prevent, so an unreadable
+	# environment now says so in words.
+	caps_seen=$(ps eww -p "$PID" 2>/dev/null \
 		| tr ' ' '\n' \
-		| grep -E '^MATRIX_HS_(ROOMLOG|TIMELINE)_MAX_EVENTS=' \
-		| sed 's/^/   /' || echo "   no cap variables in the process environment (0/absent = unlimited)"
+		| grep -E '^MATRIX_HS_(ROOMLOG|TIMELINE)_MAX_EVENTS=' || true)
+	if [ -n "$caps_seen" ]; then
+		printf '%s\n' "$caps_seen" | sed 's/^/   /'
+	else
+		echo "   COULD NOT READ the environment of pid $PID."
+		echo "   Another user's process environment is not readable without privilege."
+		echo "   NOT A MEASUREMENT OF ZERO: no caps visible here is not 'no caps set'."
+		echo "   Re-run as the process owner (or root) before trusting this row."
+	fi
 fi
 
 echo
