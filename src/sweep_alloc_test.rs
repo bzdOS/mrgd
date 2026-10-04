@@ -126,6 +126,81 @@ fn sweep_alloc_profile_prints_per_site_bytes() {
         "[sweep-alloc-profile] verdict: id-set rebuilds = {rebuilt}B of {total}B; per-room {:.1}B; candidates-only path",
         total as f64 / ROOMS as f64
     );
+
+    // ── Residual calibration: the two new sites on a REAL parse+verify round-trip ──
+    // The eight sites above are all the merge path; what the live window could not
+    // attribute was here, so the counters must be calibrated against bytes-in as well as
+    // allocated-out. No stand, no network: one room, 8 signed PDUs through the production
+    // `delta_from_bytes` and `apply_delta_verified`.
+    {
+        use crate::substrate::matrix_events::{
+            delta_from_bytes, delta_to_bytes, Pdu, RoomLog, RoomLogDelta,
+        };
+        use crate::substrate::node_auth::{NodeKeyStore, NodeSigner};
+
+        const PDUS: usize = 8;
+        const BODY: usize = 200;
+
+        let signer = NodeSigner::from_seed([71u8; 32], "node-calib".to_string());
+        let store = NodeKeyStore::new();
+        store.insert(&signer.node_id, signer.verifying_key_bytes());
+
+        let mut wire_pdus: Vec<Pdu> = Vec::with_capacity(PDUS);
+        for i in 0..PDUS {
+            let prev = if i == 0 {
+                Vec::new()
+            } else {
+                vec![wire_pdus[i - 1].event_id.clone()]
+            };
+            wire_pdus.push(Pdu::signed(
+                "!calibration:localhost".to_string(),
+                format!("@calibrator:{}", signer.node_id),
+                "m.room.message".to_string(),
+                format!("{{\"body\":\"{}\"}}", "x".repeat(BODY)).into_bytes(),
+                prev,
+                i as u64,
+                1_700_000_000_000 + i as u64,
+                &signer,
+            ));
+        }
+        let blob = delta_to_bytes(&RoomLogDelta {
+            pdus: wire_pdus.clone(),
+            collected_depth: 0,
+        });
+
+        sweep_alloc::reset();
+        let parsed = delta_from_bytes(&blob).expect("own encoding must parse");
+        let mut log = RoomLog::new();
+        let (accepted, rejected) = log.apply_delta_verified(&parsed, &store);
+        assert_eq!((accepted, rejected), (PDUS, 0), "signed PDUs must verify");
+
+        let snap = sweep_alloc::snapshot();
+        let get = |s: Site| snap.iter().find(|(k, _)| *k == s).map(|(_, v)| *v).unwrap_or(0);
+        let parse_out = get(Site::DeltaFromBytes);
+        let parse_in = sweep_alloc::input_bytes(Site::DeltaFromBytes);
+        let verify_out = get(Site::ApplyDeltaVerified);
+        let verify_in = sweep_alloc::input_bytes(Site::ApplyDeltaVerified);
+        assert!(parse_out > 0 && parse_in > 0, "parse site must record both sides");
+        assert!(verify_out > 0 && verify_in > 0, "verify site must record both sides");
+        assert_eq!(parse_in, blob.len() as u64, "parse input gauge is the blob read");
+        println!(
+            "[sweep-alloc-profile] calibration: wire={}B pdus={PDUS} body={BODY}B",
+            blob.len()
+        );
+        println!(
+            "[sweep-alloc-profile]   catchup.delta_from_bytes     out={parse_out:>9}B in={parse_in:>9}B  amplification {:.2}x",
+            parse_out as f64 / parse_in as f64
+        );
+        println!(
+            "[sweep-alloc-profile]   merge.apply_delta_verified  out={verify_out:>9}B in={verify_in:>9}B  amplification {:.2}x",
+            verify_out as f64 / verify_in as f64
+        );
+        println!(
+            "[sweep-alloc-profile] sites in sweep-alloc line = {} (2 calibrated, printed as name=outB(in=inB))",
+            Site::ALL.len()
+        );
+        println!("{}", sweep_alloc::format_summary("calibration (synthetic)"));
+    }
 }
 
 /// sweep_merge:start
@@ -264,6 +339,9 @@ fn sweep_merge(
 /// sweep_alloc_candidate_refs_scale_with_rooms_not_events:end
 #[test]
 fn sweep_alloc_candidate_refs_scale_with_rooms_not_events() {
+    // Same global counters as the profile test, and `steady_cycle` resets them per size —
+    // without this guard the two tests interleave and each one's numbers are the other's.
+    let _guard = ALLOC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     fn steady_cycle(rooms: usize) -> (u64, u64) {
         const EVENTS_PER_ROOM: usize = 40;
         let state = crate::state::AppState::new();

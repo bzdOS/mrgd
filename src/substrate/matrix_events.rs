@@ -453,8 +453,13 @@ impl RoomLog {
     ) -> (usize, usize) {
         let mut accepted = 0usize;
         let mut rejected = 0usize;
+        // sweep-alloc: `alloc` is what this function allocates on the way in, `walked` the
+        // PDU bytes it inspects — the input gauge for the site. Counted, not changed.
+        let mut alloc: u64 = 0;
+        let mut walked: u64 = 0;
         self.collect_below(delta.collected_depth);
         for pdu in &delta.pdus {
+            walked += pdu_heap_bytes(pdu);
             // Already garbage-collected here: not an error, and NOT counted as a
             // rejection — a rejection means "this PDU is bad", and a peer resending
             // history we chose to drop is neither bad nor worth logging every pass.
@@ -490,6 +495,40 @@ impl RoomLog {
             // id and signature from the same canonical bytes (Pdu::signed). Unsigned
             // PDUs — including the pre-internal-task replay fallback in persist.rs — are
             // rejected above and never reach here.
+            //
+            // sweep-alloc: compute_id builds the canonical pre-image and hashes it, then
+            // returns a base64 id. All three allocations are this path's, so they are
+            // counted here. The length is computed rather than measured to keep the
+            // release path free of a second canonical build.
+            debug_assert_eq!(
+                pdu_canonical_len(
+                    &pdu.room_id,
+                    &pdu.sender,
+                    &pdu.kind,
+                    &pdu.content,
+                    &pdu.prev_events,
+                ),
+                pdu_canonical_bytes(
+                    &pdu.room_id,
+                    &pdu.sender,
+                    &pdu.kind,
+                    &pdu.content,
+                    &pdu.prev_events,
+                    pdu.depth,
+                    pdu.ts,
+                )
+                .len() as u64,
+                "pdu_canonical_len must track node_auth::canonical_bytes exactly"
+            );
+            alloc += pdu_canonical_len(
+                &pdu.room_id,
+                &pdu.sender,
+                &pdu.kind,
+                &pdu.content,
+                &pdu.prev_events,
+            );
+            // base64url(sha256) with no padding is always 43 chars, wrapped by the '$'.
+            const B64_SHA256_LEN: u64 = 43;
             let expected_id = Pdu::compute_id(
                 &pdu.room_id,
                 &pdu.sender,
@@ -499,6 +538,7 @@ impl RoomLog {
                 pdu.depth,
                 pdu.ts,
             );
+            alloc += B64_SHA256_LEN + expected_id.len() as u64;
             if pdu.event_id != expected_id {
                 eprintln!(
                     "[matrix_events] REJECT PDU {}: event_id is not the content address \
@@ -508,11 +548,26 @@ impl RoomLog {
                 rejected += 1;
                 continue;
             }
+            // sweep-alloc: the entry API takes an owned key, so `event_id` is cloned for
+            // every PDU; the PDU itself is cloned only when the event was not held yet.
+            let mut cloned_pdu = false;
             self.events
                 .entry(pdu.event_id.clone())
-                .or_insert_with(|| pdu.clone());
+                .or_insert_with(|| {
+                    cloned_pdu = true;
+                    pdu.clone()
+                });
+            alloc += pdu.event_id.len() as u64;
+            if cloned_pdu {
+                alloc += pdu_heap_bytes(pdu);
+            }
             accepted += 1;
         }
+        crate::sweep_alloc::add(crate::sweep_alloc::Site::ApplyDeltaVerified, alloc);
+        crate::sweep_alloc::calibrate_input(
+            crate::sweep_alloc::Site::ApplyDeltaVerified,
+            walked,
+        );
         (accepted, rejected)
     }
 
@@ -826,9 +881,14 @@ pub fn delta_from_bytes(bytes: &[u8]) -> Option<RoomLogDelta> {
     // error.
     const MIN_PDU_BLOCK: usize = 2 + 2 + 2 + 2 + 4 + 2 + 8 + 8 + 2 + 2;
 
+    // sweep-alloc: the residual this function was suspected of. Counted, not changed —
+    // `alloc` accumulates the owned heap the parse builds, `out` is what it reads.
+    let mut alloc: u64 = 0;
+
     let mut off = 0usize;
     let n_pdus = read_u32(bytes, &mut off)? as usize;
     let mut pdus = Vec::with_capacity(n_pdus.min(bytes.len() / MIN_PDU_BLOCK));
+    alloc += (pdus.capacity() * std::mem::size_of::<Pdu>()) as u64;
     for _ in 0..n_pdus {
         let event_id = read_str(bytes, &mut off)?;
         let room_id = read_str(bytes, &mut off)?;
@@ -839,13 +899,25 @@ pub fn delta_from_bytes(bytes: &[u8]) -> Option<RoomLogDelta> {
         // Same reasoning as MIN_PDU_BLOCK: each prev costs at least its u16 length.
         let mut prev_events = Vec::with_capacity(n_prevs.min(bytes.len().saturating_sub(off) / 2));
         for _ in 0..n_prevs {
-            prev_events.push(read_str(bytes, &mut off)?);
+            let prev = read_str(bytes, &mut off)?;
+            alloc += prev.len() as u64;
+            prev_events.push(prev);
         }
         let depth = read_u64(bytes, &mut off)?;
         let ts = read_u64(bytes, &mut off)?;
         // P1 additions.
         let signer_node = read_str(bytes, &mut off)?;
         let sig = read_bytes16(bytes, &mut off)?;
+        // Every String/Vec the parse now owns: the heap behind each of them, plus the
+        // prev_events table itself.
+        alloc += (event_id.len()
+            + room_id.len()
+            + sender.len()
+            + kind.len()
+            + signer_node.len()
+            + content.len()
+            + sig.len()) as u64;
+        alloc += (prev_events.capacity() * std::mem::size_of::<String>()) as u64;
         pdus.push(Pdu {
             event_id,
             room_id,
@@ -862,10 +934,55 @@ pub fn delta_from_bytes(bytes: &[u8]) -> Option<RoomLogDelta> {
     // Absent trailing watermark = a peer that predates GC, i.e. "collected
     // nothing". Distinct from a malformed blob, so unwrap_or rather than `?`.
     let collected_depth = read_u64(bytes, &mut off).unwrap_or(0);
+    crate::sweep_alloc::add(crate::sweep_alloc::Site::DeltaFromBytes, alloc);
+    crate::sweep_alloc::calibrate_input(
+        crate::sweep_alloc::Site::DeltaFromBytes,
+        bytes.len() as u64,
+    );
     Some(RoomLogDelta {
         pdus,
         collected_depth,
     })
+}
+
+/// Heap bytes a `Pdu` clone allocates: every owned String/Vec payload plus the table
+/// behind `prev_events`. Used by the sweep-alloc accounting only; a `String`'s 24-byte
+/// header lives in the struct itself, which the caller already counts.
+fn pdu_heap_bytes(p: &Pdu) -> u64 {
+    let strings = p.event_id.len()
+        + p.room_id.len()
+        + p.sender.len()
+        + p.kind.len()
+        + p.signer_node.len()
+        + p.sig.len()
+        + p.content.len()
+        + p.prev_events.iter().map(|s| s.len()).sum::<usize>();
+    strings as u64 + (p.prev_events.capacity() * std::mem::size_of::<String>()) as u64
+}
+
+/// Length of `pdu_canonical_bytes` without building it: five length-prefixed fields
+/// (room_id, sender, kind, content), a count plus length-prefixed prev_events, then
+/// depth and ts as two fixed 8-byte words. Mirrors
+/// `node_auth::canonical_bytes` — the `debug_assert` in `apply_delta_verified` checks the
+/// two against each other, so a drift fails the suite instead of silently skewing a
+/// byte count.
+fn pdu_canonical_len(
+    room_id: &str,
+    sender: &str,
+    kind: &str,
+    content: &[u8],
+    prev_events: &[String],
+) -> u64 {
+    const PREFIX: u64 = 8; // u64-LE length written by put_field
+    let mut len = PREFIX * 4
+        + (room_id.len() + sender.len() + kind.len() + content.len()) as u64
+        + 8 // prev_events count
+        + 8 // depth
+        + 8; // ts
+    for p in prev_events {
+        len += PREFIX + p.len() as u64;
+    }
+    len
 }
 
 // ── low-level encode/decode ────────────────────────────────────────────────────
