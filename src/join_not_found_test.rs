@@ -194,4 +194,78 @@ mod tests {
         let body: Value = resp.json();
         assert_eq!(body["errcode"], "M_NOT_FOUND", "body was {body}");
     }
+    // characterization_send_to_unknown_room_writes_a_room:start
+    //   purpose: MEASUREMENT, not a fix. `PUT /rooms/{roomId}/send/{eventType}/{txnId}`
+    //            (src/routes/send.rs:73) calls `state.ensure_room(&room_id)` with the
+    //            comment "lazy create" and then inserts the PDU — with NO existence check
+    //            and NO membership check. So an authenticated client that PUTs one message
+    //            into a room id nobody ever heard of gets 200 back, and the node is left
+    //            holding a fabricated room WITH a timeline event in it. That is a wider hole
+    //            than the one the 404-join fix closed (join created an empty shell; this
+    //            writes content into it), and `sync` unions `state.rooms`, so the room
+    //            becomes reachable for the drain path as well.
+    //
+    //            This test asserts TODAY's behaviour on purpose, so the vector is a number
+    //            in the suite rather than a suspicion in prose. The next dispatch that
+    //            closes it will turn this red — that is the intended way for it to die.
+    //            Nothing is fixed here: the stand is frozen inside somebody else's
+    //            regression run, and the join dispatch named that endpoint only — so this
+    //            branch must not smuggle a behaviour change into a deploy.
+    //   input:  a fresh server and one registered user; a room id that does not exist
+    //   output: ()
+    //   sideEffects: in-memory AppState only
+    // characterization_send_to_unknown_room_writes_a_room:end
+    #[tokio::test]
+    async fn characterization_send_to_unknown_room_writes_a_room() {
+        let state = AppState::new();
+        let app = router(state.clone());
+        let server = TestServer::new(app);
+        let alice = register_and_bearer(&server, "alice_send_unknown").await;
+        let ghost = "!never-existed-send:localhost";
+
+        assert!(
+            !state.rooms.lock().expect("rooms lock").contains_key(ghost),
+            "premise: {ghost} must not exist before the probe"
+        );
+
+        let resp = server
+            .put(&format!(
+                "/_matrix/client/v3/rooms/{ghost}/send/m.room.message/txn-1"
+            ))
+            .add_header(alice.0.clone(), alice.1.clone())
+            .bytes(axum::body::Bytes::from_static(b"hello"))
+            .await;
+
+        let status = resp.status_code();
+        let created = state.rooms.lock().expect("rooms lock").contains_key(ghost);
+        let events = state
+            .rooms
+            .lock()
+            .expect("rooms lock")
+            .get(ghost)
+            .map(|log| log.ordered().len())
+            .unwrap_or(0);
+
+        println!(
+            "send to unknown room: status={status} room_log_created={created} timeline_events={events}"
+        );
+
+        // Assert the measured behaviour, so a change in either direction shows up as a
+        // failure here rather than as a surprise on the stand.
+        assert_eq!(
+            status, 200,
+            "MEASURED behaviour changed: send to an unknown room no longer answers 200 \
+             (room_log_created={created}, timeline_events={events}). If this is now a fix, \
+             flip this test to assert the refusal and the absence of the room."
+        );
+        assert!(
+            created,
+            "MEASURED behaviour changed: the room log is no longer created ({ghost})."
+        );
+        assert!(
+            events >= 1,
+            "MEASURED behaviour changed: the fabricated room no longer holds the event."
+        );
+    }
+
 }
