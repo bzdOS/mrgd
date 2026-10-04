@@ -432,12 +432,16 @@ impl ClusterState {
                     .and_then(|s| s.strip_prefix('/'))
                     .unwrap_or(full_key);
                 if let Some(slash) = suffix.find('/') {
-                    let room_id = &suffix[..slash];
+                    // The room segment arrives percent-encoded (see substrate::keyexpr), so
+                      // decode it: sink_for() and the local room map both speak raw room
+                      // ids, and an undecoded segment would create a sink for a room that
+                      // does not exist — the node would then never drain it.
+                      let room_id = crate::substrate::keyexpr::decode_segment(&suffix[..slash]);
                     let crdt_key = &suffix[slash + 1..];
                     let bytes = sample.payload().to_bytes().to_vec();
                     // Lazily create the per-room sink, then hand it the sample we just
                     // took delivery of — its own subscriber was declared too late to see it.
-                    match self_arc.sink_for(room_id).await {
+                    match self_arc.sink_for(&room_id).await {
                         Ok(sink) => sink.inject(crdt_key, bytes),
                         Err(e) => eprintln!("[matrix-hs] discovery sink_for({room_id}): {e}"),
                     }
@@ -481,8 +485,14 @@ impl ClusterState {
             }
         }
 
-        // Slow path: create a new sink for this room.
-        let room_prefix = format!("{}/{}", self.key_prefix, room_id);
+        // Slow path: create a new sink for this room. The room id is encoded: a raw one
+        // containing `#`, `?` or `*` makes the router reject the whole subscribe
+        // expression, which is what broke initial /sync for every room on the node.
+        let room_prefix = format!(
+            "{}/{}",
+            self.key_prefix,
+            crate::substrate::keyexpr::encode_segment(room_id)
+        );
 
         // Clone the session — cheap because zenoh::Session is Arc<SessionInner>.
         let session_clone = self.session.clone();
@@ -537,17 +547,19 @@ impl ClusterState {
     //   output: Some(room_id) if the key has that exact shape, else None
     //   sideEffects: none
     // ClusterState::room_from_key:end
-    pub fn room_from_key<'a>(key: &'a str, prefix: &str, leaf: &str) -> Option<&'a str> {
+    pub fn room_from_key(key: &str, prefix: &str, leaf: &str) -> Option<String> {
         let seg = key
             .strip_prefix(prefix)?
             .strip_prefix('/')?
             .strip_suffix(leaf)?
             .strip_suffix('/')?;
-        // A room_id is one key chunk; anything with a '/' is a different shape.
+        // A room_id is one key chunk; anything with a '/' is a different shape. The chunk
+        // is percent-encoded on the wire (see substrate::keyexpr), so decode it here:
+        // otherwise a room whose id needed encoding would never match its own entry.
         if seg.is_empty() || seg.contains('/') {
             None
         } else {
-            Some(seg)
+            Some(crate::substrate::keyexpr::decode_segment(seg))
         }
     }
 
@@ -571,7 +583,7 @@ impl ClusterState {
         match Self::room_from_key(query_key, prefix, leaf) {
             // Concrete room asked for: answer only if we have it.
             Some(rid) if rid != "*" && rid != "**" => {
-                local.into_iter().filter(|r| r == rid).collect()
+                local.into_iter().filter(|r| r == &rid).collect()
             }
             // Wildcard, or a key we cannot parse: answer for everything we have.
             // Being generous is safe — the reply key names the room, so a querier

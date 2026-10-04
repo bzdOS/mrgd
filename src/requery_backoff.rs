@@ -254,9 +254,18 @@ impl PassPlanner {
 pub fn query_keys(prefix: &str, leaf: &str, scope: &PassScope) -> Vec<String> {
     match scope {
         PassScope::Full => vec![format!("{prefix}/*/{leaf}")],
-        PassScope::Targeted(rooms) => {
-            rooms.iter().map(|r| format!("{prefix}/{r}/{leaf}")).collect()
-        }
+        PassScope::Targeted(rooms) => rooms
+            .iter()
+            // The room id is one key segment; a `#`/`?`/`*`/`/` inside it is forbidden
+            // by the router, and an unescaped `/` would forge a deeper path. Encoded
+            // here and decoded by the serving side (room_from_key).
+            .map(|r| {
+                format!(
+                    "{prefix}/{}/{leaf}",
+                    crate::substrate::keyexpr::encode_segment(r)
+                )
+            })
+            .collect(),
         PassScope::Skip => Vec::new(),
     }
 }
@@ -462,12 +471,13 @@ mod tests {
         assert_eq!(
             hist,
             vec![
-                "mrgd/matrix/room/!one:localhost/history",
-                "mrgd/matrix/room/!two:localhost/history",
+                "mrgd/matrix/room/%21one%3Alocalhost/history",
+                "mrgd/matrix/room/%21two%3Alocalhost/history",
             ]
         );
         for key in &hist {
             assert!(!key.contains('*'), "targeted key must not be a wildcard: {key}");
+            assert!(!key.contains('!'), "the room segment must be encoded: {key}");
         }
         assert_eq!(query_keys("mrgd/matrix/room", "state", &scope).len(), 2);
     }

@@ -629,7 +629,10 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                         } else {
                             delta_bytes
                         };
-                        let reply_key = format!("{prefix_clone}/{room_id}/history");
+                        let reply_key = format!(
+                            "{prefix_clone}/{}/history",
+                            mrgd::substrate::keyexpr::encode_segment(&room_id)
+                        );
                         let _ = query.reply(&reply_key, payload).await;
                     }
                 }
@@ -687,7 +690,10 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                                 continue;
                             }
                         };
-                        let reply_key = format!("{prefix_clone}/{room_id}/state");
+                        let reply_key = format!(
+                            "{prefix_clone}/{}/state",
+                            mrgd::substrate::keyexpr::encode_segment(&room_id)
+                        );
                         let _ = query.reply(&reply_key, state_bytes).await;
                     }
                 }
@@ -1196,7 +1202,7 @@ async fn catchup_pass(
                 }
                 // May be a room this node has never heard of: merge_catchup_delta
                 // creates the RoomLog and room state for it.
-                merge_catchup_delta(state, room_id, &delta, data_dir, stats);
+                merge_catchup_delta(state, &room_id, &delta, data_dir, stats);
                 mrgd::sweep_alloc::add(
                     mrgd::sweep_alloc::Site::ConvergedRoomId,
                     room_id.len() as u64,
@@ -1243,7 +1249,7 @@ async fn catchup_pass(
                 }
                 match serde_json::from_slice::<mrgd::routes::room_state::StateCatchupMsg>(&bytes) {
                     Ok(msg) => {
-                        merge_state_catchup(state, room_id, msg);
+                        merge_state_catchup(state, &room_id, msg);
                         mrgd::sweep_alloc::add(
                     mrgd::sweep_alloc::Site::ConvergedRoomId,
                     room_id.len() as u64,

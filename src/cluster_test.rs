@@ -384,7 +384,12 @@ mod tests {
         // Subscribe directly to the room's "events" CRDT key from an independent
         // session — bypassing AppState/ClusterState so this sees exactly what
         // insert_pdu published, not a re-derived view.
-        let events_key = format!("{prefix}/{room_id}/events");
+        // Mirror what the publisher actually writes: the room segment is percent-encoded, so
+        // a spy subscribed to the raw id would see nothing and blame the publisher.
+        let events_key = format!(
+            "{prefix}/{}/events",
+            crate::substrate::keyexpr::encode_segment(&room_id)
+        );
         let subscriber = sess_spy
             .declare_subscriber(&events_key)
             .await
@@ -1427,18 +1432,30 @@ mod tests {
                 prefix,
                 "history"
             ),
-            Some("!abc_1f2e3d4c_node-a:localhost"),
+            Some("!abc_1f2e3d4c_node-a:localhost".to_string()),
             "a room_id may contain '!' ':' '_' '-' and must survive round-tripping"
         );
         assert_eq!(
             ClusterState::room_from_key("mrgd/matrix/room/!r:localhost/state", prefix, "state"),
-            Some("!r:localhost")
+            Some("!r:localhost".to_string())
         );
 
         // Wildcards come back as the literal segment; the caller decides what they mean.
         assert_eq!(
             ClusterState::room_from_key("mrgd/matrix/room/*/state", prefix, "state"),
-            Some("*")
+            Some("*".to_string())
+        );
+
+        // A key that arrives percent-encoded decodes back to the raw room_id: the
+        // serving side compares against its own map, which stores raw ids.
+        assert_eq!(
+            ClusterState::room_from_key(
+                "mrgd/matrix/room/%21%23seed433-chatlong%3Alocalhost/history",
+                prefix,
+                "history"
+            ),
+            Some("!#seed433-chatlong:localhost".to_string()),
+            "an encoded room segment must decode to the raw room_id it came from"
         );
 
         // Rejected shapes.
