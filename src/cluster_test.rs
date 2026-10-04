@@ -2087,4 +2087,125 @@ mod tests {
         sess_a.close().await.ok();
     }
 
+    // cluster:join_peer_known_room_is_200:start
+    //   purpose: The other half of the 404-join fix (src/join_not_found_test.rs and the
+    //            guard in src/routes/room_state.rs). The fix added a 404 for rooms this
+    //            node has never heard of; the failure mode that would replace the old bug
+    //            is the opposite one — refusing a room that really exists but is known
+    //            only from a peer. Nothing covered that: the 404 tests use a bare AppState
+    //            with no cluster, so the `cluster.list_room_ids()` branch of
+    //            room_is_known was the one line of the fix with no test behind it. A typo
+    //            there would ship as "join refuses every federated room" and surface only
+    //            on the stand, mid-regression.
+    //   input:  two clustered nodes on one mesh prefix; alice creates a room on node-a and
+    //            node-b is told nothing; bob joins that room by room_id on node-b
+    //   output: () — asserts 200 and the room_id echoed, with the premise asserted first
+    //   sideEffects: two real Zenoh sessions on loopback, background sink tasks;
+    //                serialised on ZENOTH_TEST_LOCK like every other mesh test
+    // cluster:join_peer_known_room_is_200:end
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_peer_known_room_is_200() {
+        let _zg = crate::test_util::ZENOH_TEST_LOCK.acquire().await.unwrap();
+        let [sess_a, sess_b] = crate::test_util::open_mesh().await;
+        let prefix = crate::test_util::unique_prefix("mrgd/matrix/room/join-peer-known");
+
+        let state_a = AppState::with_cluster(ClusterConfig {
+            session: sess_a,
+            key_prefix: prefix.to_string(),
+            server_name: "node-a".to_string(),
+        });
+        let state_b = AppState::with_cluster(ClusterConfig {
+            session: sess_b,
+            key_prefix: prefix.to_string(),
+            server_name: "node-b".to_string(),
+        });
+
+        // TOFU both ways: without this, apply_delta_verified rejects every discovered
+        // sample and this test would measure the wrong thing.
+        state_b
+            .key_store
+            .insert("node-a", state_a.signer.verifying_key_bytes());
+        state_a
+            .key_store
+            .insert("node-b", state_b.signer.verifying_key_bytes());
+
+        let server_a = TestServer::new(router(state_a.clone()));
+        let server_b = TestServer::new(router(state_b.clone()));
+
+        let (auth_a_name, auth_a_val) = register_and_bearer(&server_a, "alice").await;
+        let (auth_b_name, auth_b_val) = register_and_bearer(&server_b, "bob").await;
+
+        // Let both discovery subscribers reach the gossip layer before any publish.
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let create: Value = server_a
+            .post("/_matrix/client/v3/createRoom")
+            .add_header(auth_a_name.clone(), auth_a_val.clone())
+            .json(&json!({ "name": "peer-known-room" }))
+            .await
+            .json();
+        let room_id = create["room_id"]
+            .as_str()
+            .expect("room_id from createRoom")
+            .to_string();
+
+        // Wait for node-b's DISCOVERY to create the per-room sink. Polling the sink list
+        // is the point: /sync would drive drain_cluster_deltas, which would add the local
+        // room entry and quietly turn this into a duplicate of the local-state tests.
+        let mut discovered = false;
+        for _ in 0..80 {
+            if state_b
+                .cluster
+                .as_ref()
+                .expect("node-b has a cluster")
+                .list_room_ids()
+                .iter()
+                .any(|r| r == &room_id)
+            {
+                discovered = true;
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            discovered,
+            "node-b never discovered {room_id} — the cluster branch of room_is_known \
+             would stay untested"
+        );
+
+        // The premise. start_discovery() only calls sink_for(); it inserts nothing local,
+        // and nothing has drained on node-b. If either assertion below fails, this test
+        // would pass WITHOUT the cluster branch and would be measuring nothing.
+        assert!(
+            !state_b.rooms.lock().expect("rooms lock").contains_key(&room_id),
+            "premise broken: node-b already has a room log for {room_id}, so this test \
+             would pass without the cluster branch"
+        );
+        assert!(
+            !state_b
+                .room_state
+                .lock()
+                .expect("room_state lock")
+                .contains_key(&room_id),
+            "premise broken: node-b already has room state for {room_id}, so this test \
+             would pass without the cluster branch"
+        );
+
+        let resp = server_b
+            .post(&format!("/_matrix/client/v3/rooms/{room_id}/join"))
+            .add_header(auth_b_name.clone(), auth_b_val.clone())
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            200,
+            "a room this node knows only from the cluster must stay joinable: {:?}",
+            resp.text()
+        );
+        let joined: Value = resp.json();
+        assert_eq!(
+            joined["room_id"], room_id,
+            "the answer must name the room that was asked for: {joined}"
+        );
+    }
+
 }
