@@ -1035,6 +1035,9 @@ async fn catchup_pass(
 ) -> std::collections::HashSet<String> {
     let mut converged: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // sweep-alloc: one measurement window == exactly one catchup_pass (one sweep cycle).
+    mrgd::sweep_alloc::reset();
+
     // History.
     let hist_wild = format!("{prefix}/*/history");
     match session.get(&hist_wild).timeout(timeout).await {
@@ -1048,12 +1051,21 @@ async fn catchup_pass(
                     }
                 };
                 let reply_key = sample.key_expr().as_str().to_string();
+                mrgd::sweep_alloc::add(
+                    mrgd::sweep_alloc::Site::ReplyKeyString,
+                    reply_key.len() as u64,
+                );
+                mrgd::sweep_alloc::count_reply();
                 let Some(room_id) = ClusterState::room_from_key(&reply_key, prefix, "history")
                 else {
                     eprintln!("[matrix-hs] {label}: unexpected reply key {reply_key}");
                     continue;
                 };
                 let bytes = sample.payload().to_bytes();
+                mrgd::sweep_alloc::add(
+                    mrgd::sweep_alloc::Site::PayloadBytes,
+                    bytes.len() as u64,
+                );
                 // A reply we cannot parse is dropped rather than trusted: this is a
                 // peer's payload, and delta_from_bytes runs before any signature is
                 // checked. The empty-room sentinel (4 zero bytes) parses fine and
@@ -1071,6 +1083,11 @@ async fn catchup_pass(
                 // May be a room this node has never heard of: merge_catchup_delta
                 // creates the RoomLog and room state for it.
                 merge_catchup_delta(state, room_id, &delta, data_dir, stats);
+                mrgd::sweep_alloc::add(
+                    mrgd::sweep_alloc::Site::ConvergedRoomId,
+                    room_id.len() as u64,
+                );
+                mrgd::sweep_alloc::count_room();
                 converged.insert(room_id.to_string());
             }
         }
@@ -1090,18 +1107,32 @@ async fn catchup_pass(
                     }
                 };
                 let reply_key = sample.key_expr().as_str().to_string();
+                mrgd::sweep_alloc::add(
+                    mrgd::sweep_alloc::Site::ReplyKeyString,
+                    reply_key.len() as u64,
+                );
+                mrgd::sweep_alloc::count_reply();
                 let Some(room_id) = ClusterState::room_from_key(&reply_key, prefix, "state") else {
                     eprintln!("[matrix-hs] {label} (state): unexpected reply key {reply_key}");
                     continue;
                 };
                 let bytes = sample.payload().to_bytes();
+                mrgd::sweep_alloc::add(
+                    mrgd::sweep_alloc::Site::PayloadBytes,
+                    bytes.len() as u64,
+                );
                 if bytes.is_empty() {
                     continue;
                 }
                 match serde_json::from_slice::<mrgd::routes::room_state::StateCatchupMsg>(&bytes) {
                     Ok(msg) => {
                         merge_state_catchup(state, room_id, msg);
-                        converged.insert(room_id.to_string());
+                        mrgd::sweep_alloc::add(
+                    mrgd::sweep_alloc::Site::ConvergedRoomId,
+                    room_id.len() as u64,
+                );
+                mrgd::sweep_alloc::count_room();
+                converged.insert(room_id.to_string());
                     }
                     Err(e) => {
                         eprintln!("[matrix-hs] {label} (state): parse for {room_id}: {e}")
@@ -1112,6 +1143,7 @@ async fn catchup_pass(
         Err(e) => eprintln!("[matrix-hs] {label} (state): GET {state_wild}: {e}"),
     }
 
+    eprintln!("{}", mrgd::sweep_alloc::format_summary(label));
     converged
 }
 
@@ -1156,13 +1188,22 @@ fn merge_catchup_delta(
             Ok(rt) => rt
                 .get(room_id)
                 .map(|v| {
-                    v.iter()
+                    let set: std::collections::HashSet<String> = v
+                        .iter()
                         .filter_map(|(_, ev)| {
                             ev.get("event_id")
                                 .and_then(|id| id.as_str())
                                 .map(|s| s.to_string())
                         })
-                        .collect()
+                        .collect();
+                    // sweep-alloc: this rebuild is per room per sweep, one String clone
+                    // per timeline entry; it is the suspected driver of the sweep step.
+                    mrgd::sweep_alloc::add_str_set(
+                        mrgd::sweep_alloc::Site::KnownIds,
+                        set.len() as u64,
+                        set.iter().map(|s| s.len() as u64).sum::<u64>(),
+                    );
+                    set
                 })
                 .unwrap_or_default(),
             Err(e) => {
@@ -1183,7 +1224,16 @@ fn merge_catchup_delta(
             match state.rooms.lock() {
                 Ok(r) => r
                     .get(room_id)
-                    .map(|log| log.ordered().iter().map(|p| p.event_id.clone()).collect())
+                    .map(|log| {
+                        let set: std::collections::HashSet<String> =
+                            log.ordered().iter().map(|p| p.event_id.clone()).collect();
+                        mrgd::sweep_alloc::add_str_set(
+                            mrgd::sweep_alloc::Site::BeforeIds,
+                            set.len() as u64,
+                            set.iter().map(|s| s.len() as u64).sum::<u64>(),
+                        );
+                        set
+                    })
                     .unwrap_or_default(),
                 Err(e) => {
                     eprintln!("[matrix-hs] catch-up merge: rooms lock (before): {e}");
@@ -1209,7 +1259,16 @@ fn merge_catchup_delta(
         let after_ids: std::collections::HashSet<String> = match state.rooms.lock() {
             Ok(r) => r
                 .get(room_id)
-                .map(|log| log.ordered().iter().map(|p| p.event_id.clone()).collect())
+                .map(|log| {
+                    let set: std::collections::HashSet<String> =
+                        log.ordered().iter().map(|p| p.event_id.clone()).collect();
+                    mrgd::sweep_alloc::add_str_set(
+                        mrgd::sweep_alloc::Site::AfterIds,
+                        set.len() as u64,
+                        set.iter().map(|s| s.len() as u64).sum::<u64>(),
+                    );
+                    set
+                })
                 .unwrap_or_default(),
             Err(e) => {
                 eprintln!("[matrix-hs] catch-up merge: rooms lock (after): {e}");
@@ -1270,6 +1329,10 @@ fn merge_catchup_delta(
 
     for pdu in &new_pdus {
         let pos = state.stream_pos.fetch_add(1, Ordering::SeqCst);
+        mrgd::sweep_alloc::add(
+            mrgd::sweep_alloc::Site::JsonContentParse,
+            pdu.content.len() as u64,
+        );
         let content_val: serde_json::Value =
             serde_json::from_slice(&pdu.content).unwrap_or_else(|_| serde_json::json!({}));
         let mut ev = serde_json::json!({

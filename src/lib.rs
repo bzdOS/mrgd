@@ -28,6 +28,7 @@ pub mod routes;
 pub mod scripting;
 pub mod substrate;
 pub mod state;
+pub mod sweep_alloc;
 
 // test_util:start
 //   purpose: Shared test-only helpers. ZENOH_TEST_LOCK serializes every test that opens a
@@ -121,6 +122,7 @@ pub(crate) mod test_util {
 }
 
 #[cfg(test)]
+mod sweep_alloc_test;
 mod account_data_test;
 #[cfg(test)]
 mod account_password_test;
