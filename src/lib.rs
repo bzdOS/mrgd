@@ -136,6 +136,8 @@ mod cluster_test;
 mod createroom_extras_test;
 #[cfg(test)]
 mod leak_survey_test;
+#[cfg(test)]
+mod soak_caps_test;
 #[cfg(all(test, feature = "cluster"))]
 mod sink_growth_test;
 #[cfg(test)]
