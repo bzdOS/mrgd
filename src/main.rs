@@ -959,7 +959,7 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                         catchup_timeout,
                         label,
                         &mut stats,
-                    &scope,
+                        &scope,
                     )
                     .await;
                     backoff.note_pass(stats);
