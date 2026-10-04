@@ -57,10 +57,14 @@ pub enum Site {
     /// base64 + `format!` id strings it returns, the `event_id` clone made for the entry
     /// API, and the full PDU clone when the event was not held yet.
     ApplyDeltaVerified,
+    /// `catchup_pass`: one `session.get` issued. Counts the cost of ASKING, which no
+    /// byte site can see: a pass that asks nothing spends nothing on replies, so
+    /// without this counter "payload fell to zero" and "we stopped asking" look alike.
+    CatchupQueries,
 }
 
 impl Site {
-    pub const ALL: [Site; 10] = [
+    pub const ALL: [Site; 11] = [
         Site::ReplyKeyString,
         Site::PayloadBytes,
         Site::ConvergedRoomId,
@@ -69,6 +73,7 @@ impl Site {
         Site::AfterIds,
         Site::JsonContentParse,
         Site::CandidateRefs,
+        Site::CatchupQueries,
         Site::DeltaFromBytes,
         Site::ApplyDeltaVerified,
     ];
@@ -87,6 +92,7 @@ impl Site {
             Site::AfterIds => "merge.after_ids",
             Site::JsonContentParse => "merge.json_content_parse",
             Site::CandidateRefs => "merge.candidate_refs",
+            Site::CatchupQueries => "catchup.queries",
             Site::DeltaFromBytes => "catchup.delta_from_bytes",
             Site::ApplyDeltaVerified => "merge.apply_delta_verified",
         }
@@ -102,6 +108,7 @@ impl Site {
             Site::AfterIds => &AFTER_IDS,
             Site::JsonContentParse => &JSON_PARSE,
             Site::CandidateRefs => &CANDIDATE_REFS,
+            Site::CatchupQueries => &CATCHUP_QUERIES,
             Site::DeltaFromBytes => &DELTA_FROM_BYTES,
             Site::ApplyDeltaVerified => &APPLY_DELTA_VERIFIED,
         }
@@ -116,6 +123,8 @@ static BEFORE_IDS: AtomicU64 = AtomicU64::new(0);
 static AFTER_IDS: AtomicU64 = AtomicU64::new(0);
 static JSON_PARSE: AtomicU64 = AtomicU64::new(0);
 static CANDIDATE_REFS: AtomicU64 = AtomicU64::new(0);
+/// One per `session.get` issued this pass; see `Site::CatchupQueries`.
+static CATCHUP_QUERIES: AtomicU64 = AtomicU64::new(0);
 static DELTA_FROM_BYTES: AtomicU64 = AtomicU64::new(0);
 static APPLY_DELTA_VERIFIED: AtomicU64 = AtomicU64::new(0);
 

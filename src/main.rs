@@ -858,6 +858,9 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
             catchup_timeout,
             "startup catch-up",
             &mut startup_stats,
+        // Startup asks for everything on purpose: it is the one moment where
+        // the set of rooms is genuinely unknown to us, and it runs once.
+        &mrgd::requery_backoff::PassScope::Full,
         )
         .await;
         if !converged.is_empty() {
@@ -901,6 +904,11 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                 let mut backoff =
                     mrgd::requery_backoff::RequeryBackoff::new(backstop_secs);
                 let mut stats = mrgd::requery_backoff::CatchupStats::default();
+                // Explicit-room passes: a converged node asks nothing, and only rooms
+                // whose fingerprint moved are named. Every CATCHUP_FULL_EVERY pass still
+                // asks for everything, so an unknown room is still discovered.
+                let mut dirty_tracker = mrgd::requery_backoff::DirtyTracker::default();
+                let mut pass_index: u32 = 0;
                 loop {
                     tokio::time::sleep(poll).await;
                     since_backstop += poll;
@@ -930,6 +938,19 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                         "re-query (periodic)"
                     };
                     stats.reset();
+                    let dirty = dirty_tracker.update(room_fingerprints(&state_bg));
+                    // pass_index is 1-based: it counts passes, so CATCHUP_FULL_EVERY
+                    // lands on the 12th, 24th, … pass rather than on the 1st.
+                    pass_index = pass_index.wrapping_add(1);
+                    let scope = mrgd::requery_backoff::decide_scope(grew, backstop_due, pass_index, &dirty);
+                    if let mrgd::requery_backoff::PassScope::Skip = scope {
+                        // Nothing moved and this is not a backstop pass: do not ask at all.
+                        // The sweep-alloc line still prints, marked [skip], so a report can
+                        // tell "asked nothing" from "asked, got nothing".
+                        eprintln!("{}", mrgd::sweep_alloc::format_summary(&format!("{label} [skip]")));
+                        since_backstop += poll;
+                        continue;
+                    }
                     let converged = catchup_pass(
                         &state_bg,
                         &session_bg,
@@ -938,6 +959,7 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                         catchup_timeout,
                         label,
                         &mut stats,
+                    &scope,
                     )
                     .await;
                     backoff.note_pass(stats);
@@ -1002,6 +1024,68 @@ async fn open_cluster_session() -> Result<zenoh::Session, String> {
     zenoh::open(cfg).await.map_err(|e| e.to_string())
 }
 
+    // room_fingerprints:start
+    //   purpose: Snapshot how much each room holds right now — events in its RoomLog,
+    //            state events, timeline entries. A room whose triple moved since the
+    //            previous completed pass is the only kind worth asking a peer about.
+    //   input:  state
+    //   output: (room_id, RoomFingerprint) for every room this node knows, from any of
+    //            the three collections (a room may exist in state or timeline only)
+    //   sideEffects: takes the three locks briefly, in order, and clones room ids
+    // room_fingerprints:end
+    fn room_fingerprints(
+        state: &std::sync::Arc<AppState>,
+    ) -> Vec<(String, mrgd::requery_backoff::RoomFingerprint)> {
+        use mrgd::requery_backoff::RoomFingerprint;
+        let events: std::collections::HashMap<String, usize> = state
+            .rooms
+            .lock()
+            .map(|m| m.iter().map(|(k, l)| (k.clone(), l.len())).collect())
+            .unwrap_or_default();
+        let st: std::collections::HashMap<String, usize> = state
+            .room_state
+            .lock()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.len())).collect())
+            .unwrap_or_default();
+        let tl: std::collections::HashMap<String, usize> = state
+            .room_timeline
+            .lock()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.len())).collect())
+            .unwrap_or_default();
+        let mut out: Vec<(String, RoomFingerprint)> = Vec::new();
+        for (room, ev) in &events {
+            out.push((
+                room.clone(),
+                RoomFingerprint {
+                    events: *ev,
+                    state: st.get(room).copied().unwrap_or(0),
+                    timeline: tl.get(room).copied().unwrap_or(0),
+                },
+            ));
+        }
+        for (room, n) in &st {
+            if !events.contains_key(room) {
+                out.push((
+                    room.clone(),
+                    RoomFingerprint {
+                        events: 0,
+                        state: *n,
+                        timeline: tl.get(room).copied().unwrap_or(0),
+                    },
+                ));
+            }
+        }
+        for (room, n) in &tl {
+            if !events.contains_key(room) && !st.contains_key(room) {
+                out.push((
+                    room.clone(),
+                    RoomFingerprint { events: 0, state: 0, timeline: *n },
+                ));
+            }
+        }
+        out
+    }
+
 // catchup_pass:start
 //   purpose: One full catch-up round. Asks every peer for every room it has, over
 //            both channels ("<prefix>/*/history" and "<prefix>/*/state"), and merges
@@ -1032,15 +1116,19 @@ async fn catchup_pass(
     timeout: Duration,
     label: &str,
     stats: &mut mrgd::requery_backoff::CatchupStats,
+    scope: &mrgd::requery_backoff::PassScope,
 ) -> std::collections::HashSet<String> {
     let mut converged: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let label = format!("{label} [{}]", scope.label());
 
     // sweep-alloc: one measurement window == exactly one catchup_pass (one sweep cycle).
     mrgd::sweep_alloc::reset();
 
     // History.
-    let hist_wild = format!("{prefix}/*/history");
-    match session.get(&hist_wild).timeout(timeout).await {
+    let hist_keys = mrgd::requery_backoff::query_keys(prefix, "history", scope);
+    for hist_key in &hist_keys {
+    mrgd::sweep_alloc::add(mrgd::sweep_alloc::Site::CatchupQueries, 1);
+    match session.get(hist_key).timeout(timeout).await {
         Ok(replies) => {
             while let Ok(Ok(reply)) = tokio::time::timeout(timeout, replies.recv_async()).await {
                 let sample = match reply.result() {
@@ -1091,12 +1179,15 @@ async fn catchup_pass(
                 converged.insert(room_id.to_string());
             }
         }
-        Err(e) => eprintln!("[matrix-hs] {label}: GET {hist_wild}: {e}"),
+        Err(e) => eprintln!("[matrix-hs] {label}: GET {hist_key}: {e}"),
+    }
     }
 
     // State (Phase 1 P1.1).
-    let state_wild = format!("{prefix}/*/state");
-    match session.get(&state_wild).timeout(timeout).await {
+    let state_keys = mrgd::requery_backoff::query_keys(prefix, "state", scope);
+    for state_key in &state_keys {
+    mrgd::sweep_alloc::add(mrgd::sweep_alloc::Site::CatchupQueries, 1);
+    match session.get(state_key).timeout(timeout).await {
         Ok(replies) => {
             while let Ok(Ok(reply)) = tokio::time::timeout(timeout, replies.recv_async()).await {
                 let sample = match reply.result() {
@@ -1140,10 +1231,11 @@ async fn catchup_pass(
                 }
             }
         }
-        Err(e) => eprintln!("[matrix-hs] {label} (state): GET {state_wild}: {e}"),
+        Err(e) => eprintln!("[matrix-hs] {label} (state): GET {state_key}: {e}"),
+    }
     }
 
-    eprintln!("{}", mrgd::sweep_alloc::format_summary(label));
+    eprintln!("{}", mrgd::sweep_alloc::format_summary(&label));
     converged
 }
 
