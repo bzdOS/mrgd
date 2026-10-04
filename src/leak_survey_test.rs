@@ -233,4 +233,191 @@ mod tests {
 
         println!("  === end survey ===\n");
     }
+    // typing_outer_map_grows_per_room_forever:start
+    //   purpose: Close the second "NOT MEASURED" from the survey. The survey's typing row
+    //            read 0 → 0, and the reason was the PROBE, not the code: it sent
+    //            `@alice:localhost` while registration had produced `@alice_leak:localhost`,
+    //            and put_typing refuses to set another user's typing state (403). So that
+    //            row measured a rejected request, not a bounded map — worth saying plainly,
+    //            because "0 → 0" reads exactly like "this one is fine".
+    //
+    //            Now measured, and the answer is the outer map: set_typing does
+    //            `guard.entry(room_id).or_default()` and typing_snapshot_local retains
+    //            expired USERS inside a room but never removes the room key. So every room
+    //            anyone ever typed in keeps an empty HashMap forever.
+    //   input:  N_TYPED_ROOMS rooms, one typing notification each with the CORRECT user id,
+    //            then a snapshot read per room to trigger the expiry prune
+    //   output: () — prints outer keys / inner users before and after expiry
+    //   sideEffects: in-memory AppState only
+    // typing_outer_map_grows_per_room_forever:end
+    #[tokio::test]
+    #[ignore = "survey, not a gate: run with --ignored --nocapture"]
+    async fn typing_outer_map_grows_per_room_forever() {
+        const N_TYPED_ROOMS: usize = 25;
+        // AppState::new() defaults server_name to "localhost", so this IS the user id the
+        // token resolves to. Derived from the server name rather than guessed per user,
+        // because guessing it is exactly what broke the first probe.
+        let me = "@alice_typing:localhost";
+
+        let state = AppState::new();
+        let app = router(state.clone());
+        let server = TestServer::new(app);
+        let alice = register_and_bearer(&server, "alice_typing").await;
+
+        let mut rooms = Vec::with_capacity(N_TYPED_ROOMS);
+        for _ in 0..N_TYPED_ROOMS {
+            let created: Value = server
+                .post("/_matrix/client/v3/createRoom")
+                .add_header(alice.0.clone(), alice.1.clone())
+                .json(&json!({}))
+                .await
+                .json();
+            rooms.push(
+                created["room_id"]
+                    .as_str()
+                    .expect("room_id from createRoom")
+                    .to_string(),
+            );
+        }
+
+        let mut rc_first = 0usize;
+        for room in &rooms {
+            let resp = server
+                .put(&format!("/_matrix/client/v3/rooms/{room}/typing/{me}"))
+                .add_header(alice.0.clone(), alice.1.clone())
+                .json(&json!({ "typing": true, "timeout": 1 }))
+                .await;
+            if resp.status_code() == 200 && rc_first == 0 {
+                rc_first = resp.status_code().as_u16() as usize;
+            }
+        }
+
+        let (outer, inner) = {
+            let g = state.ephemeral.typing.lock().expect("typing");
+            let outer = g.len();
+            let inner: usize = g.values().map(|m| m.len()).sum();
+            (outer, inner)
+        };
+        println!(
+            "  typing after {N_TYPED_ROOMS} rooms: outer_room_keys={outer} inner_users={inner} \
+             (first PUT rc={rc_first})"
+        );
+
+        // Let every user's entry expire (timeout=1ms), then read each room's snapshot —
+        // that read is what prunes, and it is the ONLY pruning path there is.
+        tokio::time::sleep(tokio::time::Duration::from_millis(60)).await;
+        for room in &rooms {
+            state.typing_snapshot_local(room);
+        }
+
+        let (outer_after, inner_after) = {
+            let g = state.ephemeral.typing.lock().expect("typing");
+            let outer = g.len();
+            let inner: usize = g.values().map(|m| m.len()).sum();
+            (outer, inner)
+        };
+        println!(
+            "  typing after expiry + snapshot read: outer_room_keys={outer_after} \
+             inner_users={inner_after}"
+        );
+        println!(
+            "  VERDICT typing: inner users {} → {} (pruned), outer room keys {} → {} {}",
+            inner,
+            inner_after,
+            outer,
+            outer_after,
+            if outer_after == outer && inner_after == 0 {
+                "— UNBOUNDED in room count: empty HashMap per room, kept forever"
+            } else {
+                "— outer keys do shrink"
+            }
+        );
+    }
+
+    // delivered_watermark_advances_on_sync:start
+    //   purpose: Close the third "NOT MEASURED". `delivered` is a watermark map keyed by
+    //            (user, device), not a growing set — so the number that matters is not the
+    //            size but whether the VALUE advances, and whether the key count stays at
+    //            one per device no matter how many to-device messages pass through.
+    //   input:  N to-device messages to self, then a sync (which is what delivers them)
+    //   output: () — prints delivered size and watermark before and after
+    //   sideEffects: in-memory AppState only
+    // delivered_watermark_advances_on_sync:end
+    #[tokio::test]
+    #[ignore = "survey, not a gate: run with --ignored --nocapture"]
+    async fn delivered_watermark_advances_on_sync() {
+        const N_TD: usize = 200;
+
+        let state = AppState::new();
+        let app = router(state.clone());
+        let server = TestServer::new(app);
+        let alice = register_and_bearer(&server, "alice_td").await;
+
+        let watermark = |tag: &str| {
+            let d = state.to_device.delivered.lock().expect("delivered");
+            let keys = d.len();
+            let values: Vec<u64> = d.values().copied().collect();
+            let queue: usize = state
+                .to_device
+                .to_device_queue
+                .lock()
+                .expect("queue")
+                .iter()
+                .map(|(_, v)| v.len())
+                .sum();
+            let seen = state.to_device.to_device_seen.lock().expect("seen").len();
+            println!(
+                "  {tag:<12} delivered_keys={keys} watermarks={values:?} queue={queue} seen={seen}"
+            );
+            (keys, values)
+        };
+
+        println!("
+  === delivered watermark survey: N = {N_TD} to-device messages ===");
+        let (keys0, _) = watermark("before");
+
+        for i in 0..N_TD {
+            server
+                .put(&format!("/_matrix/client/v3/sendToDevice/m.leak.probe/txn-d{i}"))
+                .add_header(alice.0.clone(), alice.1.clone())
+                // "*" is the wildcard device: the server expands it to the recipient's
+                // real device id from UserRecord. Addressing "@alice_td:localhost" as if
+                // it were a device id queues into a key that sync can never match —
+                // which is why the first run of this probe showed queue=200 delivered=0.
+                .json(&json!({
+                    "messages": { "@alice_td:localhost": { "*": { "leakprobe": { "n": i } } } }
+                }))
+                .await;
+        }
+        watermark("after-send");
+
+        // The delivery path: a sync that actually returns the queue. timeout=0 keeps it to
+        // an initial sync so the test does not sit in a long poll.
+        let sync = server
+            .get("/_matrix/client/v3/sync?timeout=0")
+            .add_header(alice.0.clone(), alice.1.clone())
+            .await;
+        let sync_rc = sync.status_code();
+        let sync_body: Value = sync.json();
+        let td_in_response = sync_body["to_device"]["events"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0);
+        println!("  sync rc={sync_rc} to_device events in response={td_in_response}");
+
+        let (keys1, values1) = watermark("after-sync");
+        println!(
+            "  VERDICT delivered: keys {} → {} (one per device), watermark {:?} → {:?} {}",
+            keys0,
+            keys1,
+            watermark("noop").1,
+            values1,
+            if keys1 <= keys0.max(1) {
+                "— NOT a leak: bounded by device count, the VALUE is the live part"
+            } else {
+                "— key count grows, investigate"
+            }
+        );
+    }
+
 }
