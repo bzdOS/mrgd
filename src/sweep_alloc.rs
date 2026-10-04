@@ -291,6 +291,17 @@ pub fn totals() -> u64 {
 ///   output: String, no trailing newline
 ///   sideEffects: none
 /// format_summary:end
+/// The sweep-alloc line for a pass that is about to start, or that asked nothing.
+///
+/// Reset and format in ONE call on purpose. A line has to describe one pass: a line
+/// formatted without resetting first carries the previous pass's bytes, which is how a
+/// skipped pass came to print the previous full pass — 525 105 B under a [skip] label —
+/// and made "asked nothing" look like the most expensive line in the log.
+pub fn reset_and_format(label: &str) -> String {
+    reset();
+    format_summary(label)
+}
+
 pub fn format_summary(label: &str) -> String {
     let snap = snapshot();
     let total: u64 = snap.iter().map(|(_, v)| *v).sum();

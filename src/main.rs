@@ -952,9 +952,12 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
             // The line prints once per interval, marked [skip], so a report can
             // tell "asked nothing" from "asked and got nothing".
             if plan.report_skip {
+                // reset_and_format, not format_summary: the counters still hold the
+                // last executed pass, and a [skip] line that prints them describes a
+                // pass that never happened.
                 eprintln!(
                     "{}",
-                    mrgd::sweep_alloc::format_summary(&format!("{label} [skip]"))
+                    mrgd::sweep_alloc::reset_and_format(&format!("{label} [skip]"))
                 );
                 planner.note_reported();
             }

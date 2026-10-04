@@ -440,3 +440,53 @@ fn skip_summary_marks_the_line_and_shows_zero_queries() {
     assert_eq!(crate::sweep_alloc::Site::ALL.len(), 11, "10 byte sites plus catchup.queries");
     println!("{line}");
 }
+
+/// a_skipped_pass_prints_only_its_own_zeroes:start
+///   purpose: The line a skipped pass prints must describe THAT pass and nothing else.
+///            The instrument caught this in the first minute of the window: a [skip]
+///            line arrived carrying 525 105 B, the previous full pass's counters,
+///            because the skip branch formatted the summary without resetting first.
+///            So "asked nothing" was printed as the most expensive line in the log —
+///            the exact confusion the [skip] marker exists to remove.
+///   input:  none — the counters are dirtied through the public adders to stand in for
+///            a full pass that just ran
+///   output: () — prints the rendered skip line
+///   sideEffects: resets the global sweep-alloc counters under ALLOC_LOCK; no files,
+///                no network
+/// a_skipped_pass_prints_only_its_own_zeroes:end
+#[test]
+fn a_skipped_pass_prints_only_its_own_zeroes() {
+    let _guard = ALLOC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use crate::sweep_alloc::Site;
+    crate::sweep_alloc::reset();
+    // Stand in for the full pass that ran a moment ago.
+    crate::sweep_alloc::count_room();
+    crate::sweep_alloc::count_reply();
+    crate::sweep_alloc::add_str_set(Site::ReplyKeyString, 136, 13_618);
+    crate::sweep_alloc::add(Site::PayloadBytes, 307_981);
+    crate::sweep_alloc::add(Site::CatchupQueries, 2);
+    assert!(
+        crate::sweep_alloc::totals() > 300_000,
+        "the stand-in pass must really have dirtied the counters, got {}",
+        crate::sweep_alloc::totals()
+    );
+
+    let line = crate::sweep_alloc::reset_and_format("re-query (periodic) [skip]");
+    assert!(line.contains("[skip]"), "{line}");
+    assert!(line.contains("total=0B"), "a skip spends nothing: {line}");
+    assert!(line.contains("catchup.payload_bytes=0B"), "{line}");
+    assert!(line.contains("catchup.queries=0B"), "{line}");
+    assert!(line.contains("rooms=0"), "{line}");
+    assert!(
+        !line.contains("307981"),
+        "a skip must not inherit the previous pass's bytes: {line}"
+    );
+    assert!(
+        !line.contains("rooms=1"),
+        "a skip merges nothing: {line}"
+    );
+    assert_eq!(crate::sweep_alloc::rooms(), 0);
+    assert_eq!(crate::sweep_alloc::replies(), 0);
+    assert_eq!(crate::sweep_alloc::totals(), 0);
+    println!("{line}");
+}
