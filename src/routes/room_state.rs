@@ -1263,12 +1263,18 @@ pub(crate) async fn drain_cluster_state(state: &Arc<AppState>) -> Result<(), HsE
 //   output: bool
 //   sideEffects: none — read-only locks, no mutation
 //
+//   Shared, not copied: `pub(crate)` because the send route asks the same question before
+//   its own lazy-create (a request must not bring a room into existence, whichever request
+//   it is). Two copies of "known" would drift, and the drift would be invisible.
+//   input:  state, room_id
+//   output: bool
+//
 //   Known gap, stated rather than hidden: a room that exists ONLY on a peer and has not
 //   been pulled yet is not known here, so join answers 404 until the next catch-up brings
 //   it. Pulling on demand is a separate feature — not something to fake by creating an
 //   empty shell, which is the defect this replaces.
 // room_is_known:end
-fn room_is_known(state: &Arc<AppState>, room_id: &str) -> bool {
+pub(crate) fn room_is_known(state: &Arc<AppState>, room_id: &str) -> bool {
     if state.room_state.lock().map(|rs| rs.contains_key(room_id)).unwrap_or(false) {
         return true;
     }

@@ -194,29 +194,20 @@ mod tests {
         let body: Value = resp.json();
         assert_eq!(body["errcode"], "M_NOT_FOUND", "body was {body}");
     }
-    // characterization_send_to_unknown_room_writes_a_room:start
-    //   purpose: MEASUREMENT, not a fix. `PUT /rooms/{roomId}/send/{eventType}/{txnId}`
-    //            (src/routes/send.rs:73) calls `state.ensure_room(&room_id)` with the
-    //            comment "lazy create" and then inserts the PDU — with NO existence check
-    //            and NO membership check. So an authenticated client that PUTs one message
-    //            into a room id nobody ever heard of gets 200 back, and the node is left
-    //            holding a fabricated room WITH a timeline event in it. That is a wider hole
-    //            than the one the 404-join fix closed (join created an empty shell; this
-    //            writes content into it), and `sync` unions `state.rooms`, so the room
-    //            becomes reachable for the drain path as well.
-    //
-    //            This test asserts TODAY's behaviour on purpose, so the vector is a number
-    //            in the suite rather than a suspicion in prose. The next dispatch that
-    //            closes it will turn this red — that is the intended way for it to die.
-    //            Nothing is fixed here: the stand is frozen inside somebody else's
-    //            regression run, and the join dispatch named that endpoint only — so this
-    //            branch must not smuggle a behaviour change into a deploy.
+    // send_to_unknown_room_is_404_and_creates_nothing:start
+    //   purpose: The refusal half of the send fix. This test used to CHARACTERISE the hole
+    //            and asserted the bad behaviour on purpose: one authenticated PUT into a
+    //            room id nobody had heard of measured status=200, room_log_created=true,
+    //            timeline_events=1 — the request fabricated a room and wrote content into
+    //            it. Now the same probe must be a 404 M_NOT_FOUND that leaves no trace,
+    //            which is the whole point: a client typo, or a room id from a peer that
+    //            has not been pulled yet, must not manufacture a room on this node.
     //   input:  a fresh server and one registered user; a room id that does not exist
     //   output: ()
-    //   sideEffects: in-memory AppState only
-    // characterization_send_to_unknown_room_writes_a_room:end
+    //   sideEffects: in-memory AppState only; no files, no network, no listeners
+    // send_to_unknown_room_is_404_and_creates_nothing:end
     #[tokio::test]
-    async fn characterization_send_to_unknown_room_writes_a_room() {
+    async fn send_to_unknown_room_is_404_and_creates_nothing() {
         let state = AppState::new();
         let app = router(state.clone());
         let server = TestServer::new(app);
@@ -236,7 +227,17 @@ mod tests {
             .bytes(axum::body::Bytes::from_static(b"hello"))
             .await;
 
-        let status = resp.status_code();
+        assert_eq!(
+            resp.status_code(),
+            404,
+            "sending into a room this node never heard of must not answer 200: {:?}",
+            resp.text()
+        );
+        let body: Value = resp.json();
+        assert_eq!(body["errcode"], "M_NOT_FOUND", "body was {body}");
+
+        // And no trace of the attempt: no room log, and therefore no timeline. Asserting
+        // the status alone would let a fix that 404s but still calls ensure_room() pass.
         let created = state.rooms.lock().expect("rooms lock").contains_key(ghost);
         let events = state
             .rooms
@@ -245,26 +246,74 @@ mod tests {
             .get(ghost)
             .map(|log| log.ordered().len())
             .unwrap_or(0);
-
-        println!(
-            "send to unknown room: status={status} room_log_created={created} timeline_events={events}"
-        );
-
-        // Assert the measured behaviour, so a change in either direction shows up as a
-        // failure here rather than as a surprise on the stand.
-        assert_eq!(
-            status, 200,
-            "MEASURED behaviour changed: send to an unknown room no longer answers 200 \
-             (room_log_created={created}, timeline_events={events}). If this is now a fix, \
-             flip this test to assert the refusal and the absence of the room."
-        );
         assert!(
-            created,
-            "MEASURED behaviour changed: the room log is no longer created ({ghost})."
+            !created,
+            "a refused send must not create the room: {ghost} now has a room log"
         );
+        assert_eq!(
+            events, 0,
+            "a refused send must not write a timeline event into {ghost}"
+        );
+    }
+
+    // send_to_existing_joined_room_is_200:start
+    //   purpose: The other half, and the reason the guard cannot be "always 404". The send
+    //            route is the hot path of the whole product — if this regressed, nothing
+    //            would work and the suite would still be green on the refusal side alone.
+    //            Deliberately a JOINED room: the fix checks existence only, and this is
+    //            where that scope boundary shows up as a fact rather than as a promise.
+    //   input:  a fresh server, one registered user, one room created through the API
+    //   output: ()
+    //   sideEffects: in-memory AppState only
+    // send_to_existing_joined_room_is_200:end
+    #[tokio::test]
+    async fn send_to_existing_joined_room_is_200() {
+        let state = AppState::new();
+        let app = router(state.clone());
+        let server = TestServer::new(app);
+        let alice = register_and_bearer(&server, "alice_send_ok").await;
+
+        let created: Value = server
+            .post("/_matrix/client/v3/createRoom")
+            .add_header(alice.0.clone(), alice.1.clone())
+            .json(&json!({}))
+            .await
+            .json();
+        let room = created["room_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no room_id in {created}"))
+            .to_string();
+
+        let resp = server
+            .put(&format!(
+                "/_matrix/client/v3/rooms/{room}/send/m.room.message/txn-1"
+            ))
+            .add_header(alice.0.clone(), alice.1.clone())
+            .bytes(axum::body::Bytes::from_static(b"hello"))
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            200,
+            "a send into a room the user joined must keep working: {:?}",
+            resp.text()
+        );
+        let body: Value = resp.json();
+        assert!(
+            body["event_id"].as_str().is_some_and(|e| !e.is_empty()),
+            "a 200 send must name the event it stored: {body}"
+        );
+
+        // The event really landed in that room's timeline.
+        let events = state
+            .rooms
+            .lock()
+            .expect("rooms lock")
+            .get(&room)
+            .map(|log| log.ordered().len())
+            .unwrap_or(0);
         assert!(
             events >= 1,
-            "MEASURED behaviour changed: the fabricated room no longer holds the event."
+            "the message must be in the room's timeline, not just acknowledged: {events}"
         );
     }
 

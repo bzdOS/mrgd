@@ -44,7 +44,7 @@
 // PUBLIC_API: put_send_event
 // END_AI_HEADER
 
-use crate::{auth, error::HsError, state::AppState};
+use crate::{auth, error::HsError, routes::room_state::room_is_known, state::AppState};
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
@@ -84,7 +84,20 @@ pub async fn put_send_event(
     let sender = resolve_sender(&headers, &state.token_secret, &state.server_name)
         .ok_or_else(|| HsError::UnknownToken("missing or invalid token".to_string()))?;
 
-    // Ensure room exists (lazy create).
+    // A request must not bring a room into existence. This is the same defect class the
+    // join routes were fixed for, and here it was worse: the PDU went into the room this
+    // line had just fabricated (measured — status 200, room log created, one event in it).
+    // room_is_known is reused rather than copied, so "known" means one thing in both
+    // routes: local state events, a local RoomLog, or a room the cluster told us about.
+    //
+    // Membership is deliberately NOT checked here. "Does this room exist" and "may this
+    // user post in it" are two different questions, and the second one is not this
+    // dispatch's to answer.
+    if !room_is_known(&state, &room_id) {
+        return Err(HsError::RoomNotFound(room_id));
+    }
+
+    // Ensure room exists (lazy create) — only ever reached for a room already known.
     state.ensure_room(&room_id);
 
     // Insert PDU into local RoomLog; return event_id and (cluster) serialised delta.
