@@ -166,4 +166,131 @@ mod tests {
              would have had to discover the slow way."
         );
     }
+    // fragment_variable_names_match_the_code:start
+    //   purpose: Close the risk my own artifact names out loud. The reporter script warns
+    //            that if the fragment's variable names and the names the code reads ever
+    //            disagree, a soak run silently tests a different configuration than the
+    //            one on disk — and the fragment's names were, until now, transcribed by
+    //            reading the source with my eyes. A rename in state.rs, or a typo in the
+    //            fragment, would leave both files looking fine and the run meaningless.
+    //            This reads both and compares, so the drift fails the suite instead of
+    //            failing a six-hour window.
+    //
+    //            Not ignored: it touches no environment variable, no process state and no
+    //            network — it only compares two files that are already in the tree.
+    //   input:  none — reads src/state.rs and deploy/soak-caps.env.example
+    //   output: () — asserts the two variable-name sets are identical
+    //   sideEffects: none (two file reads)
+    // fragment_variable_names_match_the_code:end
+    #[test]
+    fn fragment_variable_names_match_the_code() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        let source = std::fs::read_to_string(root.join("src/state.rs"))
+            .expect("readable src/state.rs");
+        let fragment = std::fs::read_to_string(root.join("deploy/soak-caps.env.example"))
+            .expect("readable deploy/soak-caps.env.example");
+
+        // Names the code actually reads, from the two *_from_env helpers.
+        let mut from_code: Vec<String> = Vec::new();
+        for line in source.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("std::env::var(\"") {
+                if let Some(end) = rest.find('"') {
+                    let name = &rest[..end];
+                    if name.ends_with("_MAX_EVENTS") {
+                        from_code.push(name.to_string());
+                    }
+                }
+            }
+        }
+        from_code.sort();
+        from_code.dedup();
+
+        // Names the fragment sets. Owned Strings on purpose — the obvious shorter version
+        // of this borrows from a local and has to Box::leak it, which would make a test
+        // about leaks the one that leaks.
+        let mut from_fragment: Vec<String> = fragment
+            .lines()
+            .filter_map(|l| l.trim().split('=').next())
+            .map(|name| name.to_string())
+            .filter(|name| name.starts_with("MATRIX_HS_") && name.ends_with("_MAX_EVENTS"))
+            .collect();
+        from_fragment.sort();
+        from_fragment.dedup();
+
+        println!(
+            "  caps variables — code reads {from_code:?}, fragment sets {from_fragment:?}"
+        );
+
+        assert!(
+            !from_code.is_empty(),
+            "no *_MAX_EVENTS env reads found in src/state.rs — this test is no longer \
+             looking at what it thinks it is"
+        );
+        assert_eq!(
+            from_code, from_fragment,
+            "the fragment and the code disagree on the cap variable names: a soak run would \
+             test a different configuration than the fragment on disk claims"
+        );
+    }
+
+    // env_path_feeds_the_caps:start
+    //   purpose: Prove the second half of the same risk: that those names, when present in
+    //            the environment, actually reach AppState::new()'s caps. The mechanism proof
+    //            (caps_flatten_roomlog_and_timeline) goes through with_server_name_and_caps
+    //            precisely because env is process-global — which leaves the env path itself
+    //            unproven, and the fragment is nothing but env.
+    //
+    //            IGNORED on purpose: setting an env variable here changes it for every test
+    //            running in parallel in this process, and plenty of them build an AppState
+    //            whose caps would silently become 50 instead of 0. A test that can turn a
+    //            green suite red by racing its neighbours does not belong in the default run.
+    //            Run it alone: cargo test --offline --release env_path_feeds -- --ignored
+    //   input:  none — sets both cap variables, builds AppState, restores the environment
+    //   output: () — asserts the caps arrived, and that the environment is left as found
+    //   sideEffects: sets and removes two environment variables for the duration
+    // env_path_feeds_the_caps:end
+    #[test]
+    #[ignore = "sets process-global env vars; run it alone, never as part of the suite"]
+    fn env_path_feeds_the_caps() {
+        const T: &str = "MATRIX_HS_TIMELINE_MAX_EVENTS";
+        const R: &str = "MATRIX_HS_ROOMLOG_MAX_EVENTS";
+        const WANT_T: usize = 1234;
+        const WANT_R: usize = 5678;
+
+        let prev_t = std::env::var(T).ok();
+        let prev_r = std::env::var(R).ok();
+        std::env::set_var(T, WANT_T.to_string());
+        std::env::set_var(R, WANT_R.to_string());
+
+        let state = AppState::new();
+
+        // Restore before asserting, so a failure below cannot leave the environment of
+        // whatever runs next in this process altered.
+        match prev_t {
+            Some(v) => std::env::set_var(T, v),
+            None => std::env::remove_var(T),
+        }
+        match prev_r {
+            Some(v) => std::env::set_var(R, v),
+            None => std::env::remove_var(R),
+        }
+
+        println!(
+            "  env path: timeline_max_events={} roomlog_max_events={} (asked for {WANT_T}/{WANT_R})",
+            state.timeline_max_events, state.roomlog_max_events
+        );
+        assert_eq!(
+            state.timeline_max_events, WANT_T,
+            "{T} did not reach AppState::new() — the fragment would be read by a run that \
+             silently keeps the default"
+        );
+        assert_eq!(
+            state.roomlog_max_events, WANT_R,
+            "{R} did not reach AppState::new() — the fragment would be read by a run that \
+             silently keeps the default"
+        );
+    }
+
 }
