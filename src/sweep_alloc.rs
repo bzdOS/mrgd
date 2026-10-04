@@ -38,10 +38,13 @@ pub enum Site {
     AfterIds,
     /// `merge_catchup_delta`: `serde_json::from_slice(&pdu.content)` input size per new PDU.
     JsonContentParse,
+    /// `merge_catchup_delta`: the small Vec of candidate PDU references kept across the
+    /// merge (replaces the two full-room id sets; kept so the accounting stays complete).
+    CandidateRefs,
 }
 
 impl Site {
-    pub const ALL: [Site; 7] = [
+    pub const ALL: [Site; 8] = [
         Site::ReplyKeyString,
         Site::PayloadBytes,
         Site::ConvergedRoomId,
@@ -49,6 +52,7 @@ impl Site {
         Site::BeforeIds,
         Site::AfterIds,
         Site::JsonContentParse,
+        Site::CandidateRefs,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -60,6 +64,7 @@ impl Site {
             Site::BeforeIds => "merge.before_ids",
             Site::AfterIds => "merge.after_ids",
             Site::JsonContentParse => "merge.json_content_parse",
+            Site::CandidateRefs => "merge.candidate_refs",
         }
     }
 
@@ -72,6 +77,7 @@ impl Site {
             Site::BeforeIds => &BEFORE_IDS,
             Site::AfterIds => &AFTER_IDS,
             Site::JsonContentParse => &JSON_PARSE,
+            Site::CandidateRefs => &CANDIDATE_REFS,
         }
     }
 }
@@ -83,6 +89,7 @@ static KNOWN_IDS: AtomicU64 = AtomicU64::new(0);
 static BEFORE_IDS: AtomicU64 = AtomicU64::new(0);
 static AFTER_IDS: AtomicU64 = AtomicU64::new(0);
 static JSON_PARSE: AtomicU64 = AtomicU64::new(0);
+static CANDIDATE_REFS: AtomicU64 = AtomicU64::new(0);
 
 /// Rooms and replies seen since the last `reset`, so a summary can state per-cycle
 /// denominators next to the byte totals.

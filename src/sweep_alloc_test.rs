@@ -115,19 +115,16 @@ fn sweep_alloc_profile_prints_per_site_bytes() {
     // Shape assertions: the three rebuilds must be the only non-zero sites, and
     // before/after must be within 2x of known (same clone pattern, different source).
     let get = |s: Site| snap.iter().find(|(k, _)| *k == s).map(|(_, v)| *v).unwrap_or(0);
-    assert!(get(Site::KnownIds) > 0, "known_ids rebuild must be counted");
-    assert!(get(Site::BeforeIds) > 0, "before_ids rebuild must be counted");
-    assert!(get(Site::AfterIds) > 0, "after_ids rebuild must be counted");
-    assert!(total >= get(Site::KnownIds), "total must cover known_ids");
+    // After the set-reuse change a steady-state cycle must NOT rebuild the id sets: the
+    // peer re-sends what we already hold, so nothing reaches known_ids at all.
+    assert_eq!(get(Site::BeforeIds), 0, "before_ids set must be gone");
+    assert_eq!(get(Site::AfterIds), 0, "after_ids set must be gone");
+    assert_eq!(get(Site::KnownIds), 0, "known_ids must be lazy (never built here)");
     let rebuilt = get(Site::KnownIds) + get(Site::BeforeIds) + get(Site::AfterIds);
-    assert!(
-        rebuilt * 100 / total >= 90,
-        "HashSet rebuilds must dominate: {rebuilt}/{total}"
-    );
+    assert!(rebuilt == 0, "no id-set rebuild may remain in a steady cycle");
     println!(
-        "[sweep-alloc-profile] verdict: HashSet<String> rebuilds = {rebuilt}B of {total}B ({}%), i.e. {:.1} bytes/room/cycle",
-        rebuilt * 100 / total,
-        rebuilt as f64 / ROOMS as f64
+        "[sweep-alloc-profile] verdict: id-set rebuilds = {rebuilt}B of {total}B; per-room {:.1}B; candidates-only path",
+        total as f64 / ROOMS as f64
     );
 }
 
@@ -146,28 +143,30 @@ fn sweep_merge(
     delta: &crate::substrate::matrix_events::RoomLogDelta,
     stats: &mut crate::requery_backoff::CatchupStats,
 ) {
-    // Same shape as merge_catchup_delta's three rebuilds, on the same locks.
+    // Mirrors the production merge path after the set-reuse change: membership answered by
+    // the log's own map (no per-room id sets), `known_ids` built only for candidates that
+    // survive into the timeline.
     use std::collections::HashSet;
-    let known: HashSet<String> = state
-        .room_timeline
-        .lock()
-        .ok()
-        .and_then(|rt| rt.get(room_id).map(|v| {
-            v.iter()
-                .filter_map(|(_, ev)| ev.get("event_id").and_then(|id| id.as_str()).map(|s| s.to_string()))
-                .collect()
-        }))
-        .unwrap_or_default();
-    sweep_alloc::add_str_set(Site::KnownIds, known.len() as u64, known.iter().map(|s| s.len() as u64).sum());
-
     state.ensure_room_state(room_id);
-    let before: HashSet<String> = state
+
+    let candidates: Vec<&crate::substrate::matrix_events::Pdu> = state
         .rooms
         .lock()
         .ok()
-        .and_then(|r| r.get(room_id).map(|log| log.ordered().iter().map(|p| p.event_id.clone()).collect()))
-        .unwrap_or_default();
-    sweep_alloc::add_str_set(Site::BeforeIds, before.len() as u64, before.iter().map(|s| s.len() as u64).sum());
+        .and_then(|r| {
+            r.get(room_id).map(|log| {
+                delta
+                    .pdus
+                    .iter()
+                    .filter(|p| !log.contains_event_id(&p.event_id))
+                    .collect()
+            })
+        })
+        .unwrap_or_else(|| delta.pdus.iter().collect());
+    sweep_alloc::add(
+        Site::CandidateRefs,
+        (candidates.len() * std::mem::size_of::<&crate::substrate::matrix_events::Pdu>()) as u64,
+    );
 
     let rejected = state
         .rooms
@@ -175,25 +174,59 @@ fn sweep_merge(
         .ok()
         .map(|mut rooms| {
             let log = rooms.entry(room_id.to_string()).or_default();
-            let (_acc, rej) = log.apply_delta_verified(delta, &crate::substrate::node_auth::NodeKeyStore::default());
+            let (_acc, rej) =
+                log.apply_delta_verified(delta, &crate::substrate::node_auth::NodeKeyStore::default());
             rej
         })
         .unwrap_or(0);
     stats.rejected += rejected;
 
-    let after: HashSet<String> = state
+    let present: Vec<&crate::substrate::matrix_events::Pdu> = state
         .rooms
         .lock()
         .ok()
-        .and_then(|r| r.get(room_id).map(|log| log.ordered().iter().map(|p| p.event_id.clone()).collect()))
+        .map(|r| {
+            candidates
+                .iter()
+                .copied()
+                .filter(|p| {
+                    r.get(room_id)
+                        .map(|log| log.contains_event_id(&p.event_id))
+                        .unwrap_or(false)
+                })
+                .collect()
+        })
         .unwrap_or_default();
-    sweep_alloc::add_str_set(Site::AfterIds, after.len() as u64, after.iter().map(|s| s.len() as u64).sum());
 
-    let new: Vec<_> = delta
-        .pdus
-        .iter()
-        .filter(|p| !before.contains(&p.event_id) && !known.contains(&p.event_id) && after.contains(&p.event_id))
-        .collect();
+    let new: Vec<&crate::substrate::matrix_events::Pdu> = if present.is_empty() {
+        present
+    } else {
+        let known: HashSet<String> = state
+            .room_timeline
+            .lock()
+            .ok()
+            .and_then(|rt| {
+                rt.get(room_id).map(|v| {
+                    v.iter()
+                        .filter_map(|(_, ev)| {
+                            ev.get("event_id")
+                                .and_then(|id| id.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        sweep_alloc::add_str_set(
+            Site::KnownIds,
+            known.len() as u64,
+            known.iter().map(|s| s.len() as u64).sum(),
+        );
+        present
+            .into_iter()
+            .filter(|p| !known.contains(&p.event_id))
+            .collect()
+    };
     stats.applied += new.len();
 
     let mut rt = match state.room_timeline.lock() {
@@ -206,31 +239,35 @@ fn sweep_merge(
         let content_val: serde_json::Value =
             serde_json::from_slice(&pdu.content).unwrap_or_else(|_| serde_json::json!({}));
         let pos = state.stream_pos.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        tl.push((pos, serde_json::json!({
+        tl.push((
+            pos,
+            serde_json::json!({
                 "event_id": pdu.event_id,
                 "type": pdu.kind,
                 "sender": pdu.sender,
                 "room_id": pdu.room_id,
                 "origin_server_ts": pdu.ts,
-            "content": content_val
-        })));
+                "content": content_val
+            }),
+        ));
     }
 }
 
-/// sweep_alloc_profile_scales_linearly_with_rooms:start
-///   purpose: Run the same synthetic cycle at 96 and at 192 rooms and assert the counted
-///            bytes double — i.e. the per-cycle cost is per-room, which is the property the
-///            window-D/B2 measurements implied (volume of events, not count of rooms).
+/// sweep_alloc_candidate_refs_scale_with_rooms_not_events:start
+///   purpose: After the set-reuse change the per-cycle cost of the merge path must track the
+///            CANDIDATE count (what the peer re-sends that we lack), not the room's event
+///            count. At 96 and at 192 rooms with the same event volume per room and a
+///            steady-state peer (nothing new), the counted bytes stay tiny and equal per room.
 ///   input:  none
-///   output: prints both totals and the ratio
+///   output: prints both totals
 ///   sideEffects: in-memory only
-/// sweep_alloc_profile_scales_linearly_with_rooms:end
+/// sweep_alloc_candidate_refs_scale_with_rooms_not_events:end
 #[test]
-fn sweep_alloc_profile_scales_linearly_with_rooms() {
-    let _guard = ALLOC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    fn cycle_total(rooms: usize) -> u64 {
+fn sweep_alloc_candidate_refs_scale_with_rooms_not_events() {
+    fn steady_cycle(rooms: usize) -> (u64, u64) {
         const EVENTS_PER_ROOM: usize = 40;
         let state = crate::state::AppState::new();
+        let mut per_room_bytes = 0u64;
         for r in 0..rooms {
             let room_id = format!("!room_{r}_profile:localhost");
             let mut pdus = Vec::with_capacity(EVENTS_PER_ROOM);
@@ -262,34 +299,27 @@ fn sweep_alloc_profile_scales_linearly_with_rooms() {
                     tl.push((i as u64, serde_json::json!({"event_id": pdu.event_id})));
                 }
             }
+            let mut stats = crate::requery_backoff::CatchupStats::default();
+            sweep_alloc::reset();
+            sweep_merge(&state, &room_id, &delta, &mut stats);
+            per_room_bytes = sweep_alloc::totals();
         }
-        sweep_alloc::reset();
-        for r in 0..rooms {
-            let room_id = format!("!room_{r}_profile:localhost");
-            let mut known_ids = std::collections::HashSet::new();
-            if let Ok(rt) = state.room_timeline.lock() {
-                if let Some(v) = rt.get(&room_id) {
-                    known_ids = v
-                        .iter()
-                        .filter_map(|(_, ev)| {
-                            ev.get("event_id")
-                                .and_then(|id| id.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .collect();
-                }
-            }
-            sweep_alloc::add_str_set(
-                Site::KnownIds,
-                known_ids.len() as u64,
-                known_ids.iter().map(|s| s.len() as u64).sum(),
-            );
-        }
-        sweep_alloc::totals()
+        (per_room_bytes, rooms as u64)
     }
 
-    let t96 = cycle_total(96);
-    let t192 = cycle_total(192);
-    println!("[sweep-alloc-profile] linearity: 96 rooms={t96}B, 192 rooms={t192}B, ratio={:.2}", t192 as f64 / t96 as f64);
-    assert_eq!(t192, t96 * 2, "per-cycle cost must be per-room (linear)");
+    let (b96, r96) = steady_cycle(96);
+    let (b192, r192) = steady_cycle(192);
+    println!(
+        "[sweep-alloc-profile] steady state: 96 rooms={b96}B total ({:.1}B/room), 192 rooms={b192}B total ({:.1}B/room)",
+        b96 as f64 / r96 as f64,
+        b192 as f64 / r192 as f64
+    );
+    assert!(
+        b96 < 4096,
+        "a steady-state room must cost almost nothing now, got {b96}B"
+    );
+    assert!(
+        b192 < 8192,
+        "192 steady rooms must stay under 8 KiB total, got {b192}B"
+    );
 }

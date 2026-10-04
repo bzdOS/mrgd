@@ -1182,66 +1182,43 @@ fn merge_catchup_delta(
 ) {
     use std::sync::atomic::Ordering;
 
-    // Collect existing event_ids from room_timeline.
-    let known_ids: std::collections::HashSet<String> = {
-        match state.room_timeline.lock() {
-            Ok(rt) => rt
+    // Ensure room structures exist.
+    state.ensure_room_state(room_id);
+
+    // Candidates first: the PDUs of this delta that the local log does not hold YET.
+    // Membership is answered by the log's own grow-only map (O(1)), so the steady-state
+    // sweep — where the peer re-sends what we already have — allocates nothing at all here,
+    // and `known_ids` below is never even consulted.
+    let candidates: Vec<&mrgd::substrate::matrix_events::Pdu> = {
+        match state.rooms.lock() {
+            Ok(r) => r
                 .get(room_id)
-                .map(|v| {
-                    let set: std::collections::HashSet<String> = v
+                .map(|log| {
+                    delta
+                        .pdus
                         .iter()
-                        .filter_map(|(_, ev)| {
-                            ev.get("event_id")
-                                .and_then(|id| id.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .collect();
-                    // sweep-alloc: this rebuild is per room per sweep, one String clone
-                    // per timeline entry; it is the suspected driver of the sweep step.
-                    mrgd::sweep_alloc::add_str_set(
-                        mrgd::sweep_alloc::Site::KnownIds,
-                        set.len() as u64,
-                        set.iter().map(|s| s.len() as u64).sum::<u64>(),
-                    );
-                    set
+                        .filter(|p| !log.contains_event_id(&p.event_id))
+                        .collect()
                 })
-                .unwrap_or_default(),
+                .unwrap_or_else(|| delta.pdus.iter().collect()),
             Err(e) => {
-                eprintln!("[matrix-hs] catch-up merge: timeline lock: {e}");
+                eprintln!("[matrix-hs] catch-up merge: rooms lock (candidates): {e}");
                 return;
             }
         }
     };
+    mrgd::sweep_alloc::add(
+        mrgd::sweep_alloc::Site::CandidateRefs,
+        (candidates.len() * std::mem::size_of::<&mrgd::substrate::matrix_events::Pdu>()) as u64,
+    );
 
-    // Ensure room structures exist.
-    state.ensure_room_state(room_id);
+    // known_ids is only needed for candidates, so build it lazily and only then.
+    let mut known_ids_built: Option<std::collections::HashSet<String>> = None;
 
     // Merge PDUs into RoomLog (verified — P1.1 internal-task) and collect the new, ACCEPTED ones
     // (not previously known AND actually present in the log after verification — a
     // rejected PDU must never surface to room_timeline/persistence).
     let (new_pdus, rejected): (Vec<&mrgd::substrate::matrix_events::Pdu>, usize) = {
-        let before_ids: std::collections::HashSet<String> = {
-            match state.rooms.lock() {
-                Ok(r) => r
-                    .get(room_id)
-                    .map(|log| {
-                        let set: std::collections::HashSet<String> =
-                            log.ordered().iter().map(|p| p.event_id.clone()).collect();
-                        mrgd::sweep_alloc::add_str_set(
-                            mrgd::sweep_alloc::Site::BeforeIds,
-                            set.len() as u64,
-                            set.iter().map(|s| s.len() as u64).sum::<u64>(),
-                        );
-                        set
-                    })
-                    .unwrap_or_default(),
-                Err(e) => {
-                    eprintln!("[matrix-hs] catch-up merge: rooms lock (before): {e}");
-                    return;
-                }
-            }
-        };
-
         let rejected_count = match state.rooms.lock() {
             Ok(mut rooms) => {
                 let log = rooms.entry(room_id.to_string()).or_default();
@@ -1254,37 +1231,60 @@ fn merge_catchup_delta(
             }
         };
 
-        // Re-check which event_ids are actually present now — verification may have
-        // rejected some PDUs from `delta.pdus`, and those must be excluded here too.
-        let after_ids: std::collections::HashSet<String> = match state.rooms.lock() {
-            Ok(r) => r
-                .get(room_id)
-                .map(|log| {
-                    let set: std::collections::HashSet<String> =
-                        log.ordered().iter().map(|p| p.event_id.clone()).collect();
+        // Re-check presence AFTER verification: a PDU that failed signature/sender-binding
+        // is in neither the log nor the timeline and must not surface.
+        let new_pdus: Vec<&mrgd::substrate::matrix_events::Pdu> = match state.rooms.lock() {
+            Ok(r) => {
+                let present: Vec<&mrgd::substrate::matrix_events::Pdu> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|p| {
+                        r.get(room_id)
+                            .map(|log| log.contains_event_id(&p.event_id))
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                if present.is_empty() {
+                    present
+                } else {
+                    // Only now is the timeline-side id set worth building: it exists to keep
+                    // an event that the timeline already holds out of the timeline again.
+                    let known: std::collections::HashSet<String> = match state.room_timeline.lock() {
+                        Ok(rt) => rt
+                            .get(room_id)
+                            .map(|v| {
+                                v.iter()
+                                    .filter_map(|(_, ev)| {
+                                        ev.get("event_id")
+                                            .and_then(|id| id.as_str())
+                                            .map(|s| s.to_string())
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        Err(e) => {
+                            eprintln!("[matrix-hs] catch-up merge: timeline lock (known): {e}");
+                            return;
+                        }
+                    };
                     mrgd::sweep_alloc::add_str_set(
-                        mrgd::sweep_alloc::Site::AfterIds,
-                        set.len() as u64,
-                        set.iter().map(|s| s.len() as u64).sum::<u64>(),
+                        mrgd::sweep_alloc::Site::KnownIds,
+                        known.len() as u64,
+                        known.iter().map(|s| s.len() as u64).sum::<u64>(),
                     );
-                    set
-                })
-                .unwrap_or_default(),
+                    known_ids_built = Some(known);
+                    let known = known_ids_built.as_ref().expect("just built");
+                    present
+                        .into_iter()
+                        .filter(|p| !known.contains(&p.event_id))
+                        .collect()
+                }
+            }
             Err(e) => {
                 eprintln!("[matrix-hs] catch-up merge: rooms lock (after): {e}");
                 return;
             }
         };
-
-        let new_pdus = delta
-            .pdus
-            .iter()
-            .filter(|p| {
-                !before_ids.contains(&p.event_id)
-                    && !known_ids.contains(&p.event_id)
-                    && after_ids.contains(&p.event_id)
-            })
-            .collect();
         (new_pdus, rejected_count)
     };
     stats.rejected += rejected;
