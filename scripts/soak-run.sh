@@ -27,10 +27,16 @@
 # GATES (from the card; the run is killed and the reason written on the last line):
 #   1. RSS above 2 GiB at any checkpoint.
 #   2. RSS growth of +100 MiB/h or more at two consecutive checkpoints.
-#   3. the baseline climbing linearly for 2 hours or more — least-squares slope over the
-#      trailing 2-hour window at or above +2 MiB/h. The threshold is mine: "climbing
-#      linearly" needs a number to be a gate, and +2 MiB/h is well above noise and well
-#      below the ~15 MiB/h this run exists to disprove.
+#   3. RSS climbing linearly for 2 hours or more — least-squares slope over the trailing
+#      2-hour window at or above +2 MiB/h.
+#      Named GATE_RSS_LINEAR_2H rather than "base" on purpose: the gate measures the RSS
+#      slope, and a gate whose name claims to measure something other than what it measures
+#      is a gate nobody trusts when it fires. The card's wording ("the baseline climbing
+#      linearly") is quantified HERE as exactly that slope; +2 MiB/h is the ratified numeric
+#      form of it, the owner's decision and the owner's responsibility, set well above noise
+#      and well below the ~15 MiB/h this run exists to disprove. No separate "base size"
+#      column is added: RSS is the series these gates are computed from, and a second number
+#      with a vaguer definition would be worse than naming the one we actually measure.
 #
 # READ-ONLY except for the probe signals and the kill a gate authorises.
 #
@@ -73,6 +79,15 @@ GATE_LOG="${LOG%.csv}.gates.log"
 CSV_HDR='epoch,iso,caps_timeline,caps_roomlog,rss_mib,vsz_mib,rss_after_poke_mib,poke_delta_mib,d_rss_mib,rate_mib_h,mp_seq,mp_resident_mib,mp_alloc_mib,rooms,served_depth,d_depth,traffic,gate,not_observable'
 
 [ -s "$CSV" ] || echo "$CSV_HDR" > "$CSV"
+
+# Defined HERE, above the say block that prints it, not further down beside the loop.
+# Under `set -u` the previous order made a bare `env -u WARMUP_TICKS sh scripts/soak-run.sh`
+# die with rc=2 and "WARMUP_TICKS: parameter not set" at the say line — the runner could not
+# start on a fresh shell by its own usage, and that was measured, not guessed.
+# Default 6: six checkpoints at the 300 s interval is the 30-minute warm-up validated on the
+# stand — long enough to cover the post-restart replay and the allocator ramp, which is what
+# made the first version's gates fire on the settling.
+WARMUP_TICKS=${WARMUP_TICKS:-6}
 
 say() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" | tee -a "$GATE_LOG" >/dev/null; }
 
@@ -134,7 +149,6 @@ deadline=$(( $(date +%s) + HOURS * 3600 ))
 # journal and the allocator returns memory over the first minutes, and each SIGUSR2 probe
 # itself walks every arena — so the earliest intervals measure the settling, not the soak.
 # A gate that fires on the settling would kill the run it was meant to judge.
-WARMUP_TICKS=${WARMUP_TICKS:-4}
 tick=0
 first_row=1
 
@@ -218,7 +232,7 @@ EOF
 	awk -v r="$rate" 'BEGIN{exit !(r>=100)}' && fast_streak=$(( fast_streak + 1 )) || fast_streak=0
 	[ "$fast_streak" -ge 2 ] && gate="GATE_RATE_100MIB_H_TWICE"
 	# The window must actually SPAN two hours, not merely contain four points. The first
-	# version only required n>=4, so GATE_BASE_LINEAR_2H fired on a 28-second stretch of
+	# version only required n>=4, so GATE_RSS_LINEAR_2H fired on a 28-second stretch of
 	# dry-run data — a "2-hour" gate judging half a minute. A gate that can fire before its
 	# own window exists is worse than no gate: it gets disarmed by the operator and then
 	# misses the thing it was written for.
@@ -228,7 +242,7 @@ EOF
 		END { if (n<4 || mx-mn < win) {print "na"; exit} d=n*sxx-sx*sx; if (d==0) {print "na"; exit}
 		       printf "%.2f", (n*sxy-sx*sy)/d*3600.0 }' "$CSV" 2>/dev/null || echo na)
 	if [ "$slope" != "na" ] && awk -v s="$slope" 'BEGIN{exit !(s>=2)}'; then
-		gate="GATE_BASE_LINEAR_2H"
+		gate="GATE_RSS_LINEAR_2H"
 	fi
 	fi
 
