@@ -873,13 +873,16 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
         // ── Mid-life re-query ─────────────────────────────────────────────────
         // Everything above happens once, at startup. A node that is already UP
         // when a partition heals has no reason to ask again: it resumes seeing
-        // live traffic, but nothing replays what it missed while the link was
-        // down, so those events are lost to it permanently. Re-run the pass:
-        //   - when the peer set GROWS, because a peer (re)appearing is what a
-        //     healed partition looks like from this side;
-        //   - and on a slow backstop timer, because a link can drop samples
-        //     without the transport ever going away, and no peer event fires.
-        // Repeating is safe because a pass is idempotent — see catchup_pass.
+// The pass is level-triggered on two things, both of them still here:
+//   - when the peer set GROWS, because a peer (re)appearing is what a
+//     healed partition looks like from this side. That pass is a wildcard: a
+//     peer we did not know of can be holding rooms we never heard of;
+//   - and on a slow timer, because a link can drop samples without the
+//     transport ever going away, and no peer event fires. That pass asks
+//     only the rooms whose fingerprint moved, and asks nothing at all when
+//     none of them did. A wildcard happens there every CATCHUP_FULL_EVERY
+//     executed passes, never more often than the interval.
+// Repeating is safe because a pass is idempotent — see catchup_pass.
         {
             let state_bg = state.clone();
             let session_bg = catchup_session.clone();
@@ -897,85 +900,105 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
             let bg_task = tokio::spawn(async move {
                 let mut seen_peers: std::collections::HashSet<_> =
                     session_bg.info().peers_zid().await.collect();
-                let mut since_backstop = Duration::ZERO;
-                // Re-query backoff: a peer whose PDUs are systematically rejected
-                // (TOFU key mismatch, bad signature) must not cost a full-history
-                // re-query every MATRIX_HS_CATCHUP_INTERVAL_SECS forever.
-                let mut backoff =
-                    mrgd::requery_backoff::RequeryBackoff::new(backstop_secs);
-                let mut stats = mrgd::requery_backoff::CatchupStats::default();
-                // Explicit-room passes: a converged node asks nothing, and only rooms
-                // whose fingerprint moved are named. Every CATCHUP_FULL_EVERY pass still
-                // asks for everything, so an unknown room is still discovered.
-                let mut dirty_tracker = mrgd::requery_backoff::DirtyTracker::default();
-                let mut pass_index: u32 = 0;
-                loop {
-                    tokio::time::sleep(poll).await;
-                    since_backstop += poll;
+    // Re-query backoff: a peer whose PDUs are systematically rejected
+    // (TOFU key mismatch, bad signature) must not cost a full-history
+    // re-query every MATRIX_HS_CATCHUP_INTERVAL_SECS forever.
+    let mut backoff =
+        mrgd::requery_backoff::RequeryBackoff::new(backstop_secs);
+    let mut stats = mrgd::requery_backoff::CatchupStats::default();
+    // Explicit-room passes. The scope is decided on EVERY poll, not only when a
+    // timer happened to fire: "ask nothing" is one of the three answers, and it
+    // has to be reachable to exist. The planner owns the clocks, so their
+    // arithmetic is a unit test rather than a thing to read and hope.
+    let mut dirty_tracker = mrgd::requery_backoff::DirtyTracker::default();
+    // Baseline before the first poll: the startup pass has just filled the
+    // state, so without this every room would look dirty on the first poll.
+    let _ = dirty_tracker.update(room_fingerprints(&state_bg));
+    // The wildcard floor is the interval this loop already used, so the rate of
+    // discovery wildcards cannot go up. With no periodic interval configured at
+    // all, discovery still has a floor rather than nothing.
+    let full_interval = if backstop_secs == 0 {
+        std::time::Duration::from_secs(mrgd::requery_backoff::CATCHUP_FULL_MIN_INTERVAL_SECS)
+    } else {
+        std::time::Duration::from_secs(backstop_secs)
+    };
+    let mut planner = mrgd::requery_backoff::PassPlanner::new(full_interval);
+    loop {
+        tokio::time::sleep(poll).await;
 
-                    let peers: std::collections::HashSet<_> =
-                        session_bg.info().peers_zid().await.collect();
-                    let grew = peers.difference(&seen_peers).next().is_some();
-                    seen_peers = peers;
+        let peers: std::collections::HashSet<_> =
+            session_bg.info().peers_zid().await.collect();
+        let grew = peers.difference(&seen_peers).next().is_some();
+        seen_peers = peers;
 
-                    let backstop_due = backstop_secs > 0
-                        && since_backstop >= Duration::from_secs(backoff.delay_secs());
-                    if !grew && !backstop_due {
-                        continue;
-                    }
-                    since_backstop = Duration::ZERO;
+        // Sampled every poll, because "moved since the last completed pass" is
+        // the question — not "moved since the last poll".
+        let dirty = dirty_tracker.update(room_fingerprints(&state_bg));
+        let plan = planner.plan(mrgd::requery_backoff::PollTick {
+            poll,
+            peer_grew: grew,
+            backstop_delay: Duration::from_secs(backoff.delay_secs()),
+            dirty: &dirty,
+        });
 
-                    if grew && settle_ms > 0 {
-                        // A peer that just appeared may not have announced its
-                        // signing key yet (5 s republish interval). Querying before
-                        // it does would reject every PDU it sends back.
-                        tokio::time::sleep(Duration::from_millis(settle_ms)).await;
-                    }
+        let label = if grew {
+            "re-query (peer appeared)"
+        } else {
+            "re-query (periodic)"
+        };
 
-                    let label = if grew {
-                        "re-query (peer appeared)"
-                    } else {
-                        "re-query (periodic)"
-                    };
-                    stats.reset();
-                    let dirty = dirty_tracker.update(room_fingerprints(&state_bg));
-                    // pass_index is 1-based: it counts passes, so CATCHUP_FULL_EVERY
-                    // lands on the 12th, 24th, … pass rather than on the 1st.
-                    pass_index = pass_index.wrapping_add(1);
-                    let scope = mrgd::requery_backoff::decide_scope(grew, backstop_due, pass_index, &dirty);
-                    if let mrgd::requery_backoff::PassScope::Skip = scope {
-                        // Nothing moved and this is not a backstop pass: do not ask at all.
-                        // The sweep-alloc line still prints, marked [skip], so a report can
-                        // tell "asked nothing" from "asked, got nothing".
-                        eprintln!("{}", mrgd::sweep_alloc::format_summary(&format!("{label} [skip]")));
-                        since_backstop += poll;
-                        continue;
-                    }
-                    let converged = catchup_pass(
-                        &state_bg,
-                        &session_bg,
-                        &prefix_bg,
-                        dir_bg.as_deref(),
-                        catchup_timeout,
-                        label,
-                        &mut stats,
-                        &scope,
-                    )
-                    .await;
-                    backoff.note_pass(stats);
-                    if backoff.delay_secs() > backstop_secs {
-                        println!(
-                            "cluster mode: {label}: systematic reject, next re-query in {} s",
-                            backoff.delay_secs()
-                        );
-                    }
-                    if !converged.is_empty() {
-                        println!(
-                            "cluster mode: {label}: {} room(s) answered",
-                            converged.len()
-                        );
-                    }
-                }
+        if !plan.execute {
+            // Nothing moved and no discovery pass is due: issue no query at all.
+            // The line prints once per interval, marked [skip], so a report can
+            // tell "asked nothing" from "asked and got nothing".
+            if plan.report_skip {
+                eprintln!(
+                    "{}",
+                    mrgd::sweep_alloc::format_summary(&format!("{label} [skip]"))
+                );
+                planner.note_reported();
+            }
+            continue;
+        }
+
+        if grew && settle_ms > 0 {
+            // A peer that just appeared may not have announced its
+            // signing key yet (5 s republish interval). Querying before
+            // it does would reject every PDU it sends back.
+            tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+        }
+
+        stats.reset();
+        let converged = catchup_pass(
+            &state_bg,
+            &session_bg,
+            &prefix_bg,
+            dir_bg.as_deref(),
+            catchup_timeout,
+            label,
+            &mut stats,
+            &plan.scope,
+        )
+        .await;
+        backoff.note_pass(stats);
+        planner.note_executed(plan.full_due);
+        // Re-baseline: the pass just changed what we hold, so "moved since the
+        // last pass" must be measured against what the pass left behind. Without
+        // this, every room looks dirty right after a full pass.
+        let _ = dirty_tracker.update(room_fingerprints(&state_bg));
+        if backoff.delay_secs() > backstop_secs {
+            println!(
+                "cluster mode: {label}: systematic reject, next re-query in {} s",
+                backoff.delay_secs()
+            );
+        }
+        if !converged.is_empty() {
+            println!(
+                "cluster mode: {label}: {} room(s) answered",
+                converged.len()
+            );
+        }
+    }
             });
             // Runs for the process lifetime.
             Box::leak(Box::new(bg_task));

@@ -401,3 +401,42 @@ fn sweep_alloc_candidate_refs_scale_with_rooms_not_events() {
         "192 steady rooms must stay under 8 KiB total, got {b192}B"
     );
 }
+
+/// skip_summary_marks_the_line_and_shows_zero_queries:start
+///   purpose: The observable the catch-up change is judged by. A pass that asks
+///            nothing must still print a sweep-alloc line, marked [skip], with
+///            catchup.queries at zero — that pair is what distinguishes "asked
+///            nothing" from "asked, and every reply was empty". Without the marker a
+///            quiet node is indistinguishable from a broken one, and without the new
+///            site the byte counters cannot see the cost of asking at all.
+///   input:  none
+///   output: () — prints the rendered line
+///   sideEffects: resets the global sweep-alloc counters, under ALLOC_LOCK so no
+///                other sweep test is reading them; no files, no network
+/// skip_summary_marks_the_line_and_shows_zero_queries:end
+#[test]
+fn skip_summary_marks_the_line_and_shows_zero_queries() {
+    let _guard = ALLOC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    crate::sweep_alloc::reset();
+    let line = crate::sweep_alloc::format_summary("re-query (periodic) [skip]");
+    assert!(
+        line.contains("[skip]"),
+        "the line must say it asked nothing: {line}"
+    );
+    assert!(
+        line.contains("catchup.queries=0B"),
+        "a skipped pass issues no query, and the line must show it: {line}"
+    );
+    assert!(line.contains("rooms=0"), "and merges nothing: {line}");
+    let sites_named = crate::sweep_alloc::Site::ALL
+        .iter()
+        .filter(|s| line.contains(s.as_str()))
+        .count();
+    assert_eq!(
+        sites_named,
+        crate::sweep_alloc::Site::ALL.len(),
+        "every site in the table must appear in the line: {line}"
+    );
+    assert_eq!(crate::sweep_alloc::Site::ALL.len(), 11, "10 byte sites plus catchup.queries");
+    println!("{line}");
+}
