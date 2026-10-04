@@ -135,6 +135,8 @@ mod cluster_test;
 #[cfg(test)]
 mod createroom_extras_test;
 #[cfg(test)]
+mod leak_survey_test;
+#[cfg(test)]
 mod join_not_found_test;
 #[cfg(all(test, feature = "cluster"))]
 mod device_lists_cluster_test;
