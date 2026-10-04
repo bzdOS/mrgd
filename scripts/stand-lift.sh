@@ -101,9 +101,27 @@ if sockstat -4 -l -p "$LISTEN_PORT" 2>/dev/null | grep -q ":$LISTEN_PORT"; then
 	exit 1
 fi
 
-MATRIX_HS_MEMPROBE_LOG="$MEMPROBE"
-export MATRIX_HS_MEMPROBE_LOG
-
+  MATRIX_HS_MEMPROBE_LOG="$MEMPROBE"
+  export MATRIX_HS_MEMPROBE_LOG
+  
+  # Арены jemalloc: виртуальный след не возвращается системе. На FreeBSD аллокатор
+  # живёт в libc, и в этой сборке `opt.retain` по умолчанию true — арена держит
+  # свой virtual high-water, а `ps rss` считает и подкачанные страницы, поэтому
+  # память узла на стоянке выглядит как растущий остаток, хотя живой набор плоский.
+  # Замерено на пробном процессе с тем же профилем аллокаций (24 потока, транзиентные
+  # мегабайтные буферы), а не на стенде:
+  #   дефолт                      high-water 233.9 МБ, удержание 233.9 МБ, RES 29.0
+  #   retain:false                 high-water  74.6 МБ, удержание  64.9 МБ, RES  1.7
+  #   retain:false + background_thread + dirty_decay_ms:1000
+  #                                high-water  97.5 МБ, удержание  35.8 МБ, RES  6.0
+  #   mallctl("opt.retain") в рантайме — НЕ РАБОТАЕТ (возвращает ошибку), поэтому
+  #   вариант «подрезать из кода» отпадает, остаётся только переменная окружения.
+  # Значение читается ПОСле sourcing env-файла, поэтому его можно переопределить.
+  # ОТКАТ ОДНИМ ШАГОМ: дописать в env-файл строку `MALLOC_CONF=` (пустое значение) —
+  # `${MALLOC_CONF-…}` (без двоеточия) уважает именно пустое значение, а не заменяет его.
+  MALLOC_CONF="${MALLOC_CONF-retain:false,background_thread:true,dirty_decay_ms:1000}"
+  export MALLOC_CONF
+  
 # Метка старта ДО запуска — состав старта должен читаться с диска, а не из
 # памяти оператора (на этом окно #6 и потеряло воспроизводимость).
 printf '[launcher] stand-lift start epoch=%s launcher_pid=%s bin_sha=%s listen=%s\n' \
