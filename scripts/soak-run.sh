@@ -27,15 +27,20 @@
 # GATES. Two kill; the third only writes a line. The banner printed at startup says which is
 # which, because a run whose log claims a gate is armed when it is not is worse than no log.
 #   KILL 1. RSS above 2 GiB at any checkpoint.
-#   KILL 2. GATE_RSS_LINEAR_2H — RSS climbing linearly for 2 hours or more: least-squares
-#            slope over the trailing 2-hour window at or above +2 MiB/h. Named for the RSS
-#            slope rather than "base" on purpose: a gate whose name claims a measurement it
-#            does not make is a gate nobody trusts when it fires. The card's wording ("the
-#            baseline climbing linearly") is quantified HERE as exactly that slope; +2 MiB/h is
-#            the ratified numeric form of it, the owner's decision and responsibility. No
-#            separate "base size" column: RSS is the series these gates are computed from, and
-#            a second number with a vaguer definition would be worse than naming the one we
-#            measure.
+#   KILL 2. GATE_MP_ALLOC_LINEAR_2H — mp_alloc climbing for 2 hours or more: the slope over the
+#            trailing 2-hour window at or above +2 MiB/h, estimated as THEIL-SEN (the median of
+#            pairwise slopes), not least squares. Two changes, one defect each:
+#              * the series is mp_alloc, the allocator's live-byte count, not rss — rss carries
+#                arena retention and swings over 63…456 MiB on this target while mp_alloc sits
+#                inside 46.0…46.6, so a gate fitted to rss was judging a quantity the run makes
+#                no claim about;
+#              * the estimator is the pairwise median, because least squares read +2.569 MiB/h
+#                on a series that never rose — values at 45.8…46.1 with two transient
+#                excursions to 73.7 — and a 28% margin was enough to shut a live service down.
+#                The same window gives +0.000 under Theil-Sen.
+#            Threshold, column and window are unchanged: +2 MiB/h is the ratified numeric form
+#            of the card's wording, the owner's decision and responsibility, and this gate does
+#            not get to quietly re-tune it.
 #   LOG ONLY. RSS growth of +100 MiB/h at two consecutive checkpoints. Demoted after it killed
 #            the stand on a saw-tooth rebound; the numbers are recorded at its implementation.
 #
@@ -77,7 +82,7 @@ mkdir -p "$(dirname "$LOG")"
 
 CSV="$LOG"
 GATE_LOG="${LOG%.csv}.gates.log"
-CSV_HDR='epoch,iso,caps_timeline,caps_roomlog,rss_mib,vsz_mib,rss_after_poke_mib,poke_delta_mib,d_rss_mib,rate_mib_h,mp_seq,mp_resident_mib,mp_alloc_mib,rooms,served_depth,d_depth,traffic,gate,not_observable,d_mp_alloc_mib,rate_mp_alloc_mib'
+CSV_HDR='epoch,iso,caps_timeline,caps_roomlog,rss_mib,vsz_mib,rss_after_poke_mib,poke_delta_mib,d_rss_mib,rate_mib_h,mp_seq,mp_resident_mib,mp_alloc_mib,rooms,served_depth,d_depth,traffic,gate,not_observable,d_mp_alloc_mib,rate_mp_alloc_mib,slope_theilsen_mib_h'
 
 [ -s "$CSV" ] || echo "$CSV_HDR" > "$CSV"
 
@@ -244,6 +249,7 @@ EOF
 
 	# ── gates ────────────────────────────────────────────────────────────────────────
 	gate="ok"
+	gate_detail=""
 	tick=$(( tick + 1 ))
 	if [ "$tick" -le "$WARMUP_TICKS" ]; then
 		gate="warmup"
@@ -283,17 +289,52 @@ EOF
 	# is worse than no gate at all — it reads armed in the banner and in the card, and never
 	# speaks. One step of tolerance is the smallest correction that makes "two hours of data"
 	# true at every interval the recorder is run at.
-	slope=$(awk -F, -v now="$epoch" -v win=7200 '
-		NR>1 && NF>=13 && $1 > now-win { n++; if (mn=="" || $1<mn) mn=$1; if ($1>mx) mx=$1
-		                                  sx+=$1; sy+=$13; sxx+=$1*$1; sxy+=$1*$13 }
-		END { if (n<4 || mx-mn < win*0.9) {print "na"; exit} d=n*sxx-sx*sx; if (d==0) {print "na"; exit}
-		       printf "%.2f", (n*sxy-sx*sy)/d*3600.0 }' "$CSV" 2>/dev/null || echo na)
+	# Theil-Sen: the median of all pairwise slopes, not the least-squares fit.
+	#
+	# Least squares on this window gave +2.569 MiB/h on a series that never rose: the
+	# values sit at 45.8…46.1 with two transient excursions to 73.7, and a fit through
+	# 24 points of which two are thrown +28 MiB produces a small positive slope. Against a
+	# +2 MiB/h threshold that was a 28% margin to shut a live service down, and the margin
+	# came entirely from the estimator's sensitivity to outliers. The pairwise median does
+	# not care about two points: on the same window it gives +0.000 MiB/h.
+	#
+	# Output: slope|column|n|first_epoch|last_epoch|span, or "na|..." when the window is not
+	# ready. The column name is read from the header rather than hardcoded, so a CSV whose
+	# layout changed cannot be silently judged on the wrong series.
+	ts_out=$(awk -F, -v now="$epoch" -v win=7200 -v col=13 '
+		NR==1 { name=$col; next }
+		NF>=col && $1+0 > now-win {
+			n++; t[n]=$1+0; y[n]=$col+0
+			if (mn=="" || $1+0 < mn) mn=$1+0
+			if ($1+0 > mx) { mx=$1+0; first=$1; last=$1 }
+		}
+		END {
+			if (n<4) { printf "na|%s|%d|0|0|0", name, n; exit }
+			if (mx-mn < win*0.9) { printf "na|%s|%d|%d|%d|%d", name, n, mn, mx, mx-mn; exit }
+			k=0
+			for (i=1; i<=n; i++) for (j=i+1; j<=n; j++) {
+				dt=(t[j]-t[i])/3600.0
+				if (dt<=0) continue
+				k++; sl[k]=((y[j]-y[i])/dt)
+			}
+			if (k<1) { printf "na|%s|%d|%d|%d|%d", name, n, mn, mx, mx-mn; exit }
+			for (a=1; a<=k; a++) for (b=a+1; b<=k; b++) if (sl[a]>sl[b]) { tmp=sl[a]; sl[a]=sl[b]; sl[b]=tmp }
+			med=(k%2) ? sl[(k+1)/2] : (sl[k/2]+sl[k/2+1])/2
+			printf "%.3f|%s|%d|%d|%d|%d", med, name, n, mn, mx, mx-mn
+		}' "$CSV" 2>/dev/null || echo "na|mp_alloc_mib|0|0|0|0")
+	slope=${ts_out%%|*}
+	ts_rest=${ts_out#*|}
+	ts_col=${ts_rest%%|*}; ts_rest=${ts_rest#*|}
+	ts_n=${ts_rest%%|*}; ts_rest=${ts_rest#*|}
+	ts_first=${ts_rest%%|*}; ts_rest=${ts_rest#*|}
+	ts_last=${ts_rest%%|*}; ts_span=${ts_rest##*|}
 	if [ "$slope" != "na" ] && awk -v s="$slope" 'BEGIN{exit !(s>=2)}'; then
 		gate="GATE_MP_ALLOC_LINEAR_2H"
+		gate_detail="col=$ts_col estimator=Theil-Sen slope=${slope}MiB/h n=$ts_n window=$ts_first..$ts_last span=${ts_span}s"
 	fi
 	fi
 
-	echo "$epoch,$iso,$caps_t,$caps_r,$rss,$vsz,$rss_after,$poke_delta,$d_rss,$rate,$mp_seq,$mp_res,$mp_alloc,$rooms,$depth,$d_depth,$traffic,$gate,to_device_seen+typing_outer+uia_sessions,$d_mp,$rate_mp" >> "$CSV"
+	echo "$epoch,$iso,$caps_t,$caps_r,$rss,$vsz,$rss_after,$poke_delta,$d_rss,$rate,$mp_seq,$mp_res,$mp_alloc,$rooms,$depth,$d_depth,$traffic,$gate,to_device_seen+typing_outer+uia_sessions,$d_mp,$rate_mp,$slope" >> "$CSV"
 
 	first_row=0
 	prev_rss=$rss; prev_mp_alloc=$mp_alloc; prev_epoch=$epoch; prev_depth=$depth
@@ -301,7 +342,11 @@ EOF
 
 	case "$gate" in
 	GATE_*)
-		say "$gate at $iso — last rows:"
+		if [ -n "$gate_detail" ]; then
+			say "$gate at $iso — $gate_detail — last rows:"
+		else
+			say "$gate at $iso — last rows:"
+		fi
 		tail -5 "$CSV" | sed 's/^/    /' | tee -a "$GATE_LOG"
 		if [ "$NO_KILL" = "1" ]; then
 			say "WOULD KILL on $gate, but --no-kill is set: pid $PID left running."
