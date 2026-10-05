@@ -77,7 +77,7 @@ mkdir -p "$(dirname "$LOG")"
 
 CSV="$LOG"
 GATE_LOG="${LOG%.csv}.gates.log"
-CSV_HDR='epoch,iso,caps_timeline,caps_roomlog,rss_mib,vsz_mib,rss_after_poke_mib,poke_delta_mib,d_rss_mib,rate_mib_h,mp_seq,mp_resident_mib,mp_alloc_mib,rooms,served_depth,d_depth,traffic,gate,not_observable'
+CSV_HDR='epoch,iso,caps_timeline,caps_roomlog,rss_mib,vsz_mib,rss_after_poke_mib,poke_delta_mib,d_rss_mib,rate_mib_h,mp_seq,mp_resident_mib,mp_alloc_mib,rooms,served_depth,d_depth,traffic,gate,not_observable,d_mp_alloc_mib,rate_mp_alloc_mib'
 
 [ -s "$CSV" ] || echo "$CSV_HDR" > "$CSV"
 
@@ -93,8 +93,8 @@ WARMUP_TICKS=${WARMUP_TICKS:-6}
 say() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" | tee -a "$GATE_LOG" >/dev/null; }
 
 say "soak-run start: pid=$PID hours=$HOURS interval=${INTERVAL}s csv=$CSV gates=$GATE_LOG"
-say "gates (KILL): rss>2048MiB | trailing-2h slope>=+2MiB/h"
-say "gates (LOG ONLY, no kill): rate>=+100MiB/h twice in a row — at a 300 s step that threshold is +8.33 MiB, and RSS swings far wider"
+say "gates (KILL): rss>2048MiB (host guard, stays on rss) | trailing-2h slope of mp_alloc >=+2MiB/h"
+say "gates (LOG ONLY, no kill): mp_alloc growth >=+100MiB/h twice in a row — growth gates read mp_alloc; rss is reported only"
 say "warmup: first $WARMUP_TICKS checkpoints are labelled warmup and cannot trip a gate"
 [ "$NO_KILL" = "1" ] && say "VALIDATION MODE (--no-kill): gates are evaluated and logged, the server is NOT killed"
 say "not observable from outside the process: to_device_seen, typing_outer_map, uia_sessions"
@@ -141,6 +141,7 @@ last_field() { # last_field <column-index> — 1-based, header on line 1
 }
 
 prev_rss=$(last_field 5)
+prev_mp_alloc=$(last_field 13)   # the series the growth gates are computed from
 prev_epoch=$(last_field 1)
 prev_depth=$(awk -F, 'NR>1 && NF>=16 {v=$16} END{print v+0}' "$CSV" 2>/dev/null || echo 0)
 rate_prev=0
@@ -215,6 +216,23 @@ EOF
 		mp_alloc=$(awk -v b="${mp_alloc:-0}" 'BEGIN{printf "%.1f", b/1048576}')
 	fi
 
+	# The growth gates read mp_alloc, the allocator's own live-byte count, NOT rss.
+	# One source of data for both gates, so neither can fire on a series the run is not
+	# making a claim about. rss carries arena retention and swings over 63…456 MiB on this
+	# target while mp_alloc sits inside 46.0…46.6; a least-squares fit over a window that
+	# ended at a swing peak read +63.19 MiB/h and took the stand down at 04:15:56Z with no
+	# accumulation anywhere in the data.
+	case "$mp_alloc" in
+	*[0-9]*) : ;;
+	*) mp_alloc=0.0 ;;   # memprobe unavailable: no series, no gate input
+	esac
+	if [ "$first_row" != "1" ] && [ "$epoch" -gt "$prev_epoch" ] && [ "$epoch" -gt 0 ]; then
+		d_mp=$(awk -v a="$mp_alloc" -v b="$prev_mp_alloc" 'BEGIN{printf "%.1f", a-b}')
+		rate_mp=$(awk -v d="$d_mp" -v dt="$(( epoch - prev_epoch ))" 'BEGIN{printf "%.2f", d/(dt/3600.0)}')
+	else
+		d_mp=0.0; rate_mp=0.00
+	fi
+
 	depth_pair=$(served_depth)
 	depth=${depth_pair%%|*}
 	rooms=${depth_pair##*|}
@@ -241,9 +259,16 @@ EOF
 	# may not act on a process.
 	# `gate` is deliberately NOT assigned: assigning it would route this gate into the same
 	# kill path as the two real killers below.
-	awk -v r="$rate" 'BEGIN{exit !(r>=100)}' && fast_streak=$(( fast_streak + 1 )) || fast_streak=0
+	# LOG ONLY — does not kill, and reads mp_alloc. It killed the stand on 2026-10-05T00:12:35Z
+	# by reading rss: two consecutive intervals read +1910.86 and +908.91 MiB/h, a
+	# saw-tooth rebound of ~236 MiB off an 88.5 MiB minimum, while the allocator's own
+	# numbers never left 71.5 … 119.7 MiB resident. Renamed from GATE_RATE_100MIB_H_TWICE
+	# because the series it judges is no longer rss; the +100 MiB/h threshold is unchanged
+	# and is the owner's number.
+	# `gate` is deliberately NOT assigned: assigning it routes this gate into the kill path.
+	awk -v r="$rate_mp" 'BEGIN{exit !(r>=100)}' && fast_streak=$(( fast_streak + 1 )) || fast_streak=0
 	if [ "$fast_streak" -ge 2 ]; then
-		say "GATE_RATE_100MIB_H_TWICE [warn] rate=$rate MiB/h streak=$fast_streak at $iso — logged, no kill"
+		say "GATE_MP_ALLOC_RATE_TWICE [warn] rate_mp_alloc=$rate_mp MiB/h streak=$fast_streak at $iso — logged, no kill"
 	fi
 	# The window must actually SPAN two hours, not merely contain four points. The first
 	# version only required n>=4, so GATE_RSS_LINEAR_2H fired on a 28-second stretch of
@@ -259,19 +284,19 @@ EOF
 	# speaks. One step of tolerance is the smallest correction that makes "two hours of data"
 	# true at every interval the recorder is run at.
 	slope=$(awk -F, -v now="$epoch" -v win=7200 '
-		NR>1 && NF>=5 && $1 > now-win { n++; if (mn=="" || $1<mn) mn=$1; if ($1>mx) mx=$1
-		                                 sx+=$1; sy+=$5; sxx+=$1*$1; sxy+=$1*$5 }
+		NR>1 && NF>=13 && $1 > now-win { n++; if (mn=="" || $1<mn) mn=$1; if ($1>mx) mx=$1
+		                                  sx+=$1; sy+=$13; sxx+=$1*$1; sxy+=$1*$13 }
 		END { if (n<4 || mx-mn < win*0.9) {print "na"; exit} d=n*sxx-sx*sx; if (d==0) {print "na"; exit}
 		       printf "%.2f", (n*sxy-sx*sy)/d*3600.0 }' "$CSV" 2>/dev/null || echo na)
 	if [ "$slope" != "na" ] && awk -v s="$slope" 'BEGIN{exit !(s>=2)}'; then
-		gate="GATE_RSS_LINEAR_2H"
+		gate="GATE_MP_ALLOC_LINEAR_2H"
 	fi
 	fi
 
-	echo "$epoch,$iso,$caps_t,$caps_r,$rss,$vsz,$rss_after,$poke_delta,$d_rss,$rate,$mp_seq,$mp_res,$mp_alloc,$rooms,$depth,$d_depth,$traffic,$gate,to_device_seen+typing_outer+uia_sessions" >> "$CSV"
+	echo "$epoch,$iso,$caps_t,$caps_r,$rss,$vsz,$rss_after,$poke_delta,$d_rss,$rate,$mp_seq,$mp_res,$mp_alloc,$rooms,$depth,$d_depth,$traffic,$gate,to_device_seen+typing_outer+uia_sessions,$d_mp,$rate_mp" >> "$CSV"
 
 	first_row=0
-	prev_rss=$rss; prev_epoch=$epoch; prev_depth=$depth
+	prev_rss=$rss; prev_mp_alloc=$mp_alloc; prev_epoch=$epoch; prev_depth=$depth
 	[ "$d_depth" -ge 0 ] 2>/dev/null && rate_prev=$rate
 
 	case "$gate" in
