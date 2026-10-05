@@ -95,6 +95,19 @@ CSV_HDR='epoch,iso,caps_timeline,caps_roomlog,rss_mib,vsz_mib,rss_after_poke_mib
 # made the first version's gates fire on the settling.
 WARMUP_TICKS=${WARMUP_TICKS:-6}
 
+# The row is written on EVERY tick, warm-up included, and it carries the Theil-Sen
+# estimate. The estimate itself is only computed on ticks past the warm-up, so it has to
+# exist before the loop or `set -u` kills the runner on tick 1 — which is exactly what
+# happened: every acceptance replay ran with WARMUP_TICKS=0, so the warm-up path, the one
+# a real 6-hour run always takes, was never exercised. Default 6, so a real launch died
+# 45 seconds in with "slope: parameter not set".
+slope="na"
+ts_col="mp_alloc_mib"
+ts_n=0
+ts_first=0
+ts_last=0
+ts_span=0
+
 say() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" | tee -a "$GATE_LOG" >/dev/null; }
 
 say "soak-run start: pid=$PID hours=$HOURS interval=${INTERVAL}s csv=$CSV gates=$GATE_LOG"
