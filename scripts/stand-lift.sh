@@ -104,6 +104,24 @@ addr_taken() {
 	sockstat -4 -l -p "$LISTEN_PORT" 2>/dev/null | grep -qE "$ADDR_TAKEN"
 }
 
+# ── Гейт 4: env просит zenoh, а бинарь собран без кластерного слоя ───────────
+# cluster — ОПЦИОНАЛЬНАЯ фича (в Cargo.toml `default = []`), и без неё весь блок
+# #[cfg(feature = "cluster")] вырезается компилятором. Тогда процесс поднимается,
+# слушает свой адрес и молча живёт без зеновского слушателя, без catch-up и без
+# строки "cluster mode:" в логе — выглядит как живой стенд, а им не является.
+# Признак ровно один и однозначный: строка, которую печатает только кластерная
+# сборка, в бинаре есть — печатать её нечем, если блока нет.
+if [ -n "${MATRIX_HS_ZENOH_LISTEN:-}${MATRIX_HS_ZENOH_CONNECT:-}" ] \
+	|| [ "${MATRIX_HS_ZENOH_MODE:-}" = client ]; then
+	if ! strings -a "$BIN" 2>/dev/null | grep -q 'cluster mode: connect='; then
+		echo "stand-lift: в бинаре нет кластерного слоя, а env просит zenoh." >&2
+		echo "stand-lift: zenoh — ОПЦИОНАЛЬНАЯ фича (Cargo.toml: default = []), собрать без неё можно," >&2
+		echo "stand-lift: и тогда подъём молча теряет слушатель, catch-up и строку 'cluster mode:' в логе." >&2
+		echo "stand-lift: пересобери с --features cluster." >&2
+		exit 1
+	fi
+fi
+
 # ── Гейт 3: наш адрес занят, а пид-файла нет — это не наш процесс ───────────
 if addr_taken; then
 	echo "stand-lift: адрес $LISTEN_HOST:$LISTEN_PORT УЖЕ слушает, а pid-файла нет." >&2
