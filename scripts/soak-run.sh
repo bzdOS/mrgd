@@ -24,19 +24,20 @@
 # is measured by whether the served depth moved during the interval: moved = interactive,
 # unchanged = quiet. That is a proxy and is labelled as one.
 #
-# GATES (from the card; the run is killed and the reason written on the last line):
-#   1. RSS above 2 GiB at any checkpoint.
-#   2. RSS growth of +100 MiB/h or more at two consecutive checkpoints.
-#   3. RSS climbing linearly for 2 hours or more — least-squares slope over the trailing
-#      2-hour window at or above +2 MiB/h.
-#      Named GATE_RSS_LINEAR_2H rather than "base" on purpose: the gate measures the RSS
-#      slope, and a gate whose name claims to measure something other than what it measures
-#      is a gate nobody trusts when it fires. The card's wording ("the baseline climbing
-#      linearly") is quantified HERE as exactly that slope; +2 MiB/h is the ratified numeric
-#      form of it, the owner's decision and the owner's responsibility, set well above noise
-#      and well below the ~15 MiB/h this run exists to disprove. No separate "base size"
-#      column is added: RSS is the series these gates are computed from, and a second number
-#      with a vaguer definition would be worse than naming the one we actually measure.
+# GATES. Two kill; the third only writes a line. The banner printed at startup says which is
+# which, because a run whose log claims a gate is armed when it is not is worse than no log.
+#   KILL 1. RSS above 2 GiB at any checkpoint.
+#   KILL 2. GATE_RSS_LINEAR_2H — RSS climbing linearly for 2 hours or more: least-squares
+#            slope over the trailing 2-hour window at or above +2 MiB/h. Named for the RSS
+#            slope rather than "base" on purpose: a gate whose name claims a measurement it
+#            does not make is a gate nobody trusts when it fires. The card's wording ("the
+#            baseline climbing linearly") is quantified HERE as exactly that slope; +2 MiB/h is
+#            the ratified numeric form of it, the owner's decision and responsibility. No
+#            separate "base size" column: RSS is the series these gates are computed from, and
+#            a second number with a vaguer definition would be worse than naming the one we
+#            measure.
+#   LOG ONLY. RSS growth of +100 MiB/h at two consecutive checkpoints. Demoted after it killed
+#            the stand on a saw-tooth rebound; the numbers are recorded at its implementation.
 #
 # READ-ONLY except for the probe signals and the kill a gate authorises.
 #
@@ -92,7 +93,8 @@ WARMUP_TICKS=${WARMUP_TICKS:-6}
 say() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" | tee -a "$GATE_LOG" >/dev/null; }
 
 say "soak-run start: pid=$PID hours=$HOURS interval=${INTERVAL}s csv=$CSV gates=$GATE_LOG"
-say "gates: rss>2048MiB | rate>=+100MiB/h twice in a row | trailing-2h slope>=+2MiB/h"
+say "gates (KILL): rss>2048MiB | trailing-2h slope>=+2MiB/h"
+say "gates (LOG ONLY, no kill): rate>=+100MiB/h twice in a row — at a 300 s step that threshold is +8.33 MiB, and RSS swings far wider"
 say "warmup: first $WARMUP_TICKS checkpoints are labelled warmup and cannot trip a gate"
 [ "$NO_KILL" = "1" ] && say "VALIDATION MODE (--no-kill): gates are evaluated and logged, the server is NOT killed"
 say "not observable from outside the process: to_device_seen, typing_outer_map, uia_sessions"
@@ -229,17 +231,37 @@ EOF
 		gate="warmup"
 	else
 	awk -v r="$rss" 'BEGIN{exit !(r>2048)}' && { gate="GATE_RSS_OVER_2GIB"; }
+	# LOG ONLY — this gate no longer kills. It fired on 2026-10-05T00:12:35Z and took the
+	# stand down mid-regression: two consecutive intervals read +1910.86 and +908.91 MiB/h,
+	# which is a saw-tooth rebound of ~236 MiB off an 88.5 MiB minimum, not growth. The
+	# arithmetic that makes it unusable at this step: +100 MiB/h over 300 s is +8.33 MiB per
+	# step, while RSS ranged over 88.5 … 397.0 MiB across the run and the allocator's own
+	# resident stayed inside 71.5 … 119.7 MiB. The gate was reading arena noise as a rate.
+	# The streak and the line are kept — the signal is worth having — but two noisy samples
+	# may not act on a process.
+	# `gate` is deliberately NOT assigned: assigning it would route this gate into the same
+	# kill path as the two real killers below.
 	awk -v r="$rate" 'BEGIN{exit !(r>=100)}' && fast_streak=$(( fast_streak + 1 )) || fast_streak=0
-	[ "$fast_streak" -ge 2 ] && gate="GATE_RATE_100MIB_H_TWICE"
+	if [ "$fast_streak" -ge 2 ]; then
+		say "GATE_RATE_100MIB_H_TWICE [warn] rate=$rate MiB/h streak=$fast_streak at $iso — logged, no kill"
+	fi
 	# The window must actually SPAN two hours, not merely contain four points. The first
 	# version only required n>=4, so GATE_RSS_LINEAR_2H fired on a 28-second stretch of
-	# dry-run data — a "2-hour" gate judging half a minute. A gate that can fire before its
-	# own window exists is worse than no gate: it gets disarmed by the operator and then
-	# misses the thing it was written for.
+	# dry-run data — a "2-hour" gate judging half a minute.
+	#
+	# The threshold is 90% of the window, and that tolerance is not slack for its own sake.
+	# The row filter is `$1 > now - win` — strictly greater — so the oldest row inside the
+	# window is always excluded and the surviving span is at most `win - one_step`. At the
+	# 300 s interval this soak actually runs, that is 7200 - 300 = 6900 s, and the original
+	# `mx - mn >= win` could therefore never be satisfied: measured, 25 rows in the window
+	# spanning 6905 s against a 7200 s requirement. The killer was unreachable code, which
+	# is worse than no gate at all — it reads armed in the banner and in the card, and never
+	# speaks. One step of tolerance is the smallest correction that makes "two hours of data"
+	# true at every interval the recorder is run at.
 	slope=$(awk -F, -v now="$epoch" -v win=7200 '
 		NR>1 && NF>=5 && $1 > now-win { n++; if (mn=="" || $1<mn) mn=$1; if ($1>mx) mx=$1
 		                                 sx+=$1; sy+=$5; sxx+=$1*$1; sxy+=$1*$5 }
-		END { if (n<4 || mx-mn < win) {print "na"; exit} d=n*sxx-sx*sx; if (d==0) {print "na"; exit}
+		END { if (n<4 || mx-mn < win*0.9) {print "na"; exit} d=n*sxx-sx*sx; if (d==0) {print "na"; exit}
 		       printf "%.2f", (n*sxy-sx*sy)/d*3600.0 }' "$CSV" 2>/dev/null || echo na)
 	if [ "$slope" != "na" ] && awk -v s="$slope" 'BEGIN{exit !(s>=2)}'; then
 		gate="GATE_RSS_LINEAR_2H"
