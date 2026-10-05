@@ -41,21 +41,11 @@ impl CatchupStats {
     }
 }
 
-/// Every Nth EXECUTED pass may ask for everything, whatever the dirty set says.
+/// Floor between two wildcard passes when no periodic interval is configured at all.
 ///
-/// The safety net for the one thing a targeted pass cannot do: discover a room this
-/// node has never heard of. A peer that came up while we were partitioned is only
-/// found by a wildcard, so discovery is bought at 1/CATCHUP_FULL_EVERY of the cost
-/// instead of on every pass.
-pub const CATCHUP_FULL_EVERY: u32 = 12;
-
-/// Floor between two wildcard passes, whatever the pass counter says.
-///
-/// A pass counter is not a rate. At a 5 s poll, "every 12th pass" is a wildcard every
-/// 60 s — several times more often than the periodic re-query this replaces, and the
-/// wildcard is the one expensive request there is. So the counter says only that a
-/// wildcard is ALLOWED; this interval says how soon. It is the old backstop interval,
-/// which is why the rate of discovery wildcards does not go up.
+/// It paces only the `[skip]` line, never a pass: with
+/// `MATRIX_HS_CATCHUP_INTERVAL_SECS=0` the clock trigger is off (see `full_pass_due`)
+/// and a node asks for everything only when a peer appears.
 pub const CATCHUP_FULL_MIN_INTERVAL_SECS: u64 = 300;
 
 /// Per-room fingerprint: how much the room holds. A change in any of the three means
@@ -107,24 +97,34 @@ pub fn decide_scope(full_due: bool, dirty: &[String]) -> PassScope {
 
 /// Whether this pass should ask for everything. Pure.
 ///
-/// One trigger existed before this change — a peer appeared — and one is new: enough
-/// executed passes have gone by, far enough apart in time. The old backstop timer is
-/// deliberately NOT a trigger here. It used to mean "ask for everything"; now it only
-/// paces the loop, because the periodic pass asks only what moved and skips when
-/// nothing did.
+/// Two triggers. A peer appeared — immediate, nothing counted, that one predates this
+/// function. And the interval elapsed since the last wildcard — a wall clock, and this
+/// is the part that changed.
 ///
-/// Consequence worth stating plainly: a node with nothing to converge executes no pass
-/// at all, so its counter never reaches `CATCHUP_FULL_EVERY` and it issues no wildcard.
-/// That is the whole point on an idle node, and it is also the trade: on such a node a
-/// room created by an already-known peer is found when the next local write or peer
-/// event happens, not on a timer.
+/// The rule used to be `peer_grew || (passes_since_full >= 12 && since_full >= interval)`,
+/// and the conjunction is where a node stayed empty forever. `passes_since_full` only
+/// grows when a pass EXECUTES, so take the order that really happens: the startup pass
+/// runs before the peer's handshake lands, so it finds nothing; the loop then takes its
+/// peer baseline with that peer already in it, so `peer_grew` is false from then on; and
+/// with no local write there is no dirty room, so no pass executes, so the counter stays
+/// at 0 and the wildcard never becomes due. The node has a peer, the peer has rooms, and
+/// nothing in any log says a convergence was lost. A pass counter cannot cover every
+/// order of events; a clock can, because it advances whether or not anybody passed.
+///
+/// `full_interval` is `MATRIX_HS_CATCHUP_INTERVAL_SECS` (default 300 s). Zero switches
+/// the clock trigger off; the peer trigger stays.
 pub fn full_pass_due(
     peer_grew: bool,
-    passes_since_full: u32,
     since_full: std::time::Duration,
-    min_interval: std::time::Duration,
+    full_interval: std::time::Duration,
 ) -> bool {
-    peer_grew || (passes_since_full >= CATCHUP_FULL_EVERY && since_full >= min_interval)
+    if peer_grew {
+        return true;
+    }
+    if full_interval.is_zero() {
+        return false;
+    }
+    since_full >= full_interval
 }
 
 /// One poll of the re-query loop, as the planner sees it.
@@ -161,7 +161,8 @@ pub struct PassPlan {
 /// that drives a planner over a simulated hour.
 #[derive(Debug, Clone)]
 pub struct PassPlanner {
-    /// Executed passes since the last wildcard. Skips do not count.
+    /// Executed passes since the last wildcard. Skips do not count. Reported, not a
+    /// trigger: gating the wildcard on this is what left a node empty forever.
     passes_since_full: u32,
     /// Wall time since the last wildcard.
     since_full: std::time::Duration,
@@ -169,7 +170,7 @@ pub struct PassPlanner {
     since_pass: std::time::Duration,
     /// Wall time since the last printed line, executed or skipped.
     since_report: std::time::Duration,
-    /// Floor between wildcards; see `CATCHUP_FULL_MIN_INTERVAL_SECS`.
+    /// Clock floor between wildcards; zero means the clock trigger is off.
     full_interval: std::time::Duration,
     fulls: u32,
 }
@@ -191,16 +192,18 @@ impl PassPlanner {
         self.since_pass = self.since_pass.saturating_add(tick.poll);
         self.since_full = self.since_full.saturating_add(tick.poll);
         self.since_report = self.since_report.saturating_add(tick.poll);
-        let full_due = full_pass_due(
-            tick.peer_grew,
-            self.passes_since_full,
-            self.since_full,
-            self.full_interval,
-        );
+        let full_due = full_pass_due(tick.peer_grew, self.since_full, self.full_interval);
         let scope = decide_scope(full_due, tick.dirty);
         let skip = matches!(scope, PassScope::Skip);
+        // The [skip] line needs a floor of its own: a switched-off clock trigger leaves
+        // full_interval zero, and "report every poll" would put a line in the log every
+        // 5 s on a node that is correctly asking nothing.
         let report_interval = if tick.backstop_delay.is_zero() {
-            self.full_interval
+            if self.full_interval.is_zero() {
+                std::time::Duration::from_secs(CATCHUP_FULL_MIN_INTERVAL_SECS)
+            } else {
+                self.full_interval
+            }
         } else {
             tick.backstop_delay
         };
@@ -496,50 +499,58 @@ mod tests {
         assert_eq!(query_keys("p", "history", &PassScope::Full), vec!["p/*/history"]);
     }
 
-    // an_idle_node_skips_every_poll:start
-    //   purpose: THE reachability test. Twenty minutes of an idle node at the real
-    //            5 s poll: every poll must decide Skip and execute nothing, so the
-    //            skip branch is a state the loop actually spends its life in, not a
-    //            branch a code read says exists. The [skip] line prints once per
-    //            backstop interval — 4 in 20 min — so a report can see "asked
-    //            nothing" without a line per poll.
+    // an_idle_node_asks_nothing_between_the_clock_wildcards:start
+    //   purpose: THE reachability test, with the new contract. Twenty minutes of an idle
+    //            node at the real 5 s poll: between wildcards every poll must decide Skip
+    //            and execute nothing, so the skip branch is a state the loop actually
+    //            spends its life in. But the node MUST pay exactly one wildcard per
+    //            interval — that is the fix: an idle node used to pay none, forever, and a
+    //            node whose startup pass lost its peer's handshake stayed empty with no
+    //            error anywhere.
     //   input:  none
     //   output: () — prints a one-line summary of the simulation
     //   sideEffects: none
-    // an_idle_node_skips_every_poll:end
+    // an_idle_node_asks_nothing_between_the_clock_wildcards:end
     #[test]
-    fn an_idle_node_skips_every_poll() {
+    fn an_idle_node_asks_nothing_between_the_clock_wildcards() {
         const POLL: std::time::Duration = std::time::Duration::from_secs(5);
         const BACKSTOP: std::time::Duration = std::time::Duration::from_secs(300);
         let mut p = PassPlanner::new(BACKSTOP);
-        let (mut polls, mut executed, mut reports) = (0u32, 0u32, 0u32);
+        let (mut polls, mut executed, mut wildcards, mut skips) = (0u32, 0u32, 0u32, 0u32);
         for i in 0..240 {
             let plan = p.plan(PollTick { poll: POLL, peer_grew: false, backstop_delay: BACKSTOP, dirty: &[] });
             polls += 1;
-            assert_eq!(plan.scope, PassScope::Skip, "poll {i}: an idle node has nothing to ask");
-            assert!(!plan.execute, "poll {i}: a skip must not run a pass");
             if plan.execute {
                 executed += 1;
-            }
-            if plan.report_skip {
-                reports += 1;
-                p.note_reported();
+                assert_eq!(
+                    plan.scope,
+                    PassScope::Full,
+                    "poll {i}: an idle node's only pass is the clock wildcard"
+                );
+                assert!(plan.full_due, "poll {i}: a wildcard came from the clock");
+                wildcards += 1;
+                p.note_executed(plan.full_due);
+            } else {
+                skips += 1;
+                assert_eq!(plan.scope, PassScope::Skip, "poll {i}: nothing moved, ask nothing");
+                assert!(!plan.execute, "poll {i}: a skip must not run a pass");
+                assert!(!plan.full_due, "poll {i}: the interval has not elapsed yet");
+                if plan.report_skip {
+                    p.note_reported();
+                }
             }
         }
         assert_eq!(polls, 240);
-        assert_eq!(executed, 0, "an idle node runs no pass at all");
-        assert_eq!(reports, 4, "one [skip] line per 300 s over 20 min");
-        assert_eq!(p.fulls(), 0, "an idle node must never pay for a wildcard");
-        assert_eq!(p.passes_since_full(), 0, "skips are not executed passes");
+        assert_eq!(wildcards, 4, "one wildcard per 300 s over 20 min, and no more");
+        assert_eq!(executed, wildcards, "a clock wildcard is the only pass an idle node runs");
+        assert_eq!(skips, 236, "every other poll asks nothing");
+        assert_eq!(p.fulls(), 4);
         assert_eq!(
             p.since_pass(),
-            std::time::Duration::from_secs(1200),
-            "the clock since the last pass grows by exactly one poll per poll"
+            std::time::Duration::ZERO,
+            "poll 240 is itself the fourth wildcard, so the clock since the last pass is zero"
         );
-        println!(
-            "idle node: {polls} polls, {executed} passes, {reports} [skip] lines, {} wildcards",
-            p.fulls()
-        );
+        println!("idle node: {polls} polls, {executed} passes ({wildcards} wildcards), {skips} skips");
     }
 
     // since_pass_resets_only_on_an_executed_pass:start
@@ -629,7 +640,15 @@ mod tests {
     // peer_appearance_is_still_a_wildcard:end
     #[test]
     fn peer_appearance_is_still_a_wildcard() {
-        assert!(full_pass_due(true, 0, std::time::Duration::ZERO, std::time::Duration::from_secs(300)));
+        assert!(full_pass_due(
+            true,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(300)
+        ));
+        assert!(
+            full_pass_due(true, std::time::Duration::ZERO, std::time::Duration::ZERO),
+            "a peer appeared — that trigger is never switched off"
+        );
         let mut p = PassPlanner::new(std::time::Duration::from_secs(300));
         let plan = p.plan(PollTick {
             poll: std::time::Duration::from_secs(5),
@@ -642,23 +661,35 @@ mod tests {
         assert!(plan.execute);
     }
 
-    // full_pass_needs_both_the_count_and_the_interval:start
-    //   purpose: The two halves of the discovery rule, separated. The count alone is
-    //            the bug that was caught in review (12 polls = 60 s); the interval
-    //            alone would let a long-poll deployment discover nothing at all.
+    // full_pass_is_a_clock_not_a_count:start
+    //   purpose: The trigger that was a conjunction with a pass counter is now the clock
+    //            alone. These are the cases the conjunction got wrong in both directions:
+    //            an hour of silence with zero executed passes MUST discover (it never
+    //            did), and a zero interval MUST discover nothing on a timer (that is what
+    //            MATRIX_HS_CATCHUP_INTERVAL_SECS=0 means).
     //   input:  none
     //   output: ()
     //   sideEffects: none
-    // full_pass_needs_both_the_count_and_the_interval:end
+    // full_pass_is_a_clock_not_a_count:end
     #[test]
-    fn full_pass_needs_both_the_count_and_the_interval() {
-        let min = std::time::Duration::from_secs(300);
-        let at = |n, secs| full_pass_due(false, n, std::time::Duration::from_secs(secs), min);
-        assert!(!at(CATCHUP_FULL_EVERY - 1, 3600), "eleven passes is not twelve");
-        assert!(!at(CATCHUP_FULL_EVERY, 5), "twelve passes in 5 s is too soon");
-        assert!(at(CATCHUP_FULL_EVERY, 300), "twelve passes and the interval elapsed");
-        assert!(at(CATCHUP_FULL_EVERY * 3, 3600));
-        assert!(!at(0, 86_400), "a node that has not executed a pass never discovers");
+    fn full_pass_is_a_clock_not_a_count() {
+        let iv = std::time::Duration::from_secs(300);
+        assert!(
+            !full_pass_due(false, std::time::Duration::from_secs(295), iv),
+            "one poll short of the interval"
+        );
+        assert!(
+            full_pass_due(false, std::time::Duration::from_secs(300), iv),
+            "at the interval, with no pass ever executed"
+        );
+        assert!(
+            full_pass_due(false, std::time::Duration::from_secs(86_400), iv),
+            "a day of silence still discovers"
+        );
+        assert!(
+            !full_pass_due(false, std::time::Duration::from_secs(86_400), std::time::Duration::ZERO),
+            "zero interval = the clock trigger is off"
+        );
     }
 
     // dirty_tracker_reports_moved_rooms:start

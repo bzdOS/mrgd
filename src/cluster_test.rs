@@ -1707,6 +1707,244 @@ mod tests {
             "node B learned the room_id but not its state: {events:?}"
         );
     }
+    // cluster:late_handshake_converges_on_the_clock:start
+    //   purpose: The order of events that left a node empty forever, on a real mesh.
+    //            Node-1 runs its startup pass while it has NO peer and finds nothing;
+    //            node-2 connects only afterwards and declares the catch-up queryable
+    //            that holds a room. The re-query loop takes its peer baseline AFTER that
+    //            handshake, so `peer_grew` is false from then on, and with no local write
+    //            no room is dirty — the only thing that can still ask for that room is
+    //            the interval clock. Before the fix the planner skipped every poll and
+    //            node-1 never learned the room, with nothing in any log saying a
+    //            convergence was lost. Both halves are asserted: a skip BEFORE the
+    //            interval (the clock is not "ask every poll") and the wildcard plus a
+    //            converged node after it.
+    //            Like catchup_room_created_after_startup, the pass itself is mirrored from
+    //            main.rs rather than called, because it lives in the binary. The planner
+    //            and the wildcard GET are the production ones.
+    //   input:  none (all resources constructed in-test)
+    //   output: node-1 holds the room's state, keyed by a room_id it learned from the
+    //           reply itself; prints the room count the startup pass found and the poll
+    //           at which the clock fired
+    //   sideEffects: binds two loopback ports for the sessions' lifetime
+    // cluster:late_handshake_converges_on_the_clock:end
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_handshake_converges_on_the_clock() {
+        let _zg = crate::test_util::ZENOH_TEST_LOCK.acquire().await.unwrap();
+        use crate::requery_backoff::{PassPlanner, PassScope, PollTick};
+        use crate::routes::room_state::StateCatchupMsg;
+        use crate::state::{ClusterState, StateEvent};
+        use serde_json::json;
+        use std::time::Duration;
+
+        let prefix = crate::test_util::unique_prefix("mrgd/matrix/room/late-handshake-test");
+        let room_id = "!late-handshake:node-b";
+        let state_wild = format!("{prefix}/*/state");
+
+        // ── Node-1 alone: its startup pass has no peer to ask ─────────────────────
+        let addr_1 = crate::test_util::free_loopback_addr();
+        let sess_1 = crate::test_util::open_at(&addr_1, &[]).await;
+        let state_1 = AppState::new();
+        let startup = sess_1
+            .get(&state_wild)
+            .timeout(Duration::from_secs(3))
+            .await
+            .expect("startup wildcard GET");
+        let mut startup_rooms = 0usize;
+        while let Ok(Ok(reply)) =
+            tokio::time::timeout(Duration::from_millis(500), startup.recv_async()).await
+        {
+            if reply.result().is_ok() {
+                startup_rooms += 1;
+            }
+        }
+        assert_eq!(
+            startup_rooms, 0,
+            "the startup pass had no peer to ask, so it found nothing — that is the state \
+             the next steps start from"
+        );
+
+        // ── Node-2 connects only now: the handshake is late ───────────────────────
+        let addr_2 = crate::test_util::free_loopback_addr();
+        let sess_2 = crate::test_util::open_at(&addr_2, &[addr_1.clone()]).await;
+        let mut handshaken = false;
+        for _ in 0..50 {
+            let peers: std::collections::HashSet<_> = sess_1.info().peers_zid().await.collect();
+            if !peers.is_empty() {
+                handshaken = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(handshaken, "the late handshake never landed on node-1");
+
+        let state_2 = AppState::new();
+        state_2.ensure_room_state(room_id);
+        {
+            let name_ev = StateEvent {
+                event_type: "m.room.name".to_string(),
+                state_key: String::new(),
+                sender: "@bob:node-b".to_string(),
+                content: json!({"name": "Late Handshake"}),
+                event_id: "$late-handshake-name".to_string(),
+                room_id: room_id.to_string(),
+                origin_server_ts: 2000,
+            };
+            let mut rs = state_2.room_state.lock().expect("room_state lock node-2");
+            rs.insert(room_id.to_string(), vec![name_ev]);
+        }
+        let qable = sess_2
+            .declare_queryable(&state_wild)
+            .await
+            .expect("declare wildcard state queryable");
+        let handler = qable.handler().clone();
+        let prefix_for_qable = prefix.to_string();
+        let _qable_task = tokio::spawn(async move {
+            while let Ok(query) = handler.recv_async().await {
+                let known: Vec<String> = {
+                    let rs = state_2.room_state.lock().expect("room_state qable lock");
+                    rs.keys().cloned().collect()
+                };
+                for rid in ClusterState::rooms_for_query(
+                    query.key_expr().as_str(),
+                    &prefix_for_qable,
+                    "state",
+                    known,
+                ) {
+                    let bytes = {
+                        let rs = state_2.room_state.lock().expect("room_state qable lock");
+                        match rs.get(&rid) {
+                            Some(events) => {
+                                let msg: StateCatchupMsg = events.into();
+                                serde_json::to_vec(&msg).unwrap_or_default()
+                            }
+                            None => Vec::new(),
+                        }
+                    };
+                    let reply_key = format!("{prefix_for_qable}/{rid}/state");
+                    let _ = query.reply(&reply_key, bytes).await;
+                }
+            }
+        });
+
+        // ── The loop's baseline: node-2 is already a peer, so peer_grew is false ──
+        let peers: std::collections::HashSet<_> = sess_1.info().peers_zid().await.collect();
+        assert!(
+            !peers.is_empty(),
+            "precondition: the handshake is in the baseline the loop would take"
+        );
+        let dirty: Vec<String> = Vec::new();
+
+        const POLL: Duration = Duration::from_secs(5);
+        const INTERVAL: Duration = Duration::from_secs(20);
+        let mut planner = PassPlanner::new(INTERVAL);
+        let tick = || PollTick {
+            poll: POLL,
+            peer_grew: false,
+            backstop_delay: INTERVAL,
+            dirty: &dirty,
+        };
+
+        // Before the interval an idle node asks nothing at all.
+        for i in 0..3 {
+            let plan = planner.plan(tick());
+            assert!(
+                !plan.execute,
+                "poll {i}: nothing moved and the interval has not elapsed — asking here \
+                 would turn the clock into a per-poll query"
+            );
+        }
+
+        // At the interval the wildcard is due — with no pass ever executed.
+        let mut due_at = None;
+        for i in 3..12 {
+            let plan = planner.plan(tick());
+            if plan.execute {
+                assert_eq!(
+                    plan.scope,
+                    PassScope::Full,
+                    "the clock buys a wildcard, not a targeted pass"
+                );
+                assert!(plan.full_due, "the pass came from the clock");
+                due_at = Some(i);
+                break;
+            }
+        }
+        let due_at = due_at.unwrap_or_else(|| {
+            panic!(
+                "the interval clock never fired a wildcard: node-1 has a peer holding a \
+                 room and would stay empty forever, with nothing in any log"
+            )
+        });
+
+        // ── The wildcard pass itself: node-1 asks for everything and converges ────
+        //   One wildcard per interval is what production does, so the test is allowed
+        //   as many passes as convergence takes — bounded, and the number is printed
+        //   rather than assumed to be one. A single GET here would be a race with the
+        //   queryable's propagation across sessions, not a property of the fix.
+        const MAX_PASSES: usize = 5;
+        let mut learned: Vec<String> = Vec::new();
+        let mut passes = 0usize;
+        while passes < MAX_PASSES && !learned.iter().any(|r| r == room_id) {
+            passes += 1;
+            let replies = sess_1
+                .get(&state_wild)
+                .timeout(Duration::from_secs(3))
+                .await
+                .expect("wildcard GET");
+            while let Ok(Ok(reply)) =
+                tokio::time::timeout(Duration::from_secs(1), replies.recv_async()).await
+            {
+                let sample = match reply.result() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("wildcard reply error: {e}");
+                        continue;
+                    }
+                };
+                let reply_key = sample.key_expr().as_str().to_string();
+                let Some(rid) = ClusterState::room_from_key(&reply_key, &prefix, "state") else {
+                    continue;
+                };
+                let bytes = sample.payload().to_bytes();
+                if bytes.is_empty() {
+                    continue;
+                }
+                let msg: StateCatchupMsg = serde_json::from_slice(&bytes).expect("parse");
+                for ev in msg.into_events() {
+                    state_1
+                        .apply_remote_state_event(ev)
+                        .expect("apply_remote_state_event node-1");
+                }
+                learned.push(rid);
+            }
+        }
+
+        assert!(
+            learned.iter().any(|r| r == room_id),
+            "node-1 never learned {room_id} on {passes} clock wildcard(s). \
+             Learned: {learned:?}"
+        );
+        {
+            let rs = state_1.room_state.lock().expect("room_state lock node-1");
+            let events = rs
+                .get(room_id)
+                .unwrap_or_else(|| panic!("node-1 has no state for {room_id}"));
+            assert!(
+                events.iter().any(|e| {
+                    e.event_type == "m.room.name"
+                        && e.content.get("name").and_then(|v| v.as_str())
+                            == Some("Late Handshake")
+                }),
+                "node-1 learned the room_id but not its state: {events:?}"
+            );
+        }
+        println!(
+            "late handshake: startup pass found {startup_rooms} room(s), clock wildcard \
+             due at poll {due_at} of 15, node-1 learned {} room(s) on pass {passes}/{MAX_PASSES}",
+            learned.len()
+        );
+    }
     // cluster:redaction_replicates:start
     //   purpose: A redaction issued on one node must take effect on every node. It
     //            did not: `redacts` was attached to the client event AFTER the Pdu

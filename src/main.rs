@@ -885,10 +885,19 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
 //     peer we did not know of can be holding rooms we never heard of;
 //   - and on a slow timer, because a link can drop samples without the
 //     transport ever going away, and no peer event fires. That pass asks
-//     only the rooms whose fingerprint moved, and asks nothing at all when
-//     none of them did. A wildcard happens there every CATCHUP_FULL_EVERY
-//     executed passes, never more often than the interval.
-// Repeating is safe because a pass is idempotent — see catchup_pass.
+        //     only the rooms whose fingerprint moved, and asks nothing at all when
+        //     none of them did.
+        //   - and every MATRIX_HS_CATCHUP_INTERVAL_SECS (default 300 s) a wildcard
+        //     fires on the clock, whatever the dirty set says and whether or not any
+        //     pass ran in between. That clock is the fix for the order of events the
+        //     two triggers above both miss: the startup pass runs before the peer's
+        //     handshake lands, so the peer is already in the loop's baseline (no
+        //     `peer_grew`), and a node with no local write has no dirty room (no
+        //     targeted pass) — the node then never discovers a room that has been on
+        //     the peer all along. A counter of executed passes cannot cover that; a
+        //     clock advances on its own. The pass is cheap (an idle wildcard answered
+        //     rooms=0 replies=0 in the run log), which is what buys the trade.
+        // Repeating is safe because a pass is idempotent — see catchup_pass.
         {
             let state_bg = state.clone();
             let session_bg = catchup_session.clone();
@@ -920,14 +929,12 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
     // Baseline before the first poll: the startup pass has just filled the
     // state, so without this every room would look dirty on the first poll.
     let _ = dirty_tracker.update(room_fingerprints(&state_bg));
-    // The wildcard floor is the interval this loop already used, so the rate of
-    // discovery wildcards cannot go up. With no periodic interval configured at
-    // all, discovery still has a floor rather than nothing.
-    let full_interval = if backstop_secs == 0 {
-        std::time::Duration::from_secs(mrgd::requery_backoff::CATCHUP_FULL_MIN_INTERVAL_SECS)
-    } else {
-        std::time::Duration::from_secs(backstop_secs)
-    };
+    // The clock that owns the periodic full pass. Zero switches it off: a node then
+    // asks for everything only when a peer appears. It used to be
+    // `if backstop_secs == 0 { CATCHUP_FULL_MIN_INTERVAL_SECS }`, i.e. asking for 0
+    // kept a 300 s timer running — the setting could not express "off", and the
+    // timer was the one thing that could still find a room the startup pass missed.
+    let full_interval = Duration::from_secs(backstop_secs);
     let mut planner = mrgd::requery_backoff::PassPlanner::new(full_interval);
     loop {
         tokio::time::sleep(poll).await;

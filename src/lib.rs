@@ -87,32 +87,59 @@ pub(crate) mod test_util {
     //   output: N linked sessions, scouting off, on unique loopback ports
     //   sideEffects: binds loopback ports for the sessions' lifetime
     // open_mesh:end
+    // free_loopback_addr:start
+    //   purpose: One free loopback endpoint in zenoh's "tcp/host:port" form, for a test
+    //            that has to open its own sessions because the ORDER of the handshakes
+    //            is the thing under test (a peer that connects after the other side's
+    //            startup pass). `open_mesh` links its sessions as it opens them, so it
+    //            cannot express a late joiner.
+    //   input:  none
+    //   output: "tcp/127.0.0.1:<free port>"
+    //   sideEffects: binds and immediately releases a loopback port
+    // free_loopback_addr:end
+    pub(crate) fn free_loopback_addr() -> String {
+        // The window before zenoh re-binds is negligible: every caller holds
+        // ZENOH_TEST_LOCK, so nothing else in this process races for it.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("probe loopback port")
+            .local_addr()
+            .expect("loopback addr")
+            .port();
+        format!("tcp/127.0.0.1:{port}")
+    }
+
+    // open_at:start
+    //   purpose: One Zenoh session on an explicit endpoint, optionally connected to
+    //            endpoints opened earlier. Same configuration as `open_mesh` — private
+    //            loopback mesh, multicast AND gossip scouting off — because a test that
+    //            scouted would merge with the deployed node and with other tests, and
+    //            then every assertion here would be about strangers.
+    //   input:  listen endpoint, endpoints to connect to
+    //   output: the session
+    //   sideEffects: binds the loopback port for the session's lifetime
+    // open_at:end
+    pub(crate) async fn open_at(listen: &str, connect: &[String]) -> zenoh::Session {
+        let mut cfg = zenoh::Config::default();
+        cfg.insert_json5("listen/endpoints", &format!("[\"{listen}\"]"))
+            .expect("zenoh listen config");
+        if !connect.is_empty() {
+            let quoted: Vec<String> = connect.iter().map(|a| format!("\"{a}\"")).collect();
+            cfg.insert_json5("connect/endpoints", &format!("[{}]", quoted.join(",")))
+                .expect("zenoh connect config");
+        }
+        cfg.insert_json5("scouting/multicast/enabled", "false")
+            .expect("zenoh scouting config");
+        cfg.insert_json5("scouting/gossip/enabled", "false")
+            .expect("zenoh gossip config");
+        zenoh::open(cfg).await.expect("isolated zenoh session")
+    }
+
     pub(crate) async fn open_mesh<const N: usize>() -> [zenoh::Session; N] {
         let mut addrs: Vec<String> = Vec::with_capacity(N);
         let mut sessions: Vec<zenoh::Session> = Vec::with_capacity(N);
         for _ in 0..N {
-            // Probe a free port by binding and immediately releasing it. The window
-            // before zenoh re-binds is negligible: every caller holds ZENOH_TEST_LOCK,
-            // so nothing else in this process races for it.
-            let port = std::net::TcpListener::bind("127.0.0.1:0")
-                .expect("probe loopback port")
-                .local_addr()
-                .expect("loopback addr")
-                .port();
-            let addr = format!("tcp/127.0.0.1:{port}");
-            let mut cfg = zenoh::Config::default();
-            cfg.insert_json5("listen/endpoints", &format!("[\"{addr}\"]"))
-                .expect("zenoh listen config");
-            if !addrs.is_empty() {
-                let quoted: Vec<String> = addrs.iter().map(|a| format!("\"{a}\"")).collect();
-                cfg.insert_json5("connect/endpoints", &format!("[{}]", quoted.join(",")))
-                    .expect("zenoh connect config");
-            }
-            cfg.insert_json5("scouting/multicast/enabled", "false")
-                .expect("zenoh scouting config");
-            cfg.insert_json5("scouting/gossip/enabled", "false")
-                .expect("zenoh gossip config");
-            sessions.push(zenoh::open(cfg).await.expect("isolated zenoh session"));
+            let addr = free_loopback_addr();
+            sessions.push(open_at(&addr, &addrs).await);
             addrs.push(addr);
         }
         sessions
