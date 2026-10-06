@@ -164,7 +164,17 @@ prev_epoch=$(last_field 1)
 prev_depth=$(awk -F, 'NR>1 && NF>=16 {v=$16} END{print v+0}' "$CSV" 2>/dev/null || echo 0)
 rate_prev=0
 fast_streak=0
-deadline=$(( $(date +%s) + HOURS * 3600 ))
+# HOURS may be a fraction: a run whose window is "six hours from the node's own t0" is
+# not six hours from the moment somebody typed the command, and the integer shell
+# arithmetic below rejected 5.7544 outright --
+#   arithmetic expression: variable conversion error: " 1791252766 + HOURS * 3600 "
+# -- which reads as a runner failure rather than as a number it did not like. awk does
+# the multiply, printf "%d" truncates to whole seconds, so an integer --hours lands on
+# exactly the same deadline it did before.
+deadline=$(awk -v now="$(date +%s)" -v h="$HOURS" 'BEGIN{printf "%d", now + h*3600}')
+# The deadline in the gate log, because "six hours from the node's own t0" is a claim
+# somebody has to be able to check later without re-deriving it from the start line.
+say "deadline: epoch=$deadline iso=$(date -u -r "$deadline" +%Y-%m-%dT%H:%M:%SZ) in $(( deadline - $(date +%s) ))s"
 
 # Warm-up: gates are suppressed for the first two checkpoints. The restart replays the
 # journal and the allocator returns memory over the first minutes, and each SIGUSR2 probe
