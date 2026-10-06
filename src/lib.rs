@@ -169,6 +169,7 @@ mod soak_caps_test;
 mod sink_growth_test;
 #[cfg(test)]
 mod join_not_found_test;
+mod member_gate_test;
 #[cfg(all(test, feature = "cluster"))]
 mod device_lists_cluster_test;
 #[cfg(test)]

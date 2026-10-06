@@ -44,7 +44,12 @@
 // PUBLIC_API: put_send_event
 // END_AI_HEADER
 
-use crate::{auth, error::HsError, routes::room_state::room_is_known, state::AppState};
+use crate::{
+    auth,
+    error::HsError,
+    routes::room_state::require_joined_room,
+    state::AppState,
+};
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
@@ -90,14 +95,15 @@ pub async fn put_send_event(
     // room_is_known is reused rather than copied, so "known" means one thing in both
     // routes: local state events, a local RoomLog, or a room the cluster told us about.
     //
-    // Membership is deliberately NOT checked here. "Does this room exist" and "may this
-    // user post in it" are two different questions, and the second one is not this
-    // dispatch's to answer.
-    if !room_is_known(&state, &room_id) {
-        return Err(HsError::RoomNotFound(room_id));
-    }
+    // Membership used to be deliberately not checked here — "does this room exist" and "may
+    // this user post in it" were called two questions, and the second was left to another
+    // dispatch. That dispatch has come: a stranger's message went through with 200. Both
+    // questions are now asked in one place, require_joined_room, which redact and the state
+    // route call too, so all three routes cannot drift apart again.
+    require_joined_room(&state, &room_id, &sender)?;
 
-    // Ensure room exists (lazy create) — only ever reached for a room already known.
+    // Ensure room exists (lazy create) — only ever reached for a room already known, and
+    // now for a sender already joined in it.
     state.ensure_room(&room_id);
 
     // Insert PDU into local RoomLog; return event_id and (cluster) serialised delta.
