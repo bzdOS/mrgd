@@ -80,6 +80,10 @@ use std::{sync::Arc, time::Duration};
 #[cfg(target_os = "freebsd")]
 mod memprobe;
 
+// Not behind the cluster feature on purpose: the env decision has to be testable on a
+// build that does not carry the layer, which is the build that needs telling.
+mod cluster_env;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Allocator statistics on SIGUSR2, when MATRIX_HS_MEMPROBE_LOG is set.
@@ -265,16 +269,16 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
         let server_name =
             std::env::var("MATRIX_HS_SERVER_NAME").unwrap_or_else(|_| "localhost".to_string());
 
+// The env decision, and the endpoint list it implies, are in cluster_env so that
+        // a unit test can read the same four variables this function reads. A binary
+        // built WITHOUT the cluster feature cannot run this code at all, and that is
+        // exactly the case the stand-lift gate (scripts/stand-lift.sh, "no cluster
+        // layer") exists to catch: the layer cannot report itself from inside.
+        //
         // Parse MATRIX_HS_ZENOH_CONNECT="tcp/ip:port,tcp/ip2:port" into Zenoh config.
         // Format: JSON5 array of endpoint strings, e.g. ["tcp/192.0.2.1:7447"].
         // If unset: use default config (peer mode, multicast/gossip scouting).
-        // Build a JSON5 array ["ep1","ep2"] from comma-separated "ep1, ep2".
-        let to_json5 = |s: &str| -> String {
-            let quoted: Vec<String> = s.split(',').map(|e| format!("\"{}\"", e.trim())).collect();
-            format!("[{}]", quoted.join(","))
-        };
-        let connect = std::env::var("MATRIX_HS_ZENOH_CONNECT").ok();
-        let listen = std::env::var("MATRIX_HS_ZENOH_LISTEN").ok();
+        //
         // MATRIX_HS_ZENOH_SCOUTING=off disables multicast discovery, so the only
         // peers are the ones named above. Three reasons it exists, all measured:
         //   - it is the difference between "these two nodes are meshed the way I
@@ -286,9 +290,7 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
         //   - two unrelated clusters on one host TOFU-trust each other's key
         //     announcements (the deployment topology record (kept private) §3).
         // Default stays on: LAN peer mode is ladder rung 1 and depends on it.
-        let scouting_off = std::env::var("MATRIX_HS_ZENOH_SCOUTING")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false"))
-            .unwrap_or(false);
+        //
         // MATRIX_HS_ZENOH_MODE=client switches the session to zenoh CLIENT mode —
         // the topology a ROUTER carrier is built for. Peer-mode sessions behind a
         // router relay unreliably between each other: measured 2026-08-21 on the
@@ -298,10 +300,13 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
         // exactly the "peer-mode routing flakiness" the router's own source
         // names when it says nodes should connect as clients. Default stays
         // peer: LAN peer mode (ladder rung 1) has no router and needs it.
-        let client_mode = std::env::var("MATRIX_HS_ZENOH_MODE")
-            .map(|v| v.trim().eq_ignore_ascii_case("client"))
-            .unwrap_or(false);
-        let session = if connect.is_some() || listen.is_some() || scouting_off || client_mode {
+        let env = cluster_env::ClusterEnv::from_process_env();
+        let to_json5 = cluster_env::to_json5_endpoints;
+        let connect = env.connect.clone();
+        let listen = env.listen.clone();
+        let scouting_off = env.scouting_off;
+        let client_mode = env.client_mode;
+        let session = if env.wants_cluster() {
             let mut cfg = zenoh::Config::default();
             if client_mode {
                 cfg.insert_json5("mode", "\"client\"")
@@ -321,15 +326,12 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                 cfg.insert_json5("scouting/gossip/enabled", "false")
                     .map_err(|e| format!("zenoh gossip config: {e}"))?;
             }
-            println!(
-                "cluster mode: connect={connect:?} listen={listen:?} \
-                 mode={} scouting={} prefix={prefix}",
-                if client_mode { "client" } else { "peer" },
-                if scouting_off { "off" } else { "on" }
-            );
+            // The line the stand-lift gate greps for, printed from the same function
+            // the unit test checks, so the marker cannot drift from the marker.
+            println!("{}", env.describe(&prefix));
             zenoh::open(cfg).await?
         } else {
-            println!("cluster mode: peer/scouting (no connect/listen env) prefix={prefix}");
+            println!("{}", env.describe(&prefix));
             zenoh::open(zenoh::Config::default()).await?
         };
 
