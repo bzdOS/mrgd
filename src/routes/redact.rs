@@ -50,7 +50,13 @@
 // PUBLIC_API: put_redact_event
 // END_AI_HEADER
 
-use crate::{auth, error::HsError, routes::send::insert_pdu, state::AppState};
+use crate::{
+    auth,
+    error::HsError,
+    routes::room_state::require_joined_room,
+    routes::send::insert_pdu,
+    state::AppState,
+};
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
@@ -85,13 +91,11 @@ pub async fn put_redact_event(
     let (sender, _device_id) = auth::extract_caller(&headers, &state)
         .ok_or_else(|| HsError::UnknownToken("missing or invalid token".to_string()))?;
 
-    // Minimal scope check: caller must be a current joined member of the room.
-    // See module header for the documented power-level seam this does NOT enforce.
-    if !state.joined_members(&room_id).iter().any(|u| u == &sender) {
-        return Err(HsError::Forbidden(format!(
-            "{sender} is not a member of {room_id}"
-        )));
-    }
+    // The one gate for every client write that appends to a room: known room + joined
+    // sender. This replaces the membership-only test that used to live here — redact could
+    // not 404 for an unknown room at all, because it never asked whether the room existed.
+    // See routes/room_state.rs::require_joined_room.
+    require_joined_room(&state, &room_id, &sender)?;
 
     let reason = body
         .and_then(|Json(v)| v.get("reason").cloned())

@@ -970,16 +970,9 @@ pub async fn put_room_state_event(
     let sender = extract_token_user(&headers, &state.token_secret, &state.server_name)
         .ok_or_else(|| HsError::UnknownToken("missing or invalid token".to_string()))?;
 
-    // Ensure room exists.
-    {
-        let rooms = state
-            .rooms
-            .lock()
-            .map_err(|e| HsError::Internal(e.to_string()))?;
-        if !rooms.contains_key(&room_id) {
-            return Err(HsError::RoomNotFound(room_id.clone()));
-        }
-    }
+    // The one gate for every client write that appends to a room: known room + joined
+    // sender. Not a copy of the check — the same function send and redact call.
+    require_joined_room(&state, &room_id, &sender)?;
 
     let ts = state.hlc_now();
     let type_slug: String = event_type.replace('.', "_");
@@ -1270,10 +1263,44 @@ pub(crate) async fn drain_cluster_state(state: &Arc<AppState>) -> Result<(), HsE
 //   output: bool
 //
 //   Known gap, stated rather than hidden: a room that exists ONLY on a peer and has not
-//   been pulled yet is not known here, so join answers 404 until the next catch-up brings
-//   it. Pulling on demand is a separate feature — not something to fake by creating an
-//   empty shell, which is the defect this replaces.
+//            been pulled yet is not known here, so join answers 404 until the next catch-up brings
+//            it. Pulling on demand is a separate feature — not something to fake by creating an
+//            empty shell, which is the defect this replaces.
 // room_is_known:end
+//
+// require_joined_room:start
+//   purpose: The one gate every client write route that appends to a room asks before it
+//            writes anything: the room must be one this node can answer for, and the sender
+//            must be a current joined member of it. Two questions, one answer, one function.
+//   input:  state, room_id, sender
+//   output: Result<(), HsError> — Err(RoomNotFound) → 404 M_NOT_FOUND when the room is
+//            unknown here; Err(Forbidden) → 403 M_FORBIDDEN when the room is known but the
+//            sender is not joined; Ok(()) when both hold.
+//   sideEffects: none — read-only locks, no mutation and, deliberately, no lazy create
+//
+//   Why one function and not three checks: send asked room_is_known and never asked
+//   membership at all, so a stranger's message went through with 200 — that was the defect
+//   this replaces. redact had its own inline membership test against joined_members and no
+//   room check at all. put_room_state_event had a THIRD room test, written inline against
+//   state.rooms only, so it answered 404 for rooms that room_is_known considers known. Three
+//   copies of "may this caller write here" is three answers to one question, and they had
+//   already disagreed with each other and with the spec.
+//
+//   The order is the model, not a taste: an unknown room is 404 even for a non-member,
+//   because we do not confirm a room's existence to a stranger; membership is only ever asked
+//   about a room that exists. Swapping the two would leak room existence to outsiders.
+//
+//   Deliberately NOT applied to the membership routes (invite/join/leave/kick/ban/unban/
+//   forget). A join is how a non-member becomes a member, so gating join on membership would
+//   lock the only door that lets anyone in; kick and ban already check membership and
+//   outranks of their own. Room creation is not gated either: the creator auto-joins in
+//   routes/rooms.rs, so create-then-send keeps working and the walkthrough does not break.
+//
+//   Seam left open on purpose: membership here is "joined", so a user who was invited but
+//   has not accepted gets 403 on a send — which is what Synapse does, since invite alone is
+//   not permission to post. Power levels are still NOT enforced (the seam redact's own
+//   comment named before this function existed); that is a separate rule, not a silent gap.
+// require_joined_room:end
 pub(crate) fn room_is_known(state: &Arc<AppState>, room_id: &str) -> bool {
     if state.room_state.lock().map(|rs| rs.contains_key(room_id)).unwrap_or(false) {
         return true;
@@ -1288,4 +1315,24 @@ pub(crate) fn room_is_known(state: &Arc<AppState>, room_id: &str) -> bool {
         }
     }
     false
+}
+
+pub(crate) fn require_joined_room(
+    state: &Arc<AppState>,
+    room_id: &str,
+    sender: &str,
+) -> Result<(), HsError> {
+    if !room_is_known(state, room_id) {
+        return Err(HsError::RoomNotFound(room_id.to_string()));
+    }
+    let joined = state
+        .joined_members(room_id)
+        .iter()
+        .any(|u| u == sender);
+    if !joined {
+        return Err(HsError::Forbidden(format!(
+            "{sender} is not a member of {room_id}"
+        )));
+    }
+    Ok(())
 }
