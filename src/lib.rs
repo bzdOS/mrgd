@@ -182,6 +182,8 @@ mod encryption_test;
 #[cfg(all(test, feature = "cluster"))]
 mod ephemeral_cluster_test;
 #[cfg(test)]
+mod ephemeral_member_gate_test;
+#[cfg(test)]
 mod ephemeral_test;
 #[cfg(test)]
 mod hubd_bridge_test;

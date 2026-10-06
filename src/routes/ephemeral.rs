@@ -40,7 +40,7 @@ use axum::{
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::{error::HsError, routes::keys::extract_caller, state::AppState};
+use crate::{error::HsError, routes::keys::extract_caller, routes::room_state::require_joined_room, state::AppState};
 
 // ── Request body shapes ───────────────────────────────────────────────────────
 
@@ -64,26 +64,15 @@ fn parse_typing_body(body: &Value) -> (bool, u64) {
     (typing, timeout_ms)
 }
 
-// require_room:start
-//   purpose: Resolve a room_id-or-alias to a canonical room_id and verify the room
-//            exists (404 M_NOT_FOUND if not) before recording any ephemeral state
-//            against it.
-//   input:  state, id_or_alias
-//   output: Result<String, HsError> — canonical room_id
-//   sideEffects: none (read-only lock of state.rooms / state.aliases)
-// require_room:end
-fn require_room(state: &Arc<AppState>, id_or_alias: &str) -> Result<String, HsError> {
-    let room_id = state.resolve_room_id(id_or_alias);
-    let exists = state
-        .rooms
-        .lock()
-        .map_err(|e| HsError::Internal(e.to_string()))?
-        .contains_key(&room_id);
-    if !exists {
-        return Err(HsError::RoomNotFound(room_id));
-    }
-    Ok(room_id)
-}
+// require_room was the room check these three routes used before require_joined_room
+// arrived, and it is deleted rather than kept alongside. It asked a strictly weaker
+// question — "is there a RoomLog" — so a room known only through its state events, or only
+// through a peer, was 404 here while send and redact happily accepted it. Deleting it IS
+// the change: three routes, one question, one function, and no private copy left to drift.
+//
+// The membership routes in room_state.rs still keep their own require_room_exists, on
+// purpose and out of scope here: a join is how a non-member becomes a member, so those
+// routes cannot be gated on membership.
 
 // put_typing:start
 //   purpose: PUT /rooms/{roomId}/typing/{userId} — start/stop this user's typing
@@ -109,13 +98,28 @@ pub async fn put_typing(
 ) -> Result<Json<Value>, HsError> {
     let (caller_user_id, _device_id) = extract_caller(&headers, &state)
         .ok_or_else(|| HsError::UnknownToken("missing or invalid token".to_string()))?;
+
+    // The same one gate every room-scoped write now asks — known room, joined sender —
+    // and NOT a private copy of it. A typing notification is a write into a room: it shows
+    // up in every member's /sync and in cluster snapshots, which is exactly why Synapse
+    // asks membership here. require_room is gone rather than kept alongside: it asked a
+    // DIFFERENT question (only "is there a RoomLog"), and two questions about the same
+    // request are two answers waiting to drift.
+    //
+    // Order is deliberate, and it is the order the predicate was defined with: membership
+    // first, THEN "is this your own typing state". Both refusals are 403 M_FORBIDDEN, so
+    // the status is the same either way, but the message differs — and with this order a
+    // non-member asking to write for somebody else is told "not a member", while a member
+    // asking that is told "not another user". Reversed, the second message would be
+    // unreachable for anyone outside the room.
+    let room_id = state.resolve_room_id(&room_id);
+    require_joined_room(&state, &room_id, &caller_user_id)?;
     if caller_user_id != user_id {
         return Err(HsError::Forbidden(
             "cannot set another user's typing state".to_string(),
         ));
     }
 
-    let room_id = require_room(&state, &room_id)?;
     let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
     let (typing, timeout_ms) = parse_typing_body(&body);
 
@@ -153,7 +157,10 @@ pub async fn post_receipt(
     let (user_id, _device_id) = extract_caller(&headers, &state)
         .ok_or_else(|| HsError::UnknownToken("missing or invalid token".to_string()))?;
 
-    let room_id = require_room(&state, &room_id)?;
+    // Same gate as put_typing and as every room write: known room + joined sender.
+    // See put_typing for why require_room was replaced rather than kept alongside.
+    let room_id = state.resolve_room_id(&room_id);
+    require_joined_room(&state, &room_id, &user_id)?;
     let ts_ms = crate::state::now_ms();
 
     state
@@ -192,7 +199,10 @@ pub async fn post_read_markers(
     let (user_id, _device_id) = extract_caller(&headers, &state)
         .ok_or_else(|| HsError::UnknownToken("missing or invalid token".to_string()))?;
 
-    let room_id = require_room(&state, &room_id)?;
+    // Same gate as put_typing and post_receipt: known room + joined sender. One call for
+    // all five client write routes that put something into a room.
+    let room_id = state.resolve_room_id(&room_id);
+    require_joined_room(&state, &room_id, &user_id)?;
     let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
     let ts_ms = crate::state::now_ms();
 
