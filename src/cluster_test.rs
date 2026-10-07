@@ -1799,6 +1799,18 @@ mod tests {
             .expect("declare wildcard state queryable");
         let handler = qable.handler().clone();
         let prefix_for_qable = prefix.to_string();
+        // Give the queryable declaration a moment to propagate before node-1 asks, which
+        // is exactly what production does and this test used to skip: src/main.rs, in the
+        // startup catch-up gate, breaks out of its peer/key wait only after
+        // `peers_seen && have_peer_key` and then sleeps 200 ms with the comment "give
+        // queryable declarations a moment to propagate before querying them". Being a
+        // PEER is not being a QUERIER: node-2 declares this queryable after the handshake,
+        // and until that declaration reaches node-1's session its wildcard GET is routed to
+        // nobody and zenoh ends the reply stream with zero replies. The wait below is
+        // production's own number, not a guess: measured over 8 runs of this test in
+        // isolation, the first reply arrives 2-6 ms after declare_queryable (median 2 ms),
+        // and in one loaded run the query was only answered on the fifth attempt.
+        tokio::time::sleep(Duration::from_millis(200)).await;
         let _qable_task = tokio::spawn(async move {
             while let Ok(query) = handler.recv_async().await {
                 let known: Vec<String> = {
@@ -1892,6 +1904,13 @@ mod tests {
                 .timeout(Duration::from_secs(3))
                 .await
                 .expect("wildcard GET");
+            // Measured: without this the five "passes" issue five GETs within about 1 ms of
+            // each other (5 passes, 0 replies, whole loop 0-1 ms — that is a failing run),
+            // so MAX_PASSES was five simultaneous attempts at the same instant, not five
+            // attempts spread over time. A retry that does not let the world move is not a
+            // retry. 50 ms x 5 passes = 250 ms of waiting, which is why the settle above is
+            // the primary guard and this is the belt to its braces.
+            tokio::time::sleep(Duration::from_millis(50)).await;
             while let Ok(Ok(reply)) =
                 tokio::time::timeout(Duration::from_secs(1), replies.recv_async()).await
             {
