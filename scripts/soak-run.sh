@@ -50,7 +50,7 @@
 # measured nothing. They are here so the next launch does not repeat it:
 #
 #   1. --memprobe is NOT optional. The mp_alloc column — the series BOTH growth gates read —
-#      is filled only inside `if [ -n "$MEMPROBE" ] && [ -r "$MEMPROBE" ]` (line ~239).
+#      is filled only inside `if [ -n "$MEMPROBE" ] && [ -r "$MEMPROBE" ]` (line ~254).
 #      Without the flag mp_alloc stays 0.0, both gates read a constant zero and go quiet
 #      VACUOUSLY: KILL_MP_ALLOC_LINEAR_2H can never fire, and a report on such a run does not
 #      mean "steady", it means "nobody measured". The gates log records pid/hours/interval/
