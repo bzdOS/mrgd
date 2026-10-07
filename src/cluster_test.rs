@@ -2296,26 +2296,63 @@ mod tests {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         let psk_ok = STANDARD.encode([7u8; 32]);
         let psk_bad = STANDARD.encode([9u8; 32]);
-        let port = 7473;
         let key = "obfstest/dispatch";
 
-        // NOTE the `#`, not `?`: zenoh separates endpoint *config* with `#` and
-        // endpoint *metadata* with `?`, and the PSK is config. With `?` the
-        // listener binds and then fails PSK load at first use — which looks like
-        // a working obfs endpoint right up until nothing can connect to it.
-        let listen = format!("obfs/127.0.0.1:{port}#obfs_psk_base64={psk_ok}");
-        let mut cfg_a = zenoh::Config::default();
-        cfg_a
-            .insert_json5("listen/endpoints", &format!("[\"{listen}\"]"))
-            .expect("obfs listen endpoint must be accepted — if this fails, the \
-                     zenoh-link patch in Cargo.toml is missing");
-        // Scouting off so the only possible path is the obfs link under test;
-        // with it on, a peer can converge over a loopback link we are not testing.
-        cfg_a.insert_json5("scouting/multicast/enabled", "false").unwrap();
-        cfg_a.insert_json5("scouting/gossip/enabled", "false").unwrap();
-        let sess_a = zenoh::open(cfg_a)
-            .await
-            .expect("session with an obfs listener must open");
+        // This used to be `let port = 7473;` — the only hard-coded port in the whole test
+        // tree, while every other cluster test asks the OS for a free one. A constant is not
+        // a test property, it is a shared resource nobody declared: anything else on this
+        // host holding 7473 fails the whole test, and it did, at the `.expect` that used to
+        // open the listener, with "Cannot create a new obfs listener on 127.0.0.1:7473:
+        // Address already in use (os error 48)" — reproduced on demand by parking a
+        // foreign listener on 7473 and running this test.
+        //
+        // So: ask the OS, and retry, because "free at the probe" is not "free at the bind".
+        // The probe releases the port before zenoh takes it, so the window is real — a
+        // non-test process on this host can win it. Retrying over a fresh port turns "the
+        // host held our number" into "we ask again", which is what every other cluster test
+        // in this file already relies on.
+        const OBFS_LISTEN_ATTEMPTS: usize = 5;
+        let mut last_listen_err = String::new();
+        let (port, sess_a) = {
+            let mut built = None;
+            for attempt in 1..=OBFS_LISTEN_ATTEMPTS {
+                let port = crate::test_util::free_loopback_port();
+                // NOTE the `#`, not `?`: zenoh separates endpoint *config* with `#` and
+                // endpoint *metadata* with `?`, and the PSK is config. With `?` the
+                // listener binds and then fails PSK load at first use — which looks like a
+                // working obfs endpoint right up until nothing can connect to it.
+                let listen = format!("obfs/127.0.0.1:{port}#obfs_psk_base64={psk_ok}");
+                let mut cfg_a = zenoh::Config::default();
+                cfg_a
+                    .insert_json5("listen/endpoints", &format!("[\"{listen}\"]"))
+                    .expect("obfs listen endpoint must be accepted — if this fails, the \
+                             zenoh-link patch in Cargo.toml is missing");
+                // Scouting off so the only possible path is the obfs link under test;
+                // with it on, a peer can converge over a loopback link we are not testing.
+                cfg_a.insert_json5("scouting/multicast/enabled", "false").unwrap();
+                cfg_a.insert_json5("scouting/gossip/enabled", "false").unwrap();
+                match zenoh::open(cfg_a).await {
+                    Ok(sess) => {
+                        built = Some((port, sess));
+                        break;
+                    }
+                    Err(e) => {
+                        last_listen_err = e.to_string();
+                        eprintln!(
+                            "obfs listener: port {port} was taken between the probe and the \
+                             bind ({e}); asking for another (attempt {attempt}/\
+                             {OBFS_LISTEN_ATTEMPTS})"
+                        );
+                    }
+                }
+            }
+            built.unwrap_or_else(|| {
+                panic!(
+                    "session with an obfs listener must open after {OBFS_LISTEN_ATTEMPTS} \
+                     different ports; last error: {last_listen_err}"
+                )
+            })
+        };
 
         // A peer with the WRONG PSK: same address, same key expression.
         let mut cfg_bad = zenoh::Config::default();

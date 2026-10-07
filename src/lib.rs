@@ -100,12 +100,29 @@ pub(crate) mod test_util {
     pub(crate) fn free_loopback_addr() -> String {
         // The window before zenoh re-binds is negligible: every caller holds
         // ZENOH_TEST_LOCK, so nothing else in this process races for it.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
+        format!("tcp/127.0.0.1:{}", free_loopback_port())
+    }
+
+    // free_loopback_port:start
+    //   purpose: A port the OS says is free right now, as a bare number. Split out of
+    //            free_loopback_addr because one test needs the port itself: it builds its
+    //            own endpoint string with a transport prefix of its own (obfs), not tcp.
+    //   input:  none
+    //   output: u16 — a port that was bindable a moment ago
+    //   sideEffects: binds and immediately releases a loopback port
+    //
+    //   What "free" means, precisely, because callers now depend on it: the kernel had no
+    //   listener on this port at the moment of the probe. That is all it means — the port is
+    //   released again before the caller binds it, so anything else on the HOST can take it
+    //   in between. Callers that bind for real must therefore be prepared for "already in
+    //   use" and retry; see the obfs listener in cluster_test.rs.
+    // free_loopback_port:end
+    pub(crate) fn free_loopback_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
             .expect("probe loopback port")
             .local_addr()
             .expect("loopback addr")
-            .port();
-        format!("tcp/127.0.0.1:{port}")
+            .port()
     }
 
     // open_at:start
