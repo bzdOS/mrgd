@@ -46,8 +46,23 @@
 #
 # READ-ONLY except for the probe signals and the kill a gate authorises.
 #
-# Usage (must run as the process owner — the caps row needs the process environment):
-#   scripts/soak-run.sh --pid N [--hours 6] [--interval 300] [--memprobe CSV]
+# TWO CONDITIONS THE USAGE LINE USED TO LEAVE OUT, both found by a run that looked clean and
+# measured nothing. They are here so the next launch does not repeat it:
+#
+#   1. --memprobe is NOT optional. The mp_alloc column — the series BOTH growth gates read —
+#      is filled only inside `if [ -n "$MEMPROBE" ] && [ -r "$MEMPROBE" ]` (line ~239).
+#      Without the flag mp_alloc stays 0.0, both gates read a constant zero and go quiet
+#      VACUOUSLY: KILL_MP_ALLOC_LINEAR_2H can never fire, and a report on such a run does not
+#      mean "steady", it means "nobody measured". The gates log records pid/hours/interval/
+#      csv/gates and NOT memprobe, so an accepted run's invocation cannot be recovered from
+#      its own log — this is why the flag has to be read here rather than reconstructed.
+#   2. THE PROCESS OWNER, not an unprivileged user. caps_of() reads `ps eww` of the target,
+#      which yields nothing on FreeBSD for another user's process, and `kill -USR2` from
+#      another user fails and is swallowed by `|| true`. Symptoms: caps_* = UNREADABLE,
+#      poke_delta 0.0, and no new usr2 row in the memprobe file at all.
+#
+# Usage (must run as the process owner — see (2) — and must pass --memprobe — see (1)):
+#   scripts/soak-run.sh --pid N --memprobe CSV [--hours 6] [--interval 300]
 #                       [--token-file F] [--endpoint URL] [--log F]
 
 set -eu
