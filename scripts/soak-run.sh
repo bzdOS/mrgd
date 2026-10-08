@@ -247,7 +247,7 @@ except Exception: pass' 2>/dev/null); do
 		case "$_delta" in ''|*[!0-9]*) _delta=0 ;; esac
 		case "$_fresh" in ''|*[!0-9]*) _fresh=$(depth_cursor "$room") ;; esac
 		_sum=$(( $(depth_total "$room") + _delta ))
-		depth_cursor_set "$room" "$_fresh" "$_sum"
+		[ "$_fresh" != "0" ] && depth_cursor_set "$room" "$_fresh" "$_sum"
 		total=$(( total + _sum ))
 	done
 	echo "$total|${rooms:-0}"
