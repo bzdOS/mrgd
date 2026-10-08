@@ -22,7 +22,9 @@
 #
 # INTERACTIVE TRAFFIC. The service log has no per-request lines, so "was a client talking"
 # is measured by whether the served depth moved during the interval: moved = interactive,
-# unchanged = quiet. That is a proxy and is labelled as one.
+# unchanged = quiet. That is a proxy and is labelled as one. It only works while the depth
+# can still move: the depth is now the running sum of what arrived after a stored cursor
+# (see served_depth), because a window count stops moving the moment the room hits its cap.
 #
 # GATES. Two kill; the third only writes a line. The banner printed at startup says which is
 # which, because a run whose log claims a gate is armed when it is not is worse than no log.
@@ -146,6 +148,84 @@ caps_of() {
 # a second time, so every row carried a pid in the vsz column (29.1 "MiB" = pid).
 proc_mib() { ps -o pid= -o rss= -o vsz= -p "$PID" 2>/dev/null | awk '{print $2, $3}'; }
 
+# DEPTH BY DELTA, NOT BY A RISING WINDOW. Counting a window (GET ?limit=5000 and counting
+# "event_id") cannot see a client talking once the room holds more events than the cap: at
+# MATRIX_HS_ROOMLOG_MAX_EVENTS=5000 the window is permanently full, the total never moves,
+# and every tick reads quiet on a stand that is being written to twice a second. Measured on
+# the live stand 2026-10-08: served_depth first reached 5000 at 23:43:02Z, 77.5 min into the
+# 6 h run, and stayed pinned for the remaining 167 rows while both load clients (pids 90532,
+# 90802) kept sending at 1 msg/s. The window answer also reports no cursor at all at
+# limit=5000 — "start"/"end" appear only when the window is short — so there is nothing in
+# the old call to advance with.
+#
+# So the depth is read as a DELTA. A cursor per room is kept in ${CSV}.depth-state
+# ("room<TAB>cursor"), and served_depth is the running sum of what arrived after it. A room
+# with no cursor yet (first tick, or a room joined later) contributes its current window as
+# the seed. The cursor is a timestamp, not a pagination token: see depth_since for what was
+# measured about the tokens on this target and why.
+# The state is "room<TAB>cursor<TAB>total", one line per room. The third column is the
+# per-room running sum and it is what served_depth reports: a caller that differences two
+# ticks must see THIS tick's arrivals, not a change in the arrival rate — with the total
+# left out, a steady 1 msg/s reads d_depth=0 and the label says quiet on a busy room. That
+# is measured, not argued: before the total was kept, the per-tick arrival counts were
+# 32, 30, 32, 32 and the row above them read d_depth -2, +2, 0.
+DEPTH_STATE="${CSV}.depth-state"
+
+depth_cursor() { # room -> the stored cursor, or nothing at all
+	[ -r "$DEPTH_STATE" ] || return 0
+	awk -F'\t' -v r="$1" '$1==r {print $2; found=1; exit} END{exit (found?0:1)}' \
+		"$DEPTH_STATE" 2>/dev/null || :
+}
+
+depth_total() { # room -> the running total stored for it, or 0
+	[ -r "$DEPTH_STATE" ] || { echo 0; return 0; }
+	awk -F'\t' -v r="$1" '$1==r {print ($3==""?0:$3); found=1; exit} END{if(!found) print 0}' \
+		"$DEPTH_STATE" 2>/dev/null || echo 0
+}
+
+depth_cursor_set() { # room cursor total
+	_dt="${DEPTH_STATE}.tmp.$$"
+	{ if [ -r "$DEPTH_STATE" ]; then
+		awk -F'\t' -v r="$1" '$1!=r' "$DEPTH_STATE" 2>/dev/null || :
+	  fi
+	} > "$_dt"
+	printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$_dt"
+	mv -f "$_dt" "$DEPTH_STATE"
+}
+
+# One room, one call: the same window the base asked for, but counted as a DELTA — how many
+# events in it are NEWER than the stored cursor — instead of being added wholesale.
+# The cursor is the newest origin_server_ts seen in that window.
+#
+# WHY NOT THE PAGINATION TOKEN, although the token was the first idea and the dispatch asked
+# for it: this target does not return one at this window. Measured on the live stand
+# 2026-10-08 02:0xZ, same room, same minute:
+#   ?limit=5000                        -> 5000 events, and NO "start"/"end" key anywhere
+#   ?limit=5                           -> "end":"t4995" (tokens appear only on a short window)
+#   ?limit=5000&dir=f&from=t4995       -> 5 events, newer ts, but NO token back
+#   ?limit=5&dir=f&from=t4995          -> 1 event, "start":"t4995" — the SAME token as the
+#                                         input, so paging forward does not advance
+# and without dir=f the same call walks backward: ?limit=5000&from=t4995 returned 4995
+# events of history, which would read as traffic on a room nobody is writing to.
+# A cursor that never advances measures the same event forever, so the delta is taken from
+# the timestamps the window already carries. Not measured: what a stopped client does to the
+# ts cursor under a load stop — the arithmetic says 0, and the silent-room run below is the
+# half of that which is measured.
+depth_since() { # room cursor-ts -> "count|newest-ts"
+	_ds_body=$(curl -s --max-time 15 -H "Authorization: Bearer $TOK" \
+		"$ENDPOINT/_matrix/client/v3/rooms/$1/messages?limit=5000" 2>/dev/null || echo "")
+	printf '%s' "$_ds_body" | python3 -c 'import sys,json
+try:
+    b = json.load(sys.stdin)
+except Exception:
+    print("0|0"); raise SystemExit
+ts = [int(e.get("origin_server_ts", 0)) for e in b.get("chunk", [])]
+newest = max(ts) if ts else 0
+after = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else ""
+n = sum(1 for t in ts if t > int(after)) if after.isdigit() and int(after) > 0 else len(ts)
+print("%d|%d" % (n, newest))' "${2:-}" 2>/dev/null || echo "0|0"
+}
+
 served_depth() {
 	[ -n "$TOKEN_FILE" ] && [ -r "$TOKEN_FILE" ] || { echo "-"; return 0; }
 	TOK=$(cat "$TOKEN_FILE")
@@ -161,10 +241,14 @@ except Exception: print(0)' 2>/dev/null || echo 0)
 try:
     for r in json.load(sys.stdin).get("joined_rooms",[]): print(r)
 except Exception: pass' 2>/dev/null); do
-		n=$(curl -s --max-time 15 -H "Authorization: Bearer $TOK" \
-			"$ENDPOINT/_matrix/client/v3/rooms/$room/messages?limit=5000" 2>/dev/null \
-			| grep -o '"event_id"' | wc -l | tr -d ' ')
-		total=$(( total + n ))
+		_pair=$(depth_since "$room" "$(depth_cursor "$room")")
+		_delta=${_pair%%|*}
+		_fresh=${_pair#*|}
+		case "$_delta" in ''|*[!0-9]*) _delta=0 ;; esac
+		case "$_fresh" in ''|*[!0-9]*) _fresh=$(depth_cursor "$room") ;; esac
+		_sum=$(( $(depth_total "$room") + _delta ))
+		depth_cursor_set "$room" "$_fresh" "$_sum"
+		total=$(( total + _sum ))
 	done
 	echo "$total|${rooms:-0}"
 }
