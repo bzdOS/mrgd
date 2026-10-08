@@ -98,6 +98,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let state = build_state().await?;
 
+    // Register the server with memprobe so its three blind structures
+    // (to_device_seen, typing outer rooms, uia_sessions) are sampled into the
+    // probe line — see src/memprobe.rs. Inert unless MATRIX_HS_MEMPROBE_LOG is
+    // set, exactly like install() above.
+    #[cfg(target_os = "freebsd")]
+    memprobe::watch(state.clone());
+
     // Load DC++-style Lua server scripts (on_room_visible, ...). Missing dir or
     // no scripts → no-op (server runs fully spec-compliant). Override path with
     // MATRIX_HS_SCRIPTS_DIR. Hot-reload: SIGHUP-friendly via re-calling load_dir.

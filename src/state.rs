@@ -2312,6 +2312,34 @@ impl AppState {
         Ok(deliver)
     }
 
+    // AppState::memprobe_struct_gauges:start
+    //   purpose: The three per-structure counters the soak recorder's memprobe
+    //            line now carries — to_device_seen, the typing map's OUTER room
+    //            keys, and uia_sessions. These are exactly the three structures
+    //            the recorder's banner used to list as "not observable from
+    //            outside the process": a soak number could say memory grew but
+    //            not which of them held it. Reading them here turns that from an
+    //            argument into a csv column. Read-only, three short
+    //            lock-and-count reads, no mutation; called only from the sampler
+    //            thread when a probe fires, never from a request path, so it adds
+    //            nothing to the hot path.
+    //   input:  none
+    //   output: (to_device_seen, typing_outer_room_keys, uia_sessions)
+    //   sideEffects: none (each lock is taken and released in turn; a poisoned
+    //                lock reads as 0 rather than panicking a probe)
+    // AppState::memprobe_struct_gauges:end
+    pub fn memprobe_struct_gauges(&self) -> (usize, usize, usize) {
+        let to_device_seen = self
+            .to_device
+            .to_device_seen
+            .lock()
+            .map(|g| g.len())
+            .unwrap_or(0);
+        let typing_outer = self.ephemeral.typing.lock().map(|g| g.len()).unwrap_or(0);
+        let uia_sessions = self.uia_sessions.lock().map(|g| g.len()).unwrap_or(0);
+        (to_device_seen, typing_outer, uia_sessions)
+    }
+
     // AppState::new_media_id:start
     //   purpose: Mint a fresh, unguessable media_id for a POST upload. 24 random bytes
     //            (OsRng) base64url-nopad encoded — same building blocks auth.rs already
@@ -4463,5 +4491,40 @@ mod to_device_delivery_test {
 
         assert_eq!(st.drain_to_device("@bob:localhost", "BOBDEV1", None).unwrap().len(), 1);
         assert_eq!(st.drain_to_device("@bob:localhost", "BOBDEV2", None).unwrap().len(), 1);
+    }
+
+    // The three memprobe structure gauges count the maps they name, and the
+    // counts move with the operations that write those maps. This is the check
+    // behind the new csv columns: if a gauge returned a constant, a soak row
+    // would carry three zeros that read as three flat structures.
+    #[test]
+    fn memprobe_struct_gauges_count_the_three_maps() {
+        let st = AppState::new();
+        assert_eq!(
+            st.memprobe_struct_gauges(),
+            (0, 0, 0),
+            "a fresh state has none of the three"
+        );
+
+        // to_device_seen: one entry per distinct to-device msg_id.
+        st.enqueue_to_device(
+            "@bob:localhost",
+            "BOBDEV",
+            "@alice:localhost",
+            "m.room_key",
+            &json!({"session_id": "sess-gauge"}),
+            "a:keys/:bob:BOBDEV:gauge",
+        )
+        .unwrap();
+        // uia_sessions: one entry per issued (here abandoned) session.
+        st.issue_uia_session().unwrap();
+        // typing: the gauge counts OUTER room keys, not inner users.
+        st.set_typing("!room:localhost", "@alice:localhost", true, 30_000)
+            .unwrap();
+
+        let (td, typing_outer, uia) = st.memprobe_struct_gauges();
+        assert_eq!(td, 1, "to_device_seen counts the enqueued msg_id");
+        assert_eq!(typing_outer, 1, "typing gauge counts outer room keys");
+        assert_eq!(uia, 1, "uia_sessions counts the issued session");
     }
 }

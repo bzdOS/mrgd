@@ -14,11 +14,21 @@
 // The line is CSV, one row per sample:
 //   epoch_s,seq,trigger,allocated,resident,mapped,retained,
 //   arenas,dirty_purged,dirty_npurge,muzzy_purged,muzzy_npurge,
-//   dirty_decay_ms,muzzy_decay_ms,metadata,active,dirty
+//   dirty_decay_ms,muzzy_decay_ms,metadata,active,dirty,
+//   td_seen,typing_outer,uia_sessions
 // allocated/resident/mapped/retained are bytes, from the four top-level stats
 // mallctls. The rest is per-arena, summed over the arenas that answer. trigger
 // is "start" for the row written at install time and "usr2" afterwards, so a
 // row can always be placed.
+//
+// THE LAST THREE, and why they exist. td_seen, typing_outer and uia_sessions
+// are the sizes of the three structures the soak recorder's banner used to list
+// as "not observable from outside the process" (to_device_seen, the typing
+// map's OUTER room keys, uia_sessions). They are read from the AppState that
+// main() registers with watch(); until watch() runs the cells are EMPTY, never
+// 0 — an unregistered gauge is missing, not a measured zero. They are appended
+// at the END so columns 1-17 keep the positions they have in every row already
+// recorded in the field.
 //
 // THE LAST THREE COLUMNS, and why they are empty-able. metadata and active are
 // the top-level stats mallctls of the same names; on this node both answer and
@@ -80,8 +90,10 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use mrgd::state::AppState;
 
 const MALLCTL_EPOCH_RENEW: u64 = 1;
 /// Per-arena extents are read for this many arenas; more than this and a single
@@ -92,6 +104,11 @@ const MAX_ARENAS: usize = 64;
 static TRIGGERED: AtomicBool = AtomicBool::new(false);
 static SEQ: AtomicU64 = AtomicU64::new(0);
 static LOG: OnceLock<Mutex<File>> = OnceLock::new();
+
+/// The server whose three blind maps the sampler now reports. Registered by
+/// main() after build_state(); unset leaves the three gauge cells EMPTY, never
+/// 0 — a gauge nobody registered is missing, not a measured zero.
+static GAUGES: OnceLock<Arc<AppState>> = OnceLock::new();
 
 /// A NUL-terminated name for mallctl. The names are compile-time constants in
 /// this file, so an interior NUL is a bug here, not an input to handle.
@@ -193,6 +210,18 @@ fn sample(trigger: &str) {
     let active = size_stat("stats.active");
     let dirty = size_stat("stats.dirty");
 
+    // Per-structure gauges: the three maps the recorder's banner used to list as
+    // "not observable from outside the process". Read from the registered
+    // AppState; EMPTY when none was registered, so a missing gauge can never be
+    // read as a flat zero.
+    let (td_seen, typing_outer, uia_sessions) = match GAUGES.get() {
+        Some(state) => {
+            let (td, ty, uia) = state.memprobe_struct_gauges();
+            (Some(td as u64), Some(ty as u64), Some(uia as u64))
+        }
+        None => (None, None, None),
+    };
+
     let epoch_s = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -201,10 +230,13 @@ fn sample(trigger: &str) {
     let line = format!(
         "{epoch_s},{seq},{trigger},{allocated},{resident},{mapped},{retained},\
 {arenas},{dirty_purged},{dirty_npurge},{muzzy_purged},{muzzy_npurge},{dirty_decay_ms},{muzzy_decay_ms},\
-{},{},{}\n",
+{},{},{},{},{},{}\n",
         opt_field(metadata),
         opt_field(active),
         opt_field(dirty),
+        opt_field(td_seen),
+        opt_field(typing_outer),
+        opt_field(uia_sessions),
     );
     if let Ok(mut f) = log.lock() {
         let _ = f.write_all(line.as_bytes());
@@ -254,4 +286,18 @@ pub fn install() {
         })
         .map(|_| ())
         .unwrap_or_else(|e| eprintln!("[memprobe] disabled: cannot spawn sampler: {e}"));
+}
+
+// watch:start
+//   purpose: Register the server whose three blind maps the sampler reports.
+//            Called from main() right after build_state(), before any traffic.
+//            install() stays callable without it, and the three gauge cells stay
+//            empty until this runs. Set-once: a second call is ignored.
+//   input:  state — the Arc<AppState> the process serves from
+//   output: none
+//   sideEffects: stores the Arc in a OnceLock; it lives as long as the process,
+//                the same lifetime as the server it points at
+// watch:end
+pub fn watch(state: Arc<AppState>) {
+    let _ = GAUGES.set(state);
 }

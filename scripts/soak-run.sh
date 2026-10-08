@@ -7,14 +7,15 @@
 # card and KILLS the server when one trips, because a gate nobody evaluates during the
 # night is a gate that fires after the damage.
 #
-# WHAT IT DELIBERATELY DOES NOT CLAIM. The card asks for roomlog / timeline / seen /
-# typing-outer / uia at every checkpoint. Three of those five CANNOT be read from outside
-# the process — they are in-process counters with no endpoint. Rather than print a 0 and
-# let it be quoted later as "measured", the row carries an explicit
-# `not_observable=to_device_seen,typing_outer,uia_sessions` field. Roomlog and timeline are
-# approximated by SERVED DEPTH (what /messages returns), which is a lower bound on the
-# stored depth, not the stored depth itself: the caps bound what is served, so a flat
-# served depth is evidence the cap holds, not a measurement of the Vec's length.
+# WHAT IT READS, AND WHAT IT NO LONGER GUESSES. The card asks for roomlog / timeline /
+# seen / typing-outer / uia at every checkpoint. Roomlog and timeline are approximated by
+# SERVED DEPTH (what /messages returns), a lower bound on the stored depth: the caps bound
+# what is served, so a flat served depth is evidence the cap holds, not a measurement of the
+# Vec's length. seen / typing-outer / uia USED to be in-process counters with no endpoint,
+# and the row carried `not_observable=to_device_seen,typing_outer,uia_sessions` instead of a
+# zero. They are now gauges: memprobe's line carries the three counts (see src/memprobe.rs),
+# and the recorder copies them into `td_seen`, `typing_rooms`, `uia_sessions` at the END of
+# the row. `not_observable` is kept as `none` so an older reader still finds its column.
 #
 # THE CAPS ROW IS A GATE ON THE RUN, NOT A COMMENT. If the caps cannot be read, the run is
 # testing a configuration nobody wrote down, so the recorder says so in the row and keeps
@@ -99,7 +100,7 @@ mkdir -p "$(dirname "$LOG")"
 
 CSV="$LOG"
 GATE_LOG="${LOG%.csv}.gates.log"
-CSV_HDR='epoch,iso,caps_timeline,caps_roomlog,rss_mib,vsz_mib,rss_after_poke_mib,poke_delta_mib,d_rss_mib,rate_mib_h,mp_seq,mp_resident_mib,mp_alloc_mib,rooms,served_depth,d_depth,traffic,gate,not_observable,d_mp_alloc_mib,rate_mp_alloc_mib,slope_theilsen_mib_h'
+CSV_HDR='epoch,iso,caps_timeline,caps_roomlog,rss_mib,vsz_mib,rss_after_poke_mib,poke_delta_mib,d_rss_mib,rate_mib_h,mp_seq,mp_resident_mib,mp_alloc_mib,rooms,served_depth,d_depth,traffic,gate,not_observable,d_mp_alloc_mib,rate_mp_alloc_mib,slope_theilsen_mib_h,td_seen,typing_rooms,uia_sessions'
 
 [ -s "$CSV" ] || echo "$CSV_HDR" > "$CSV"
 
@@ -132,7 +133,7 @@ say "gates (KILL): rss>2048MiB (host guard, stays on rss) | trailing-2h slope of
 say "gates (LOG ONLY, no kill): mp_alloc growth >=+100MiB/h twice in a row — growth gates read mp_alloc; rss is reported only"
 say "warmup: first $WARMUP_TICKS checkpoints are labelled warmup and cannot trip a gate"
 [ "$NO_KILL" = "1" ] && say "VALIDATION MODE (--no-kill): gates are evaluated and logged, the server is NOT killed"
-say "not observable from outside the process: to_device_seen, typing_outer_map, uia_sessions"
+say "structure gauges in csv: td_seen, typing_rooms (typing OUTER room keys), uia_sessions — the three maps formerly 'not observable'"
 
 caps_of() {
 	# Capture, then judge. `ps eww` of another user's process yields nothing on FreeBSD,
@@ -334,10 +335,15 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 		rate=0.00
 	fi
 
-	mp_seq="-"; mp_res="-"; mp_alloc="-"
+	mp_seq="-"; mp_res="-"; mp_alloc="-"; mp_td="-"; mp_typing="-"; mp_uia="-"
 	if [ -n "$MEMPROBE" ] && [ -r "$MEMPROBE" ]; then
-		read -r mp_seq mp_res mp_alloc <<EOF
-$(awk -F, 'NF>=7 {s=$2; r=$5; a=$4} END{print s, r, a}' "$MEMPROBE")
+		read -r mp_seq mp_res mp_alloc mp_td mp_typing mp_uia <<EOF
+$(awk -F, 'NF>=7 {s=$2; r=$5; a=$4; td=$18; ty=$19; uia=$20} END{
+	# structure gauges are fields 18-20 of the memprobe line. An older probe, or a
+	# process that never registered its state (memprobe::watch), leaves them empty;
+	# copy those as "-" so a missing gauge is never quoted as a flat zero.
+	if (td=="") td="-"; if (ty=="") ty="-"; if (uia=="") uia="-"
+	print s, r, a, td, ty, uia}' "$MEMPROBE")
 EOF
 		mp_res=$(awk -v b="${mp_res:-0}" 'BEGIN{printf "%.1f", b/1048576}')
 		mp_alloc=$(awk -v b="${mp_alloc:-0}" 'BEGIN{printf "%.1f", b/1048576}')
@@ -456,7 +462,7 @@ EOF
 	fi
 	fi
 
-	echo "$epoch,$iso,$caps_t,$caps_r,$rss,$vsz,$rss_after,$poke_delta,$d_rss,$rate,$mp_seq,$mp_res,$mp_alloc,$rooms,$depth,$d_depth,$traffic,$gate,to_device_seen+typing_outer+uia_sessions,$d_mp,$rate_mp,$slope" >> "$CSV"
+	echo "$epoch,$iso,$caps_t,$caps_r,$rss,$vsz,$rss_after,$poke_delta,$d_rss,$rate,$mp_seq,$mp_res,$mp_alloc,$rooms,$depth,$d_depth,$traffic,$gate,none,$d_mp,$rate_mp,$slope,$mp_td,$mp_typing,$mp_uia" >> "$CSV"
 
 	first_row=0
 	prev_rss=$rss; prev_mp_alloc=$mp_alloc; prev_epoch=$epoch; prev_depth=$depth
