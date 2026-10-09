@@ -98,8 +98,9 @@ fn wildcard_devices_for_user(state: &AppState, target_user: &str) -> Vec<String>
 //   input:  Path(event_type, txn_id); Authorization: Bearer <signed mxt_ token>;
 //           JSON body {"messages": {user_id: {device_id: content, ...}, ...}}
 //   output: JSON {} (200) on success; 401 M_UNKNOWN_TOKEN on missing/invalid token
-//   sideEffects: writes to state.to_device.to_device_queue (+ to_device_seen); wakes /sync long-poll
-//                waiters; (cluster) publishes one Zenoh sample per recipient
+//   sideEffects: writes to state.to_device.to_device_queue (+ to_device_seen); appends
+//                each message to data_dir/to_device.jsonl when persistence is enabled;
+//                wakes /sync long-poll waiters; (cluster) publishes one Zenoh sample per recipient
 // put_send_to_device:end
 pub async fn put_send_to_device(
     State(state): State<Arc<AppState>>,

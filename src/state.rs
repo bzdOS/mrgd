@@ -74,8 +74,8 @@
 //              users_sharing_room_with, and routes/keys.rs for the cross-node gossip.
 //
 //          To-device relay (real sendToDevice — replaces the old no-op stub):
-//            - to_device_queue: per-(user_id,device_id) ordered Vec<(stream_pos, event)>.
-//              stream_pos is drawn from the SAME counter as room sync (used for FIFO
+//            - to_device_queue: per-(user_id,device_id) ordered Vec<(stream_pos, msg_id,
+//              event)>. stream_pos is drawn from the SAME counter as room sync (used for FIFO
 //              ordering ONLY — the delivery ack is the per-device `delivered` watermark,
 //              see drain_to_device; using the room since as the ack would silently drop
 //              messages enqueued below a device's room cursor). See routes/to_device.rs
@@ -125,7 +125,7 @@ use std::{
 use crate::substrate::crdt::ZenohCrdtSink;
 
 type RoomKeyDataMap = HashMap<(String, String), HashMap<String, HashMap<String, Value>>>;
-type ToDeviceQueue = HashMap<(String, String), Vec<(u64, Value)>>;
+type ToDeviceQueue = HashMap<(String, String), Vec<(u64, String, Value)>>;
 type TypingRemoteMap = HashMap<String, HashMap<String, HashMap<String, u64>>>;
 type ReceiptsMap = HashMap<String, HashMap<String, (String, String, u64)>>;
 type AccountDataRoomMap = HashMap<String, HashMap<String, HashMap<String, Value>>>;
@@ -2177,8 +2177,9 @@ impl AppState {
     //           msg_id — caller-computed dedup key, unique per (sender, txn_id, target_user,
     //                    target_device)
     //   output: Ok(()) on success; Err(String) on mutex poison
-    //   sideEffects: mutates to_device_seen + to_device_queue; wakes long-poll /sync waiters
-    //                via self.notify (shared with room-event delivery)
+    //   sideEffects: mutates to_device_seen + to_device_queue; appends one JSON line
+    //                to data_dir/to_device.jsonl when persistence is enabled; wakes
+    //                long-poll /sync waiters via self.notify (shared with room-event delivery)
     // AppState::enqueue_to_device:end
     pub fn enqueue_to_device(
         &self,
@@ -2216,8 +2217,18 @@ impl AppState {
         queue
             .entry((target_user.to_string(), target_device.to_string()))
             .or_default()
-            .push((pos, ev));
+            .push((pos, msg_id.to_string(), ev));
         drop(queue);
+
+        self.persist_to_device(
+            target_user,
+            target_device,
+            sender,
+            event_type,
+            content,
+            msg_id,
+            pos,
+        );
 
         self.notify.notify_waiters();
         Ok(())
@@ -2278,36 +2289,36 @@ impl AppState {
         let watermark: Option<u64> = delivered.get(&key).copied();
 
         // Oldest-first FIFO.
-        entries.sort_by_key(|(pos, _)| *pos);
+        entries.sort_by_key(|(pos, _, _)| *pos);
 
         // What do we hand back? On a device's VERY FIRST drain there is no watermark
         // entry yet — it has never been acked anything, so the whole queue is new.
         // Afterwards only messages strictly above the per-device watermark are new.
-        let deliver_entries: Vec<(u64, Value)> = match watermark {
+        let deliver_entries: Vec<(u64, String, Value)> = match watermark {
             None => entries.clone(),
             Some(w) => entries
                 .iter()
-                .filter(|(pos, _)| *pos > w)
+                .filter(|(pos, _, _)| *pos > w)
                 .cloned()
                 .collect(),
         };
         let deliver: Vec<Value> = deliver_entries
             .iter()
-            .map(|(_, ev)| ev.clone())
+            .map(|(_, _, ev)| ev.clone())
             .collect();
 
         // New watermark = highest position this call returns; if none returned, keep
         // the existing watermark (or 0 for a device that has nothing at all).
         let new_watermark = deliver_entries
             .iter()
-            .map(|(pos, _)| *pos)
+            .map(|(pos, _, _)| *pos)
             .max()
             .unwrap_or(watermark.unwrap_or(0));
         delivered.insert(key, new_watermark);
 
         // GC everything at or below the new watermark — a message becomes disposable
         // only once drain has actually returned it to this device.
-        entries.retain(|(pos, _)| *pos > new_watermark);
+        entries.retain(|(pos, _, _)| *pos > new_watermark);
 
         Ok(deliver)
     }
@@ -4526,5 +4537,55 @@ mod to_device_delivery_test {
         assert_eq!(td, 1, "to_device_seen counts the enqueued msg_id");
         assert_eq!(typing_outer, 1, "typing gauge counts outer room keys");
         assert_eq!(uia, 1, "uia_sessions counts the issued session");
+    }
+
+    // Persist-across-restart: undelivered to-device messages survive a restart
+    // when MATRIX_HS_DATA_DIR is set. New process, same on-disk journal → replay
+    // restores them. stream_pos is node-local (resets to 0) — replay assigns fresh
+    // positions from the live counter in file order, so ordering is preserved by file
+    // order, not by the persisted pos field.
+    #[test]
+    fn to_device_persist_across_restart() {
+        let dir = std::env::temp_dir()
+            .join(format!("mrgd_td_persist_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        // First instance: enqueue N messages with persistence enabled.
+        let st1 = AppState::with_data_dir(dir.clone());
+        for i in 0..5u32 {
+            st1
+                .enqueue_to_device(
+                    "@bob:localhost",
+                    "BOBDEV",
+                    "@alice:localhost",
+                    "m.test",
+                    &json!({ "i": i }),
+                    &format!("msg:{}", i),
+                )
+                .unwrap();
+        }
+        // Journal must be on disk after enqueue.
+        assert!(
+            dir.join("to_device.jsonl").exists(),
+            "journal must be on disk after enqueue"
+        );
+
+        // Second instance: same dir → replay_from_dir restores undelivered messages.
+        let st2 = AppState::with_data_dir(dir.clone());
+        crate::persist::replay_from_dir(&st2, &dir).unwrap();
+
+        let got = st2
+            .drain_to_device("@bob:localhost", "BOBDEV", None)
+            .unwrap();
+        assert_eq!(got.len(), 5, "all 5 messages must survive restart");
+        // Order and content preserved (file-order replay, fresh stream_pos).
+        assert_eq!(got[0]["content"]["i"], 0);
+        assert_eq!(got[1]["content"]["i"], 1);
+        assert_eq!(got[2]["content"]["i"], 2);
+        assert_eq!(got[3]["content"]["i"], 3);
+        assert_eq!(got[4]["content"]["i"], 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -882,6 +882,57 @@ impl AppState {
     }
     // AppState::persist_alias:end
 
+    // AppState::persist_to_device:start
+    //   purpose: Append one to-device message to data_dir/to_device.jsonl — a
+    //            flat JSON-lines journal (the append-only + replay shape used by
+    //            room PDU journals and accounts.jsonl), NOT a per-room sidecar but
+    //            the same durability contract: best-effort, fsync'd, O_APPEND-cached
+    //            via append_line(), replay restores via replay_to_device().
+    //            Format: {"pos":N,"msg_id":"...","target_user":"...","target_device":"...",
+    //                    "sender":"...","event_type":"...","content":{...}}.
+    //            On replay, stream_pos is NOT reused (it is node-local and resets to 0
+    //            on restart) — the file is replayed in file order and new positions are
+    //            assigned. The pos field is stored only for debugging/telemetry.
+    //            No-op when persistence is disabled (data_dir is None).
+    //   input:  target_user, target_device — recipient identity;
+    //           sender — verified sender user_id;
+    //           event_type — to-device event type;
+    //           content — event content JSON;
+    //           msg_id — dedup key;
+    //           pos — the stream_pos assigned to this message (for debugging/telemetry;
+    //                 not trusted on replay — replay assigns fresh positions from the
+    //                 live counter)
+    //   output: none
+    //   sideEffects: appends one JSON line to to_device.jsonl
+    // AppState::persist_to_device:end
+    pub fn persist_to_device(
+        &self,
+        target_user: &str,
+        target_device: &str,
+        sender: &str,
+        event_type: &str,
+        content: &Value,
+        msg_id: &str,
+        pos: u64,
+    ) {
+        let ctx = &self.persist;
+        let dir = match &ctx.data_dir {
+            Some(d) => d,
+            None => return,
+        };
+        let path = dir.join("to_device.jsonl");
+        let rec = json!({
+            "pos":           pos,
+            "msg_id":        msg_id,
+            "target_user":   target_user,
+            "target_device": target_device,
+            "sender":        sender,
+            "event_type":    event_type,
+            "content":       content,
+        });
+        append_line(&path, &rec);
+    }
+
     // AppState::persist_media_blob:start
     //   purpose: Write one uploaded media blob to <data_dir>/media/<sanitized_media_id>
     //            plus a sibling "<sanitized_media_id>.ct" sidecar carrying the raw
@@ -1155,9 +1206,103 @@ pub fn replay_from_dir(state: &std::sync::Arc<AppState>, data_dir: &Path) -> Res
         replay_room_key_data(state, &data_path);
     }
 
+    // ── 6. To-device queue journal ───────────────────────────────────────────────
+    // replay_to_device populates to_device_queue with undelivered messages that
+    // survived the last run. New stream_pos values are assigned from the live
+    // counter in file order — stream_pos is node-local and resets to 0 on restart,
+    // so the persisted "pos" field is NOT trusted for ordering, only for debugging.
+    let td_path = data_dir.join("to_device.jsonl");
+    if td_path.exists() {
+        replay_to_device(state, &td_path);
+    }
+
     Ok(())
 }
 // replay_from_dir:end
+
+// replay_to_device:start
+//   purpose: Replay data_dir/to_device.jsonl to reconstruct the in-memory
+//            to_device_queue with UNDELIVERED messages. Messages delivered on the
+//            previous run were evicted from the in-memory queue on drain (the
+//            on-disk journal is append-only); at-least-once re-delivery after
+//            restart is Matrix-spec acceptable — the to_device_recent dedup deque
+//            (reset on restart) covers within-run redelivery only.
+//            Each persisted record is replayed in file order with a fresh stream_pos
+//            drawn from the live counter — stream_pos is node-local and resets to 0
+//            on restart, so the persisted "pos" field is NOT trusted for ordering.
+//   input:  state — Arc<AppState> (freshly constructed, data_dir set);
+//           path — path to to_device.jsonl
+//   output: none (errors printed to stderr, never fatal)
+//   sideEffects: populates state.to_device.to_device_queue
+// replay_to_device:end
+fn replay_to_device(state: &std::sync::Arc<AppState>, path: &Path) {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("matrix-hs replay: open {}: {e}", path.display());
+            return;
+        }
+    };
+    let reader = BufReader::new(file);
+    {
+        let mut queue = match state.to_device.to_device_queue.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                eprintln!("matrix-hs replay: to_device_queue poisoned");
+                return;
+            }
+        };
+        for (line_no, line_result) in reader.lines().enumerate() {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!(
+                        "matrix-hs replay: to_device read line {} of {}: {e}",
+                        line_no + 1,
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let rec: Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "matrix-hs replay: to_device parse line {} of {}: {e}",
+                        line_no + 1,
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            let target_user = match rec.get("target_user").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let target_device = match rec.get("target_device").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let msg_id = match rec.get("msg_id").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let pos = state.stream_pos.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let ev = json!({
+                "sender":  rec.get("sender").and_then(|v| v.as_str()).unwrap_or(""),
+                "type":    rec.get("event_type").and_then(|v| v.as_str()).unwrap_or(""),
+                "content": rec.get("content").cloned().unwrap_or(json!({})),
+            });
+            queue
+                .entry((target_user, target_device))
+                .or_default()
+                .push((pos, msg_id, ev));
+        }
+    }
+}
 
 // replay_room_key_versions:start
 //   purpose: Replay room_key_versions.jsonl (create/update/delete ops, in file
