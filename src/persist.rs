@@ -641,6 +641,96 @@ pub fn prune_room_journal(dir: &Path, room_id: &str, event_ids_kept: &HashSet<St
 }
 // prune_room_journal:end
 
+// compact_to_device_journal:start
+//   purpose: Rewrite data_dir/to_device.jsonl keeping only entries whose msg_id
+//            is still pending in the in-memory to_device_queue. Called by
+//            drain_to_device after GC'ing delivered entries from memory, so the
+//            on-disk journal does not grow append-only across restarts — without
+//            this, replay re-adds delivered messages and a fresh drain re-delivers
+//            them (to-device at-least-once already, but only ACROSS a restart
+//            boundary is the double-delivery avoidable).
+//
+//            Atomicity: write-to-temp then rename via swap_journal_file, the SAME
+//            shape as compact_room / prune_room_journal — a crash mid-rewrite leaves
+//            the old journal intact (the temp is never visible). swap_journal_file
+//            also drops the stale O_APPEND handle from the APPEND_FILES cache in the
+//            SAME critical section as the rename: if the cache-drop were outside the
+//            lock, an enqueue whose append_line had just opened a handle to the old
+//            inode between rename and cache-clear would silently write into the
+//            unlinked file. Because drain_to_device holds to_device_queue while
+//            calling this (and enqueue_to_device now also persists under that same
+//            lock), no enqueue can append between keep-set collection and rewrite —
+//            there is no append-vs-compaction race.
+//
+//            Skip-when-clean: if every line's msg_id is in keep_msg_ids, the rewrite
+//            would be byte-for-byte identical, so it is skipped (same rationale as
+//            compact_room's count_newlines check — avoids fsync+rewrite on every
+//            /sync when nothing new was delivered).
+//
+//            Empty keep-set (all messages for every device delivered): rewrites the
+//            journal to an empty file — correct, since replay of an empty file
+//            yields an empty queue.
+//   input:  dir          — data directory root;
+//           keep_msg_ids — set of msg_ids still in the in-memory queue (pending)
+//   output: none (errors printed to stderr, not propagated — best-effort)
+//   sideEffects: may rewrite data_dir/to_device.jsonl (temp → rename)
+// compact_to_device_journal:end
+pub fn compact_to_device_journal(dir: &Path, keep_msg_ids: &HashSet<String>) {
+    let final_path = dir.join("to_device.jsonl");
+    if !final_path.exists() {
+        return; // nothing persisted yet
+    }
+    let tmp_path = dir.join("to_device.jsonl.compact.tmp");
+
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let reader = BufReader::new(File::open(&final_path)?);
+        let mut kept: Vec<String> = Vec::new();
+        let mut total = 0usize;
+        for line_result in reader.lines() {
+            let line = line_result?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            total += 1;
+            let rec: Value = serde_json::from_str(trimmed)?;
+            let msg_id = rec
+                .get("msg_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if msg_id.is_empty() || !keep_msg_ids.contains(msg_id) {
+                continue; // delivered — drop from journal
+            }
+            kept.push(trimmed.to_string());
+        }
+
+        // SKIP-WHEN-CLEAN: if every line survived the filter, a rewrite would
+        // reproduce the file byte-for-byte — pure write amplification on every
+        // /sync. Read line count is cheap next to fsync+rename.
+        if kept.len() == total {
+            return Ok(());
+        }
+
+        let mut tmp = File::create(&tmp_path)?;
+        for line in &kept {
+            tmp.write_all(line.as_bytes())?;
+            tmp.write_all(b"\n")?;
+        }
+        tmp.flush()?;
+        tmp.sync_data()?;
+        drop(tmp);
+
+        // swap_journal_file locks APPEND_FILES + rename + cache-drop, all atomic.
+        swap_journal_file(&tmp_path, &final_path)?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        eprintln!("matrix-hs compact_to_device_journal: {e} (journal untouched)");
+        let _ = fs::remove_file(&tmp_path);
+    }
+}
+
 // read_room_journal_events:start
 //   purpose: Read every event line from a room journal file directly off disk, in
 //            file order. Deliberately independent of AppState / room_timeline: the

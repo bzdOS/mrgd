@@ -2218,8 +2218,14 @@ impl AppState {
             .entry((target_user.to_string(), target_device.to_string()))
             .or_default()
             .push((pos, msg_id.to_string(), ev));
-        drop(queue);
 
+        // Persist UNDER the queue lock: fetch_add gave each message a distinct
+        // pos, and the queue holds entries sorted by pos. If persist ran after
+        // drop(queue), two concurrent enqueuers could append to to_device.jsonl
+        // in an order that disagrees with their pos values; replay assigns
+        // fresh positions in file order, silently reversing FIFO. Holding the
+        // lock through append_line (which takes only APPEND_FILES, never the
+        // queue lock — no circular wait) pins on-disk order to pos order.
         self.persist_to_device(
             target_user,
             target_device,
@@ -2229,6 +2235,7 @@ impl AppState {
             msg_id,
             pos,
         );
+        drop(queue);
 
         self.notify.notify_waiters();
         Ok(())
@@ -2254,6 +2261,14 @@ impl AppState {
     //            signature stable and to allow the initial-sync/None path to return the
     //            full pending set.
     //
+    //            After GC, delivered entries are ALSO evicted from the on-disk journal
+    //            (data_dir/to_device.jsonl) via compact_to_device_journal — otherwise the
+    //            append-only journal would replay delivered messages on restart and
+    //            re-deliver them. The compaction only runs when persistence is enabled and
+    //            something was actually delivered; the queue lock serialises with
+    //            enqueue_to_device's persist (now under the same lock) so the keep-set
+    //            and the file rewrite are race-free.
+    //
     //   input:  user_id, device_id — target device identity;
     //           since_pos — ignored for to-device acking (kept for signature stability);
     //                       None for initial sync
@@ -2262,7 +2277,9 @@ impl AppState {
     //           Err(String) on mutex poison
     //   sideEffects: mutates to_device_queue (removes delivered entries in place) and
     //                to_device.delivered (advances the per-device watermark to the highest
-    //                position handed back)
+    //                position handed back); (persist enabled, when something was delivered)
+    //                rewrites data_dir/to_device.jsonl via compact_to_device_journal, evicting
+    //                entries no longer pending in memory
     // AppState::drain_to_device:end
     pub fn drain_to_device(
         &self,
@@ -2319,6 +2336,24 @@ impl AppState {
         // GC everything at or below the new watermark — a message becomes disposable
         // only once drain has actually returned it to this device.
         entries.retain(|(pos, _, _)| *pos > new_watermark);
+
+        // Evict delivered entries from the on-disk journal.  Only when we actually
+        // delivered something (an empty deliver means the journal already matches
+        // memory — no eviction needed) and persistence is enabled.  The queue lock
+        // is still held: this serialises with enqueue_to_device (which now persists
+        // under this same lock) so the keep-set and the file rewrite are race-free
+        // — no message can be appended between collecting msg_ids and rewriting.
+        if !deliver.is_empty() {
+            if let Some(ref dir) = self.persist.data_dir {
+                let keep_ids: HashSet<String> = queue
+                    .values()
+                    .flat_map(|v| v.iter().map(|(_, msg_id, _)| msg_id.clone()))
+                    .collect();
+                crate::persist::compact_to_device_journal(dir, &keep_ids);
+            }
+        }
+        drop(delivered);
+        drop(queue);
 
         Ok(deliver)
     }
@@ -4585,6 +4620,132 @@ mod to_device_delivery_test {
         assert_eq!(got[2]["content"]["i"], 2);
         assert_eq!(got[3]["content"]["i"], 3);
         assert_eq!(got[4]["content"]["i"], 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Evict-after-delivery: draining delivered messages evicts them from the
+    // in-memory queue AND from the on-disk journal. A second drain returns 0
+    // (in-memory GC handles this), but the KEY assertion is that the journal
+    // file itself has been compacted — without the compaction, restart would
+    // replay the delivered entries and re-deliver them.
+    #[test]
+    fn evict_after_delivery() {
+        let dir = std::env::temp_dir()
+            .join(format!("mrgd_td_evict_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let st = AppState::with_data_dir(dir.clone());
+        for i in 0..3u32 {
+            st.enqueue_to_device(
+                "@bob:localhost",
+                "BOBDEV",
+                "@alice:localhost",
+                "m.test",
+                &json!({ "i": i }),
+                &format!("msg:{}", i),
+            )
+            .unwrap();
+        }
+
+        // First drain delivers all 3 — in-memory GC + journal compaction.
+        let first = st
+            .drain_to_device("@bob:localhost", "BOBDEV", None)
+            .unwrap();
+        assert_eq!(first.len(), 3, "first drain delivers all 3");
+
+        // Second drain: 0 (in-memory queue is empty).
+        let second = st
+            .drain_to_device("@bob:localhost", "BOBDEV", None)
+            .unwrap();
+        assert_eq!(
+            second.len(),
+            0,
+            "second drain must be empty — evict-after-delivery"
+        );
+
+        // Journal must be compacted: all delivered entries evicted from disk.
+        let remaining = std::fs::read_to_string(dir.join("to_device.jsonl"))
+            .unwrap_or_default();
+        assert_eq!(
+            remaining.lines().count(),
+            0,
+            "journal must be compacted to 0 lines after all deliveries evicted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // No-redelivery-after-restart: after draining (which compacts the journal),
+    // a restart replays only undelivered entries. Delivered messages must NOT be
+    // re-delivered. Undelivered messages for a different device MUST survive.
+    #[test]
+    fn no_redelivery_after_restart() {
+        let dir = std::env::temp_dir()
+            .join(format!("mrgd_td_noredeliver_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        // First instance: enqueue for TWO devices — BOBDEV1 and BOBDEV2.
+        let st1 = AppState::with_data_dir(dir.clone());
+        for i in 0..3u32 {
+            st1
+                .enqueue_to_device(
+                    "@bob:localhost",
+                    "BOBDEV1",
+                    "@alice:localhost",
+                    "m.test",
+                    &json!({ "i": i }),
+                    &format!("msg1:{}", i),
+                )
+                .unwrap();
+        }
+        for i in 0..2u32 {
+            st1
+                .enqueue_to_device(
+                    "@bob:localhost",
+                    "BOBDEV2",
+                    "@alice:localhost",
+                    "m.test",
+                    &json!({ "i": i }),
+                    &format!("msg2:{}", i),
+                )
+                .unwrap();
+        }
+
+        // Drain BOBDEV1 → compacts journal, evicts BOBDEV1's delivered entries.
+        // BOBDEV2's entries survive because they're still in the queue (keep-set).
+        let d1 = st1
+            .drain_to_device("@bob:localhost", "BOBDEV1", None)
+            .unwrap();
+        assert_eq!(d1.len(), 3, "BOBDEV1 gets all 3 messages");
+
+        // Second instance: restart → replay only undelivered entries.
+        let st2 = AppState::with_data_dir(dir.clone());
+        crate::persist::replay_from_dir(&st2, &dir).unwrap();
+
+        // BOBDEV1: no redelivery — delivered entries were evicted from journal.
+        let redelivered1 = st2
+            .drain_to_device("@bob:localhost", "BOBDEV1", None)
+            .unwrap();
+        assert_eq!(
+            redelivered1.len(),
+            0,
+            "delivered messages must not be re-delivered after restart"
+        );
+
+        // BOBDEV2: undelivered messages survive on disk and are delivered.
+        let d2 = st2
+            .drain_to_device("@bob:localhost", "BOBDEV2", None)
+            .unwrap();
+        assert_eq!(
+            d2.len(),
+            2,
+            "undelivered messages must survive restart"
+        );
+        assert_eq!(d2[0]["content"]["i"], 0);
+        assert_eq!(d2[1]["content"]["i"], 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
