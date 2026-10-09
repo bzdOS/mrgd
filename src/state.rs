@@ -113,7 +113,7 @@ use crate::substrate::matrix_events::RoomLog;
 use crate::substrate::node_auth::{NodeKeyStore, NodeSigner};
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
@@ -1151,6 +1151,14 @@ pub struct E2ee {
 //   output: ToDevice value, held as AppState.to_device
 //   sideEffects: none (plain data holder)
 // ToDevice:end
+
+/// Cap on the per-device delivered-msg_id redrain guard (see
+/// ToDevice::to_device_delivered_ids). 128 covers the realistic Zenoh
+/// at-least-once redelivery window and the sending node's own gossip loop-back
+/// with wide margin, while bounding guard memory at (#devices × 128) msg_ids
+/// regardless of traffic volume.
+const TO_DEVICE_DELIVERED_GUARD: usize = 128;
+
 #[derive(Default)]
 pub struct ToDevice {
     /// Per-target-device to-device message queue. Keyed by (target_user_id,
@@ -1175,12 +1183,35 @@ pub struct ToDevice {
     /// restart, which only ever re-delivers, never drops.
     pub delivered: Mutex<HashMap<(String, String), u64>>,
 
-    /// Dedup set of to-device msg_ids already enqueued locally. A to-device
-    /// message sent on one node is (a) enqueued directly AND (b) broadcast via
-    /// Zenoh gossip, so a node may see the same message twice — this set makes
-    /// enqueue_to_device() a no-op on replay (mirrors RoomLog's grow-only
-    /// dedup-by-event_id idempotency).
+    /// Dedup set of to-device msg_ids ALREADY ENQUEUED but NOT YET DELIVERED —
+    /// an in-flight index, not a grow-only history. A to-device message sent on
+    /// one node is (a) enqueued directly AND (b) broadcast via Zenoh gossip, so
+    /// a node may see the same message twice — this set makes
+    /// enqueue_to_device() a no-op on replay while the message is still pending.
+    /// CRITICAL CHANGE (task/td-seen-watermark): entries are now EVICTED when
+    /// drain_to_device actually hands the message to the device (moved into
+    /// to_device_delivered_ids). Before this change the set grew ∝ traffic and
+    /// never drained (718 entries after 720 messages in the #163 leak survey) —
+    /// it doubled as an unbounded delivered-history. The delivered-history role
+    /// is now played by the bounded per-device ring `to_device_delivered_ids`.
     pub to_device_seen: Mutex<HashSet<String>>,
+
+    /// Bounded per-device ring of the LAST N msg_ids actually DELIVERED to that
+    /// device — the redrain guard. Its only job is the red line of this change:
+    /// dedup must survive long enough that a gossip redrain of an already
+    /// delivered message cannot re-enqueue it (which would re-deliver it on the
+    /// next /sync — "вечная пере-доставка"). A per-device WATERMARK (highest
+    /// delivered stream_pos) cannot replace the msg_id here: a gossip sample
+    /// carries the ORIGIN node's stream_pos, which is drawn from a different
+    /// counter than this node's `delivered` watermark — comparing them is
+    /// exactly the room-key-loss bug (a foreign pos below the local cursor
+    /// would be silently dropped). So the guard keys on msg_id (the id that
+    /// actually travels in the gossip payload) but is bounded to
+    /// `TO_DEVICE_DELIVERED_GUARD` entries per device, evicting oldest-first.
+    /// That caps memory at (#devices × guard), independent of traffic, while
+    /// covering the realistic redrain window (Zenoh at-least-once redelivery
+    /// and the sending node's own loop-back, both well inside N recent sends).
+    pub to_device_delivered_ids: Mutex<HashMap<(String, String), VecDeque<String>>>,
 }
 
 // Ephemeral:start
@@ -2164,10 +2195,18 @@ impl AppState {
     // AppState::enqueue_to_device:start
     //   purpose: Enqueue one to-device message for (target_user, target_device), assigning
     //            it a fresh position from the SAME global stream_pos counter used for room
-    //            sync (so a single since-token space covers both). Idempotent per msg_id:
-    //            if msg_id was already seen (to_device_seen), this is a silent no-op — this
-    //            is what makes it safe for the PUT handler to enqueue locally AND publish
-    //            cross-node gossip unconditionally: the gossip may loop back to the
+    //            sync (so a single since-token space covers both). Idempotent per msg_id —
+    //            two-tier, because `to_device_seen` is now an in-flight index that drains
+    //            on delivery (see ToDevice::to_device_seen):
+    //              1. to_device_delivered_ids (bounded per-device ring): a gossip redrain
+    //                 of a message this device ALREADY received is a silent no-op. This is
+    //                 the red line — without it, evicting from `seen` on delivery would let
+    //                 a late redrain re-enqueue and re-deliver on the next /sync forever.
+    //              2. to_device_seen (in-flight set): a duplicate of a message still
+    //                 PENDING (not yet delivered) — direct send + gossip loop-back racing
+    //                 before the device fetches — is a silent no-op.
+    //            This is what makes it safe for the PUT handler to enqueue locally AND
+    //            publish cross-node gossip unconditionally: the gossip may loop back to the
     //            publishing node's own subscriber (cluster feature) and would otherwise
     //            double-store the same message.
     //   input:  target_user, target_device — recipient identity;
@@ -2177,8 +2216,8 @@ impl AppState {
     //           msg_id — caller-computed dedup key, unique per (sender, txn_id, target_user,
     //                    target_device)
     //   output: Ok(()) on success; Err(String) on mutex poison
-    //   sideEffects: mutates to_device_seen + to_device_queue; appends one JSON line
-    //                to data_dir/to_device.jsonl when persistence is enabled; wakes
+    //   sideEffects: on accept, mutates to_device_seen + to_device_queue; appends one JSON
+    //                line to data_dir/to_device.jsonl when persistence is enabled; wakes
     //                long-poll /sync waiters via self.notify (shared with room-event delivery)
     // AppState::enqueue_to_device:end
     pub fn enqueue_to_device(
@@ -2191,6 +2230,23 @@ impl AppState {
         msg_id: &str,
     ) -> Result<(), String> {
         {
+            // Tier 1: already DELIVERED to this device (bounded redrain guard) — a gossip
+            // redrain of an acked message must not re-enqueue it.
+            let delivered = self
+                .to_device
+                .to_device_delivered_ids
+                .lock()
+                .map_err(|e| e.to_string())?;
+            if delivered
+                .get(&(target_user.to_string(), target_device.to_string()))
+                .is_some_and(|ring| ring.iter().any(|m| m == msg_id))
+            {
+                return Ok(());
+            }
+        }
+        {
+            // Tier 2: still IN FLIGHT (pending, not yet delivered) — duplicate direct send
+            // or gossip loop-back racing before the device fetches.
             let mut seen = self
                 .to_device
                 .to_device_seen
@@ -2269,6 +2325,19 @@ impl AppState {
     //            enqueue_to_device's persist (now under the same lock) so the keep-set
     //            and the file rewrite are race-free.
     //
+    //            Delivered msg_ids are EVICTED from the in-flight `to_device_seen` set and
+    //            pushed into the bounded per-device redrain ring `to_device_delivered_ids`
+    //            (oldest evicted past TO_DEVICE_DELIVERED_GUARD). This is the leak fix:
+    //            `seen` now drains to ~0 after a device fully fetches, instead of growing
+    //            ∝ traffic forever. The red line that made the naive "just clear seen"
+    //            wrong — a gossip redrain of an already-acked message re-enqueueing and
+    //            re-delivering on every future /sync — is closed by the ring: the redrain
+    //            is caught by enqueue_to_device's delivered-guard check (tier 1) long
+    //            after it left `seen`. A per-device stream_pos watermark cannot replace
+    //            the msg_id here, because a gossip sample carries the ORIGIN node's pos
+    //            (a different counter) — comparing it to this node's cursor is the
+    //            room-key-loss bug; the ring keys on the msg_id that actually travels.
+    //
     //   input:  user_id, device_id — target device identity;
     //           since_pos — ignored for to-device acking (kept for signature stability);
     //                       None for initial sync
@@ -2277,9 +2346,10 @@ impl AppState {
     //           Err(String) on mutex poison
     //   sideEffects: mutates to_device_queue (removes delivered entries in place) and
     //                to_device.delivered (advances the per-device watermark to the highest
-    //                position handed back); (persist enabled, when something was delivered)
-    //                rewrites data_dir/to_device.jsonl via compact_to_device_journal, evicting
-    //                entries no longer pending in memory
+    //                position handed back); moves delivered msg_ids from to_device_seen into
+    //                to_device_delivered_ids (bounded ring); (persist enabled, when something
+    //                was delivered) rewrites data_dir/to_device.jsonl via
+    //                compact_to_device_journal, evicting entries no longer pending in memory
     // AppState::drain_to_device:end
     pub fn drain_to_device(
         &self,
@@ -2331,7 +2401,7 @@ impl AppState {
             .map(|(pos, _, _)| *pos)
             .max()
             .unwrap_or(watermark.unwrap_or(0));
-        delivered.insert(key, new_watermark);
+        delivered.insert(key.clone(), new_watermark);
 
         // GC everything at or below the new watermark — a message becomes disposable
         // only once drain has actually returned it to this device.
@@ -2350,6 +2420,37 @@ impl AppState {
                     .flat_map(|v| v.iter().map(|(_, msg_id, _)| msg_id.clone()))
                     .collect();
                 crate::persist::compact_to_device_journal(dir, &keep_ids);
+            }
+
+            // Move each delivered msg_id OUT of the in-flight `seen` set and INTO this
+            // device's bounded redrain ring. Done here, under the queue lock, so it is
+            // atomic with the queue GC: a concurrent enqueue_to_device either sees the id
+            // still in `seen` (tier-2 dedup) or already in the ring (tier-1 dedup) — it
+            // can never slip through the gap between the two structures.
+            {
+                let mut seen = self
+                    .to_device
+                    .to_device_seen
+                    .lock()
+                    .map_err(|e| e.to_string())?;
+                let mut guard = self
+                    .to_device
+                    .to_device_delivered_ids
+                    .lock()
+                    .map_err(|e| e.to_string())?;
+                let ring = guard.entry(key.clone()).or_default();
+                for (_, msg_id, _) in deliver_entries.iter() {
+                    seen.remove(msg_id);
+                    // Dedup within the ring too (a replayed id must not double-push),
+                    // then push newest to the back, evicting oldest past the cap.
+                    if let Some(pos) = ring.iter().position(|m| m == msg_id) {
+                        ring.remove(pos);
+                    }
+                    ring.push_back(msg_id.clone());
+                    while ring.len() > TO_DEVICE_DELIVERED_GUARD {
+                        ring.pop_front();
+                    }
+                }
             }
         }
         drop(delivered);
@@ -4748,5 +4849,140 @@ mod to_device_delivery_test {
         assert_eq!(d2[1]["content"]["i"], 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Acceptance 1 (task/td-seen-watermark): after a device FULLY fetches (drain returns
+    // every pending message), the in-flight `to_device_seen` set must drain to ~0. Before
+    // this change it grew ∝ traffic and never emptied (718 entries after 720 msgs in the
+    // #163 leak survey). Negative check: enqueue N, full fetch, assert seen is empty.
+    #[test]
+    fn seen_drains_after_full_fetch() {
+        let st = AppState::new();
+
+        const N: u32 = 50;
+        for i in 0..N {
+            st.enqueue_to_device(
+                "@bob:localhost",
+                "BOBDEV",
+                "@alice:localhost",
+                "m.room_key",
+                &json!({ "i": i }),
+                &format!("drain-msg:{}", i),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            st.to_device.to_device_seen.lock().unwrap().len(),
+            N as usize,
+            "before the fetch, every msg_id is in-flight"
+        );
+
+        // Full fetch: one drain returns all N.
+        let got = st.drain_to_device("@bob:localhost", "BOBDEV", None).unwrap();
+        assert_eq!(got.len(), N as usize, "full fetch returns all N");
+
+        // THE leak assertion: seen must have drained.
+        assert_eq!(
+            st.to_device.to_device_seen.lock().unwrap().len(),
+            0,
+            "in-flight seen must drain to 0 after a full fetch (was the #163 leak)"
+        );
+        // Queue is also empty (in-memory GC).
+        let queue_len: usize = st
+            .to_device
+            .to_device_queue
+            .lock()
+            .unwrap()
+            .values()
+            .map(|v| v.len())
+            .sum();
+        assert_eq!(queue_len, 0, "queue must be empty after a full fetch");
+    }
+
+    // Acceptance 2 (task/td-seen-watermark): the RED LINE. A gossip redrain of a message
+    // the device ALREADY received (acknowledged by a drain) must NOT re-enqueue or
+    // re-deliver it. drain_to_device_gossip calls enqueue_to_device for every gossip
+    // sample, so a redrain is exactly "enqueue_to_device with a msg_id already delivered".
+    // Negative check: deliver M, redrain M via the gossip path, second drain returns 0.
+    #[test]
+    fn no_redelivery_same_run_after_gossip_redrain() {
+        let st = AppState::new();
+
+        st.enqueue_to_device(
+            "@bob:localhost",
+            "BOBDEV",
+            "@alice:localhost",
+            "m.room_key",
+            &json!({ "session_id": "sess-redrain" }),
+            "a:keys/:bob:BOBDEV:redrain",
+        )
+        .unwrap();
+
+        // First /sync delivers it (the ack).
+        let first = st.drain_to_device("@bob:localhost", "BOBDEV", None).unwrap();
+        assert_eq!(first.len(), 1, "first sync delivers the message");
+
+        // A late gossip redrain of the SAME msg_id arrives — this is what
+        // drain_to_device_gossip does per sample. It must be a no-op (tier-1 guard).
+        st.enqueue_to_device(
+            "@bob:localhost",
+            "BOBDEV",
+            "@alice:localhost",
+            "m.room_key",
+            &json!({ "session_id": "sess-redrain" }),
+            "a:keys/:bob:BOBDEV:redrain",
+        )
+        .unwrap();
+
+        // Second /sync: 0 new. No re-delivery after ack, gossip path included.
+        let second = st.drain_to_device("@bob:localhost", "BOBDEV", None).unwrap();
+        assert_eq!(
+            second.len(),
+            0,
+            "gossip redrain of an acked message must not re-deliver it"
+        );
+    }
+
+    // Acceptance 3 (task/td-seen-watermark): gossip dedup must stay intact BEFORE delivery.
+    // A duplicate enqueue of a message still PENDING (direct send + gossip loop-back racing
+    // before the device fetches) must not double-store it. This is tier-2 (in-flight seen).
+    #[test]
+    fn gossip_dedup_intact_before_delivery() {
+        let st = AppState::new();
+
+        st.enqueue_to_device(
+            "@bob:localhost",
+            "BOBDEV",
+            "@alice:localhost",
+            "m.room_key",
+            &json!({ "session_id": "sess-dedup" }),
+            "a:keys/:bob:BOBDEV:dedup",
+        )
+        .unwrap();
+        // Gossip loop-back of the SAME msg_id while it is still pending — no-op.
+        st.enqueue_to_device(
+            "@bob:localhost",
+            "BOBDEV",
+            "@alice:localhost",
+            "m.room_key",
+            &json!({ "session_id": "sess-dedup" }),
+            "a:keys/:bob:BOBDEV:dedup",
+        )
+        .unwrap();
+
+        // Only ONE copy is queued and only ONE is delivered.
+        let queue_len: usize = st
+            .to_device
+            .to_device_queue
+            .lock()
+            .unwrap()
+            .values()
+            .map(|v| v.len())
+            .sum();
+        assert_eq!(queue_len, 1, "duplicate pending msg_id must not double-store");
+
+        let got = st.drain_to_device("@bob:localhost", "BOBDEV", None).unwrap();
+        assert_eq!(got.len(), 1, "dedup before delivery: exactly one copy delivered");
+        assert_eq!(got[0]["content"]["session_id"], "sess-dedup");
     }
 }
