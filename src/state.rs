@@ -2230,28 +2230,42 @@ impl AppState {
         msg_id: &str,
     ) -> Result<(), String> {
         {
-            // Tier 1: already DELIVERED to this device (bounded redrain guard) — a gossip
-            // redrain of an acked message must not re-enqueue it.
-            let delivered = self
-                .to_device
-                .to_device_delivered_ids
-                .lock()
-                .map_err(|e| e.to_string())?;
-            if delivered
-                .get(&(target_user.to_string(), target_device.to_string()))
-                .is_some_and(|ring| ring.iter().any(|m| m == msg_id))
-            {
-                return Ok(());
-            }
-        }
-        {
-            // Tier 2: still IN FLIGHT (pending, not yet delivered) — duplicate direct send
-            // or gossip loop-back racing before the device fetches.
+            // BOTH locks are held here, in the SAME order the drain handoff takes them
+            // (seen -> delivered_ids), so this dedup check is atomic against a concurrent
+            // delivery's seen->ring handoff. That closes the window a two-lock split left
+            // open: with tier-1 under guard and tier-2 under seen separately, a redrain
+            // could pass tier-1 (ring still empty because the id was still in seen) and
+            // then lose the race — a concurrent drain hands the id off seen->ring — so by
+            // the time tier-2 ran, seen no longer held it, insert succeeded, and the acked
+            // message was re-enqueued (redelivered) in the same run. Under both locks the
+            // handoff cannot run mid-check: the id is either still in seen (tier-2 catches
+            // it) or already in the ring (tier-1 catches it), never neither.
+            //
+            // Lock order is seen -> delivered_ids everywhere (this block and the drain
+            // handoff both use it), so there is no inversion. Neither lock is held while
+            // enqueue later waits for to_device_queue, so enqueue never forms a cycle with
+            // drain (which holds queue and then takes seen/guard).
             let mut seen = self
                 .to_device
                 .to_device_seen
                 .lock()
                 .map_err(|e| e.to_string())?;
+            let mut guard = self
+                .to_device
+                .to_device_delivered_ids
+                .lock()
+                .map_err(|e| e.to_string())?;
+
+            // Tier 1: already DELIVERED to this device (bounded redrain guard) — a gossip
+            // redrain of an acked message must not re-enqueue it.
+            if guard
+                .get(&(target_user.to_string(), target_device.to_string()))
+                .is_some_and(|ring| ring.iter().any(|m| m == msg_id))
+            {
+                return Ok(());
+            }
+            // Tier 2: still IN FLIGHT (pending, not yet delivered) — duplicate direct send
+            // or gossip loop-back racing before the device fetches.
             if !seen.insert(msg_id.to_string()) {
                 // Already enqueued (direct send or an earlier gossip delivery) — no-op.
                 return Ok(());
@@ -2423,10 +2437,15 @@ impl AppState {
             }
 
             // Move each delivered msg_id OUT of the in-flight `seen` set and INTO this
-            // device's bounded redrain ring. Done here, under the queue lock, so it is
-            // atomic with the queue GC: a concurrent enqueue_to_device either sees the id
-            // still in `seen` (tier-2 dedup) or already in the ring (tier-1 dedup) — it
-            // can never slip through the gap between the two structures.
+            // device's bounded redrain ring. The handoff holds BOTH locks, in the order
+            // seen -> delivered_ids — the SAME order enqueue_to_device takes them for its
+            // two-tier dedup check. That shared order is what closes the redrain window:
+            // enqueue's tier-1 (ring) + tier-2 (seen) decision runs atomically against this
+            // handoff, so a msg_id can never be observed as "not in the ring AND not in
+            // seen" by a concurrent enqueue. Either the handoff has not run yet (id still
+            // in seen — tier-2 catches it) or it has completed (id now in the ring — tier-1
+            // catches it). It cannot be caught mid-move, where the id would be in neither
+            // structure and a redrain would slip through to a re-enqueue.
             {
                 let mut seen = self
                     .to_device
