@@ -2799,7 +2799,11 @@ impl AppState {
             Ok(mut guard) => {
                 if let Some(room_map) = guard.get_mut(room_id) {
                     room_map.retain(|_, expiry| *expiry > now);
-                    room_map.clone()
+                    let snapshot = room_map.clone();
+                    if room_map.is_empty() {
+                        guard.remove(room_id);
+                    }
+                    snapshot
                 } else {
                     HashMap::new()
                 }
@@ -4692,6 +4696,34 @@ mod to_device_delivery_test {
         assert_eq!(td, 1, "to_device_seen counts the enqueued msg_id");
         assert_eq!(typing_outer, 1, "typing gauge counts outer room keys");
         assert_eq!(uia, 1, "uia_sessions counts the issued session");
+    }
+
+    #[test]
+    fn typing_prune_empty_outer_keys_after_expiry() {
+        let st = AppState::new();
+
+        // Set typing with a 50ms timeout: long enough to survive the
+        // immediate snapshot below (1ms races with now_ms() and prunes
+        // the entry before the gauge check), short enough that the sleep
+        // that follows still drives expiry.
+        st.set_typing("!room:localhost", "@alice:localhost", true, 50)
+            .unwrap();
+
+        // While the entry is alive: outer key present, gauge = 1.
+        let snapshot = st.typing_snapshot_local("!room:localhost");
+        assert_eq!(snapshot.len(), 1, "one user typing before expiry");
+        let (_, typing_outer, _) = st.memprobe_struct_gauges();
+        assert_eq!(typing_outer, 1, "outer room key present before expiry");
+
+        // Wait past the 50ms expiry.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // After expiry: snapshot prunes inner entries AND removes the
+        // now-empty outer room key, so the gauge drops to 0.
+        let snapshot = st.typing_snapshot_local("!room:localhost");
+        assert!(snapshot.is_empty(), "no users typing after expiry");
+        let (_, typing_outer, _) = st.memprobe_struct_gauges();
+        assert_eq!(typing_outer, 0, "outer room key pruned after expiry");
     }
 
     // Persist-across-restart: undelivered to-device messages survive a restart
