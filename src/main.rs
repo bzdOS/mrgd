@@ -313,6 +313,8 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
         let listen = env.listen.clone();
         let scouting_off = env.scouting_off;
         let client_mode = env.client_mode;
+        env.validate_transport_security()
+            .map_err(|e| format!("refusing to start: {e}"))?;
         let session = if env.wants_cluster() {
             let mut cfg = zenoh::Config::default();
             if client_mode {

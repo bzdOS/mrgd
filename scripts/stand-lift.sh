@@ -83,6 +83,27 @@ case "$LISTEN_HOST" in
 	0.0.0.0|'[::]'|'[::]') echo "stand-lift: MATRIX_HS_LISTEN='$MATRIX_HS_LISTEN' — наружу слушать нельзя." >&2; exit 1 ;;
 esac
 
+# ── Гейт 5: Zenoh must not be plaintext tcp/ on a public interface ─────────
+# Fleet rule (.env.example): "never plaintext Zenoh on a public interface."
+# A tcp/ endpoint on 0.0.0.0, a public IP, or a hostname is a bug — refuse
+# the lift so the process never starts that way. Only tcp/ on loopback
+# (127.0.0.1, ::1, localhost) or an obfs/tls carrier is accepted.
+for _zen in "$MATRIX_HS_ZENOH_LISTEN" "$MATRIX_HS_ZENOH_CONNECT"; do
+	[ -z "$_zen" ] && continue
+	for _ep in $(echo "$_zen" | tr ',' ' '); do
+		case "$_ep" in
+			tcp/127.0.0.1:*|tcp/localhost:*|tcp/\[::1]:*|tcp/::1:*) ;;
+			tcp/*)
+				_h=${_ep#tcp/}
+				_h=${_h%%:*}
+				echo "stand-lift: plaintext tcp/ Zenoh on address '$_h' — forbidden; use obfs/ or TLS." >&2
+				exit 1
+				;;
+		esac
+	done
+done
+unset _zen _ep _h
+
 # Живой hubd не трогаем: если кто-то дописал очереди в env, подъём стенда их
 # оживит. Стоит ДО exec.
 if [ -n "${MATRIX_HS_HUBD_QUEUES_DIR:-}${MATRIX_HS_HUBD_HUB_DIR:-}" ]; then

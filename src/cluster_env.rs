@@ -79,8 +79,48 @@ impl ClusterEnv {
                 prefix
             )
         } else {
-            format!("cluster mode: peer/scouting (no connect/listen env) prefix={prefix}")
+             format!("cluster mode: peer/scouting (no connect/listen env) prefix={prefix}")
+         }
+     }
+
+    /// Reject plaintext `tcp/` Zenoh endpoints on non-loopback addresses.
+    /// Per the fleet rule (see .env.example: "never plaintext Zenoh on a public
+    /// interface"), such a configuration is a security bug, not a transport
+    /// choice. Returns Err with the first insecure endpoint found.
+    pub fn validate_transport_security(&self) -> Result<(), String> {
+        for (label, endpoints) in [
+            ("MATRIX_HS_ZENOH_CONNECT", &self.connect),
+            ("MATRIX_HS_ZENOH_LISTEN", &self.listen),
+        ] {
+            if let Some(ep_list) = endpoints {
+                for ep in ep_list.split(',') {
+                    let ep = ep.trim();
+                    if ep.is_empty() {
+                        continue;
+                    }
+                    if let Some(host) = ep.strip_prefix("tcp/") {
+                        let host = host.split(':').next().unwrap_or("");
+                        if !host.is_empty() && !is_loopback_host(host) {
+                            return Err(format!(
+                                "{label}: plaintext tcp/ endpoint on non-loopback address \
+                                 {} is forbidden; use obfs/ or TLS instead (see .env.example rule)",
+                                host
+                            ));
+                        }
+                    }
+                }
+            }
         }
+        Ok(())
+    }
+}
+
+/// True for loopback addresses that are safe for plaintext tcp/.
+fn is_loopback_host(host: &str) -> bool {
+    match host {
+        "127.0.0.1" | "::1" | "localhost" => true,
+        h if h.starts_with("[::1]") => true,
+        _ => false,
     }
 }
 
@@ -174,5 +214,57 @@ mod tests {
         assert_eq!(to_json5_endpoints("tcp/a:1"), "[\"tcp/a:1\"]");
         assert_eq!(to_json5_endpoints(" tcp/a:1 , tcp/b:2 "), "[\"tcp/a:1\",\"tcp/b:2\"]");
         assert_eq!(to_json5_endpoints(""), "[\"\"]");
+    }
+
+    #[test]
+    fn plaintext_tcp_on_loopback_is_allowed() {
+        let e = env_of(&[("MATRIX_HS_ZENOH_LISTEN", "tcp/127.0.0.1:7448")]);
+        assert!(e.validate_transport_security().is_ok());
+        let e = env_of(&[("MATRIX_HS_ZENOH_CONNECT", "tcp/127.0.0.1:7449")]);
+        assert!(e.validate_transport_security().is_ok());
+        let e = env_of(&[("MATRIX_HS_ZENOH_LISTEN", "tcp/localhost:7448")]);
+        assert!(e.validate_transport_security().is_ok());
+    }
+
+    #[test]
+    fn obfs_on_any_address_is_allowed() {
+        let e = env_of(&[(
+            "MATRIX_HS_ZENOH_LISTEN",
+            "obfs/198.51.100.7:7447#obfs_psk_base64=AAECAw==",
+        )]);
+        assert!(e.validate_transport_security().is_ok());
+        let e = env_of(&[(
+            "MATRIX_HS_ZENOH_CONNECT",
+            "obfs/198.51.100.9:7447#obfs_psk_base64=AAECAw==",
+        )]);
+        assert!(e.validate_transport_security().is_ok());
+    }
+
+    #[test]
+    fn plaintext_tcp_on_public_address_is_rejected() {
+        let e = env_of(&[("MATRIX_HS_ZENOH_LISTEN", "tcp/0.0.0.0:7448")]);
+        assert!(e.validate_transport_security().is_err());
+        let e = env_of(&[("MATRIX_HS_ZENOH_CONNECT", "tcp/198.51.100.9:7447")]);
+        assert!(e.validate_transport_security().is_err());
+        let msg = e.validate_transport_security().unwrap_err();
+        assert!(msg.contains("198.51.100.9"));
+    }
+
+    #[test]
+    fn mixed_endpoints_with_one_plaintext_public_is_rejected() {
+        // loopback OK + public tcp/ in the same var → still rejected
+        let e = env_of(&[(
+            "MATRIX_HS_ZENOH_LISTEN",
+            "tcp/127.0.0.1:7448,tcp/198.51.100.7:7449",
+        )]);
+        assert!(e.validate_transport_security().is_err());
+    }
+
+    #[test]
+    fn empty_or_unset_endpoints_are_allowed() {
+        let e = env_of(&[("MATRIX_HS_ZENOH_SCOUTING", "off")]);
+        assert!(e.validate_transport_security().is_ok());
+        let e = env_of(&[("MATRIX_HS_ZENOH_LISTEN", "")]);
+        assert!(e.validate_transport_security().is_ok());
     }
 }
