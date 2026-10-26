@@ -233,6 +233,83 @@ mod tests {
 
         println!("  === end survey ===\n");
     }
+    // redactions_grow_per_distinct_event:start
+    //   purpose: Close the gap in the redactions survey row. The main survey (step 5)
+    //            redacts the SAME event N times — that is idempotent by event_id (LWW
+    //            overwrite → 1 entry), so it reads as bounded and misses the real shape.
+    //            AppState::mark_redacted inserts into self.redactions keyed by
+    //            target_event_id with NO cap and NO eviction (state.rs:3169-3170). Redact
+    //            N DISTINCT events and the map grows to N — that is the leak.
+    //   input:  N distinct timeline events, each redacted once
+    //   output: () — prints redactions len before/after with a VERDICT line
+    //   sideEffects: in-memory AppState only
+    // redactions_grow_per_distinct_event:end
+    #[tokio::test]
+    #[ignore = "survey, not a gate: run with --ignored --nocapture"]
+    async fn redactions_grow_per_distinct_event() {
+        const N: usize = 50;
+
+        let state = AppState::new();
+        let app = router(state.clone());
+        let server = TestServer::new(app);
+        let alice = register_and_bearer(&server, "alice_redact").await;
+
+        let created: Value = server
+            .post("/_matrix/client/v3/createRoom")
+            .add_header(alice.0.clone(), alice.1.clone())
+            .json(&json!({}))
+            .await
+            .json();
+        let room = created["room_id"]
+            .as_str()
+            .expect("room_id from createRoom")
+            .to_string();
+
+        // Send N distinct events, capturing each event_id so each redaction targets
+        // a distinct key — the shape the survey's same-event probe could not exercise.
+        let mut victim_ids = Vec::with_capacity(N);
+        for i in 0..N {
+            let sent: Value = server
+                .put(&format!(
+                    "/_matrix/client/v3/rooms/{room}/send/m.room.message/txn-d{i}"
+                ))
+                .add_header(alice.0.clone(), alice.1.clone())
+                .bytes(axum::body::Bytes::from_static(b"redact me"))
+                .await
+                .json();
+            victim_ids.push(
+                sent["event_id"]
+                    .as_str()
+                    .expect("event_id from send")
+                    .to_string(),
+            );
+        }
+
+        let before = state.redactions.lock().expect("redactions").len();
+        println!("  redactions before: {before}");
+
+        for (i, victim) in victim_ids.iter().enumerate() {
+            server
+                .put(&format!(
+                    "/_matrix/client/v3/rooms/{room}/redact/{victim}/txn-r{i}"
+                ))
+                .add_header(alice.0.clone(), alice.1.clone())
+                .json(&json!({ "reason": "leak survey" }))
+                .await;
+        }
+
+        let after = state.redactions.lock().expect("redactions").len();
+        println!("  redactions after {N} distinct redacts: {after}");
+        println!(
+            "  VERDICT redactions: {before} → {after} {}",
+            if after >= N {
+                "— UNBOUNDED: grows per distinct redacted event, no cap or eviction"
+            } else {
+                "— capped or pruned"
+            }
+        );
+    }
+
     // typing_outer_map_grows_per_room_forever:start
     //   purpose: Close the second "NOT MEASURED" from the survey. The survey's typing row
     //            read 0 → 0, and the reason was the PROBE, not the code: it sent
