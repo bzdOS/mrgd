@@ -151,8 +151,8 @@ mod tests {
         };
 
         println!(
-            "\n  === leak survey: N = {N} per candidate; caps: roomlog_max_events={} timeline_max_events={} ===",
-            state.roomlog_max_events, state.timeline_max_events
+            "\n  === leak survey: N = {N} per candidate; caps: roomlog_max_events={} timeline_max_events={} redactions_max_entries={} ===",
+            state.roomlog_max_events, state.timeline_max_events, state.redactions_max_entries
         );
         sizes("before");
 
@@ -308,6 +308,82 @@ mod tests {
                 "— capped or pruned"
             }
         );
+    }
+
+    // redactions_cap_bounds_distinct_event_growth:start
+    //   purpose: Close the leak. The preceding test showed the redactions map grows to N
+    //            with no cap; this one pins a positive cap and drives N >> cap distinct
+    //            redactions through the real HTTP route, asserting the map never exceeds
+    //            the cap. Eviction is arbitrary (HashMap has no insertion order), but
+    //            safe: the map is rebuilt from the room journals on replay.
+    //   input:  cap = 7, N = 50 distinct redacted events
+    //   output: () — asserts redactions map len ≤ cap after N redacts
+    //   sideEffects: in-memory AppState only
+    // redactions_cap_bounds_distinct_event_growth:end
+    #[tokio::test]
+    #[ignore = "survey, not a gate: run with --ignored --nocapture"]
+    async fn redactions_cap_bounds_distinct_event_growth() {
+        const CAP: usize = 7;
+        const N: usize = 50;
+
+        let state = AppState::with_server_name_and_caps(
+            "localhost".to_string(),
+            0,
+            0,
+            CAP,
+        );
+        let app = router(state.clone());
+        let server = TestServer::new(app);
+        let alice = register_and_bearer(&server, "alice_cap").await;
+
+        let created: Value = server
+            .post("/_matrix/client/v3/createRoom")
+            .add_header(alice.0.clone(), alice.1.clone())
+            .json(&json!({}))
+            .await
+            .json();
+        let room = created["room_id"]
+            .as_str()
+            .expect("room_id from createRoom")
+            .to_string();
+
+        let mut victim_ids = Vec::with_capacity(N);
+        for i in 0..N {
+            let sent: Value = server
+                .put(&format!(
+                    "/_matrix/client/v3/rooms/{room}/send/m.room.message/txn-cd{i}"
+                ))
+                .add_header(alice.0.clone(), alice.1.clone())
+                .bytes(axum::body::Bytes::from_static(b"cap probe"))
+                .await
+                .json();
+            victim_ids.push(
+                sent["event_id"]
+                    .as_str()
+                    .expect("event_id from send")
+                    .to_string(),
+            );
+        }
+
+        for (i, victim) in victim_ids.iter().enumerate() {
+            server
+                .put(&format!(
+                    "/_matrix/client/v3/rooms/{room}/redact/{victim}/txn-cr{i}"
+                ))
+                .add_header(alice.0.clone(), alice.1.clone())
+                .json(&json!({ "reason": "cap probe" }))
+                .await;
+        }
+
+        let after = state.redactions.lock().expect("redactions").len();
+        println!(
+            "  redactions after {N} distinct redacts with cap={CAP}: {after}"
+        );
+        assert!(
+            after <= CAP,
+            "redactions map grew past cap: {after} > {CAP} — cap/eviction not enforced"
+        );
+        println!("  VERDICT: redactions capped at {CAP} (was unbounded, now bounded)");
     }
 
     // typing_outer_map_grows_per_room_forever:start

@@ -82,6 +82,7 @@ mod tests {
                 "localhost".to_string(),
                 timeline_cap,
                 roomlog_cap,
+                0,
             );
             let app = router(state.clone());
             let server = TestServer::new(app);
@@ -198,7 +199,7 @@ mod tests {
             if let Some(rest) = line.strip_prefix("std::env::var(\"") {
                 if let Some(end) = rest.find('"') {
                     let name = &rest[..end];
-                    if name.ends_with("_MAX_EVENTS") {
+                     if name.ends_with("_MAX_EVENTS") || name.ends_with("_MAX_ENTRIES") {
                         from_code.push(name.to_string());
                     }
                 }
@@ -214,7 +215,7 @@ mod tests {
             .lines()
             .filter_map(|l| l.trim().split('=').next())
             .map(|name| name.to_string())
-            .filter(|name| name.starts_with("MATRIX_HS_") && name.ends_with("_MAX_EVENTS"))
+             .filter(|name| name.starts_with("MATRIX_HS_") && (name.ends_with("_MAX_EVENTS") || name.ends_with("_MAX_ENTRIES")))
             .collect();
         from_fragment.sort();
         from_fragment.dedup();
@@ -225,7 +226,7 @@ mod tests {
 
         assert!(
             !from_code.is_empty(),
-            "no *_MAX_EVENTS env reads found in src/state.rs — this test is no longer \
+            "no *_MAX_EVENTS / *_MAX_ENTRIES env reads found in src/state.rs — this test is no longer \
              looking at what it thinks it is"
         );
         assert_eq!(
@@ -247,22 +248,26 @@ mod tests {
     //            whose caps would silently become 50 instead of 0. A test that can turn a
     //            green suite red by racing its neighbours does not belong in the default run.
     //            Run it alone: cargo test --offline --release env_path_feeds -- --ignored
-    //   input:  none — sets both cap variables, builds AppState, restores the environment
+    //   input:  none — sets all three cap variables, builds AppState, restores the environment
     //   output: () — asserts the caps arrived, and that the environment is left as found
-    //   sideEffects: sets and removes two environment variables for the duration
+    //   sideEffects: sets and removes three environment variables for the duration
     // env_path_feeds_the_caps:end
     #[test]
     #[ignore = "sets process-global env vars; run it alone, never as part of the suite"]
     fn env_path_feeds_the_caps() {
         const T: &str = "MATRIX_HS_TIMELINE_MAX_EVENTS";
         const R: &str = "MATRIX_HS_ROOMLOG_MAX_EVENTS";
+        const D: &str = "MATRIX_HS_REDACTIONS_MAX_ENTRIES";
         const WANT_T: usize = 1234;
         const WANT_R: usize = 5678;
+        const WANT_D: usize = 999;
 
         let prev_t = std::env::var(T).ok();
         let prev_r = std::env::var(R).ok();
+        let prev_d = std::env::var(D).ok();
         std::env::set_var(T, WANT_T.to_string());
         std::env::set_var(R, WANT_R.to_string());
+        std::env::set_var(D, WANT_D.to_string());
 
         let state = AppState::new();
 
@@ -276,10 +281,15 @@ mod tests {
             Some(v) => std::env::set_var(R, v),
             None => std::env::remove_var(R),
         }
+        match prev_d {
+            Some(v) => std::env::set_var(D, v),
+            None => std::env::remove_var(D),
+        }
 
         println!(
-            "  env path: timeline_max_events={} roomlog_max_events={} (asked for {WANT_T}/{WANT_R})",
-            state.timeline_max_events, state.roomlog_max_events
+            "  env path: timeline_max_events={} roomlog_max_events={} redactions_max_entries={} \
+             (asked for {WANT_T}/{WANT_R}/{WANT_D})",
+            state.timeline_max_events, state.roomlog_max_events, state.redactions_max_entries
         );
         assert_eq!(
             state.timeline_max_events, WANT_T,
@@ -289,6 +299,11 @@ mod tests {
         assert_eq!(
             state.roomlog_max_events, WANT_R,
             "{R} did not reach AppState::new() — the fragment would be read by a run that \
+             silently keeps the default"
+        );
+        assert_eq!(
+            state.redactions_max_entries, WANT_D,
+            "{D} did not reach AppState::new() — the fragment would be read by a run that \
              silently keeps the default"
         );
     }

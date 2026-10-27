@@ -1493,7 +1493,7 @@ mod persist_tests {
         use serde_json::json;
 
         // ── 1. explicit caps, and the timeline cap really trims ──────────────
-        let state = AppState::with_server_name_and_caps("localhost".to_string(), 1, 5);
+        let state = AppState::with_server_name_and_caps("localhost".to_string(), 1, 5, 7);
         assert_eq!(
             state.timeline_max_events, 1,
             "an explicitly passed timeline cap must reach the state"
@@ -1501,6 +1501,10 @@ mod persist_tests {
         assert_eq!(
             state.roomlog_max_events, 5,
             "an explicitly passed roomlog cap must reach the state"
+        );
+        assert_eq!(
+            state.redactions_max_entries, 7,
+            "an explicitly passed redactions cap must reach the state"
         );
         for i in 0..3 {
             state.append_room_timeline(
@@ -1522,9 +1526,11 @@ mod persist_tests {
         const HUGE: &str = "100000";
         std::env::set_var("MATRIX_HS_TIMELINE_MAX_EVENTS", HUGE);
         std::env::set_var("MATRIX_HS_ROOMLOG_MAX_EVENTS", HUGE);
+        std::env::set_var("MATRIX_HS_REDACTIONS_MAX_ENTRIES", HUGE);
         let from_env = AppState::with_server_name("localhost".to_string());
         std::env::remove_var("MATRIX_HS_TIMELINE_MAX_EVENTS");
         std::env::remove_var("MATRIX_HS_ROOMLOG_MAX_EVENTS");
+        std::env::remove_var("MATRIX_HS_REDACTIONS_MAX_ENTRIES");
 
         assert_eq!(
             from_env.timeline_max_events, 100_000,
@@ -1535,6 +1541,10 @@ mod persist_tests {
             from_env.roomlog_max_events, 100_000,
             "with_server_name must read MATRIX_HS_ROOMLOG_MAX_EVENTS, not hardcode 0"
         );
+        assert_eq!(
+            from_env.redactions_max_entries, 100_000,
+            "with_server_name must read MATRIX_HS_REDACTIONS_MAX_ENTRIES, not hardcode 0"
+        );
 
         // ── 3. unset means unlimited, and that is still the default ──────────
         let defaults = AppState::with_server_name("localhost".to_string());
@@ -1543,6 +1553,11 @@ mod persist_tests {
             (0, 0),
             "with the variables unset both caps must be 0 (unlimited) -- the fix must not \
              invent a bound that the operator did not ask for"
+        );
+        assert_eq!(
+            defaults.redactions_max_entries, 0,
+            "with the variable unset the redactions cap must be 0 (unlimited) -- \
+             the fix must not invent a bound that the operator did not ask for"
         );
     }
 

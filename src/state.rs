@@ -1415,7 +1415,17 @@ pub struct AppState {
     /// any event_id present here. The underlying room_timeline entry is left
     /// UNTOUCHED (masking is read-side only) — this keeps redaction idempotent
     /// and avoids racing writers that already hold a room_timeline lock.
+    /// Bounded by `redactions_max_entries` (0 = unlimited); when the cap is
+    /// exceeded, mark_redacted evicts excess entries. Eviction is safe because
+    /// the map is rebuilt on replay from the room journals — evicted entries
+    /// are restored on restart, so this is a memory bound, not a correctness bound.
     pub redactions: Mutex<HashMap<String, Value>>,
+    /// GC cap for AppState.redactions — the in-memory redaction record map
+    /// (event_id → redaction event JSON). 0 (default) = unlimited. When > 0,
+    /// mark_redacted evicts excess entries when the map grows past it. This
+    /// closes leak candidate #3 (redactions map grows unbounded per distinct
+    /// redacted event) without changing the read-side masking contract.
+    pub redactions_max_entries: usize,
 
     /// Matrix server name (e.g. "localhost").
     pub server_name: String,
@@ -1582,6 +1592,22 @@ fn roomlog_max_events_from_env() -> usize {
         .unwrap_or(0)
 }
 
+// redactions_max_entries_from_env:start
+//   purpose: Read the redactions map GC cap from MATRIX_HS_REDACTIONS_MAX_ENTRIES.
+//            0 (default) = unlimited. When > 0, mark_redacted evicts excess
+//            entries when the map grows past it, bounding memory used by the
+//            in-memory redaction record map (leak candidate #3).
+//   input:  none
+//   output: usize
+//   sideEffects: reads an environment variable
+// redactions_max_entries_from_env:end
+fn redactions_max_entries_from_env() -> usize {
+    std::env::var("MATRIX_HS_REDACTIONS_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 impl Default for AppState {
     fn default() -> Self {
         let server_name =
@@ -1628,6 +1654,7 @@ impl Default for AppState {
             scripting: crate::scripting::Scripting::default(),
             timeline_max_events: timeline_max_events_from_env(),
             roomlog_max_events: roomlog_max_events_from_env(),
+            redactions_max_entries: redactions_max_entries_from_env(),
         }
     }
 }
@@ -1657,6 +1684,7 @@ impl AppState {
             name,
             timeline_max_events_from_env(),
             roomlog_max_events_from_env(),
+            redactions_max_entries_from_env(),
         )
     }
 
@@ -1674,6 +1702,8 @@ impl AppState {
     //            timeline_max_events — retention cap for the per-room timeline
     //                                    (0 = unlimited)
     //            roomlog_max_events — GC cap for the RoomLog CRDT set (0 = unlimited)
+    //            redactions_max_entries — GC cap for the in-memory redactions map
+    //                                    (0 = unlimited)
     //   output: Arc<AppState>
     //   sideEffects: none
     // AppState::with_server_name_and_caps:end
@@ -1681,6 +1711,7 @@ impl AppState {
         name: String,
         timeline_max_events: usize,
         roomlog_max_events: usize,
+        redactions_max_entries: usize,
     ) -> Arc<Self> {
         let token_secret = crate::auth::TokenSecret::global().bytes().to_vec();
         let (signer, key_store) = build_signer(&name, None);
@@ -1694,6 +1725,7 @@ impl AppState {
             notify: Arc::new(tokio::sync::Notify::new()),
             room_timeline: Mutex::new(HashMap::new()),
             redactions: Mutex::new(HashMap::new()),
+            redactions_max_entries,
             server_name: name,
             public_base_url: None,
             users: Mutex::new(HashMap::new()),
@@ -1773,6 +1805,7 @@ impl AppState {
             scripting: crate::scripting::Scripting::default(),
             timeline_max_events: timeline_max_events_from_env(),
             roomlog_max_events: roomlog_max_events_from_env(),
+            redactions_max_entries: redactions_max_entries_from_env(),
         })
     }
 
@@ -1840,6 +1873,7 @@ impl AppState {
             scripting: crate::scripting::Scripting::default(),
             timeline_max_events: timeline_max_events_from_env(),
             roomlog_max_events: roomlog_max_events_from_env(),
+            redactions_max_entries: redactions_max_entries_from_env(),
         })
     }
 
@@ -3168,6 +3202,18 @@ impl AppState {
     ) -> Result<(), String> {
         let mut guard = self.redactions.lock().map_err(|e| e.to_string())?;
         guard.insert(target_event_id.to_string(), redaction_event);
+        if self.redactions_max_entries > 0 && guard.len() > self.redactions_max_entries {
+            // The redactions map is rebuilt on replay from the room journals
+            // (persist.rs), so evicting entries here is safe — evicted redactions
+            // are restored on restart. Eviction order from HashMap is arbitrary,
+            // which is acceptable because the cap is a memory bound, not a
+            // correctness bound.
+            let excess = guard.len() - self.redactions_max_entries;
+            let keys: Vec<String> = guard.keys().take(excess).cloned().collect();
+            for key in &keys {
+                guard.remove(key);
+            }
+        }
         Ok(())
     }
 
