@@ -21,6 +21,15 @@
 # testing a configuration nobody wrote down, so the recorder says so in the row and keeps
 # going — but the operator must treat an unreadable caps row as a STOP, not as a detail.
 #
+# BARECHAT TRAFFIC, ON ITS OWN COLUMN. The console clients are a declared part of the soak
+# load, and a run whose RSS is read against "the pair 2×0.5 msg/s" while a chat client is also
+# writing is measuring two things at once. The generator writes one line per successful send
+# ("barechat msg N sent + synced"), so its line count IS the client's traffic: the recorder
+# copies that running count into `barechat_total` (cumulative, so a restart of the recorder
+# does not lose it) and the verdict prints it as a line of its own. The column is never
+# folded into rss or mp_alloc — it says how much of the run was someone else's load, and the
+# reader subtracts it by choosing the rows outside those intervals.
+#
 # INTERACTIVE TRAFFIC. The service log has no per-request lines, so "was a client talking"
 # is measured by whether the served depth moved during the interval: moved = interactive,
 # unchanged = quiet. That is a proxy and is labelled as one. It only works while the depth
@@ -65,15 +74,21 @@
 #      poke_delta 0.0, and no new usr2 row in the memprobe file at all.
 #
 # Usage (must run as the process owner — see (2) — and must pass --memprobe — see (1)):
-#   scripts/soak-run.sh --pid N --memprobe CSV [--hours 6] [--interval 300]
-#                       [--token-file F] [--endpoint URL] [--log F]
+#   scripts/soak-run.sh --pid N --memprobe CSV [--hours 6] [--interval 600]
+#                       [--barechat-log F] [--token-file F] [--endpoint URL] [--log F]
+#
+# --interval defaults to 600 s: the soak card asks for a gauge sample every ten minutes, and
+# the warm-up below is three checkpoints, the same 30 minutes validated at the 300 s step.
+# --barechat-log is the console client's generator log; its successful sends are recorded in
+# barechat_total, one column of their own (see BARECHAT TRAFFIC above).
 
 set -eu
 
 PID=""
 HOURS=6
-INTERVAL=300
+INTERVAL=600
 MEMPROBE=""
+BARE_CHAT_LOG=""
 TOKEN_FILE=""
 ENDPOINT=""   # no default: a hardcoded address would be a deployment map in a public file
 LOG=""
@@ -85,6 +100,7 @@ while [ $# -gt 0 ]; do
 	--hours) HOURS=${2:?--hours needs a number}; shift 2 ;;
 	--interval) INTERVAL=${2:?--interval needs seconds}; shift 2 ;;
 	--memprobe) MEMPROBE=${2:?--memprobe needs a path}; shift 2 ;;
+	--barechat-log) BARE_CHAT_LOG=${2:?--barechat-log needs a path}; shift 2 ;;
 	--token-file) TOKEN_FILE=${2:?--token-file needs a path}; shift 2 ;;
 	--endpoint) ENDPOINT=${2:?--endpoint needs a url}; shift 2 ;;
 	--log) LOG=${2:?--log needs a path}; shift 2 ;;
@@ -100,7 +116,7 @@ mkdir -p "$(dirname "$LOG")"
 
 CSV="$LOG"
 GATE_LOG="${LOG%.csv}.gates.log"
-CSV_HDR='epoch,iso,caps_timeline,caps_roomlog,rss_mib,vsz_mib,rss_after_poke_mib,poke_delta_mib,d_rss_mib,rate_mib_h,mp_seq,mp_resident_mib,mp_alloc_mib,rooms,served_depth,d_depth,traffic,gate,not_observable,d_mp_alloc_mib,rate_mp_alloc_mib,slope_theilsen_mib_h,td_seen,typing_rooms,uia_sessions'
+CSV_HDR='epoch,iso,caps_timeline,caps_roomlog,rss_mib,vsz_mib,rss_after_poke_mib,poke_delta_mib,d_rss_mib,rate_mib_h,mp_seq,mp_resident_mib,mp_alloc_mib,rooms,served_depth,d_depth,traffic,gate,not_observable,d_mp_alloc_mib,rate_mp_alloc_mib,slope_theilsen_mib_h,td_seen,typing_rooms,uia_sessions,barechat_total'
 
 [ -s "$CSV" ] || echo "$CSV_HDR" > "$CSV"
 
@@ -108,10 +124,11 @@ CSV_HDR='epoch,iso,caps_timeline,caps_roomlog,rss_mib,vsz_mib,rss_after_poke_mib
 # Under `set -u` the previous order made a bare `env -u WARMUP_TICKS sh scripts/soak-run.sh`
 # die with rc=2 and "WARMUP_TICKS: parameter not set" at the say line — the runner could not
 # start on a fresh shell by its own usage, and that was measured, not guessed.
-# Default 6: six checkpoints at the 300 s interval is the 30-minute warm-up validated on the
-# stand — long enough to cover the post-restart replay and the allocator ramp, which is what
-# made the first version's gates fire on the settling.
-WARMUP_TICKS=${WARMUP_TICKS:-6}
+# Default 3: three checkpoints at the 600 s interval is the same 30-minute warm-up validated
+# on the stand — long enough to cover the post-restart replay and the allocator ramp, which is
+# what made the first version's gates fire on the settling. The number follows the sample step
+# (6 at 300 s) so the warm-up stays 30 minutes, not an arbitrary count of ticks.
+WARMUP_TICKS=${WARMUP_TICKS:-3}
 
 # The row is written on EVERY tick, warm-up included, and it carries the Theil-Sen
 # estimate. The estimate itself is only computed on ticks past the warm-up, so it has to
@@ -134,6 +151,12 @@ say "gates (LOG ONLY, no kill): mp_alloc growth >=+100MiB/h twice in a row — g
 say "warmup: first $WARMUP_TICKS checkpoints are labelled warmup and cannot trip a gate"
 [ "$NO_KILL" = "1" ] && say "VALIDATION MODE (--no-kill): gates are evaluated and logged, the server is NOT killed"
 say "structure gauges in csv: td_seen, typing_rooms (typing OUTER room keys), uia_sessions — the three maps formerly 'not observable'"
+if [ -n "$BARE_CHAT_LOG" ]; then
+	say "barechat traffic: cumulative successful sends from $BARE_CHAT_LOG recorded in column barechat_total, separate from rss/mp_alloc"
+	[ -r "$BARE_CHAT_LOG" ] || say "WARN: barechat log is not readable yet; barechat_total will read UNREADABLE until it appears"
+else
+	say "barechat traffic: no --barechat-log given — barechat_total is UNREADABLE and the console client's load is NOT separated"
+fi
 
 caps_of() {
 	# Capture, then judge. `ps eww` of another user's process yields nothing on FreeBSD,
@@ -258,6 +281,18 @@ last_field() { # last_field <column-index> — 1-based, header on line 1
 	awk -F, -v c="$1" 'NR>1 && NF>=2 {v=$c} END{print v+0}' "$CSV" 2>/dev/null || echo 0
 }
 
+# The console client's sends, counted from its own log. The generator's success line is
+# "barechat msg N sent + synced"; a line that only says a send was attempted is not counted,
+# so the number is traffic the server acknowledged, not traffic the client tried. The count is
+# CUMULATIVE on purpose: a per-interval delta cannot survive the recorder being restarted
+# mid-run (the first row after a restart has no previous count), and a soak is exactly the
+# run that gets restarted. The verdict differences consecutive rows.
+barechat_total() {
+	[ -n "$BARE_CHAT_LOG" ] || { echo "UNREADABLE"; return 0; }
+	[ -r "$BARE_CHAT_LOG" ] || { echo "UNREADABLE"; return 0; }
+	awk '/barechat msg/ && /sent \+ synced/ {n++} END{print n+0}' "$BARE_CHAT_LOG" 2>/dev/null || echo "UNREADABLE"
+}
+
 prev_rss=$(last_field 5)
 prev_mp_alloc=$(last_field 13)   # the series the growth gates are computed from
 prev_epoch=$(last_field 1)
@@ -370,6 +405,11 @@ EOF
 	depth=${depth_pair%%|*}
 	rooms=${depth_pair##*|}
 	[ -n "$depth" ] || depth="-"
+
+	# Read on EVERY row, warm-up included: the console client's load is a fact about the
+	# interval the row covers, and hiding it behind the warm-up would make the first three
+	# checkpoints of every run look quieter than they were.
+	barechat=$(barechat_total)
 	if [ "$first_row" != "1" ]; then
 		d_depth=$(awk -v a="$depth" -v b="$prev_depth" 'BEGIN{printf "%d", (a ~ /^[0-9]+$/ && b ~ /^[0-9]+$/) ? a-b : 0}')
 		if [ "$d_depth" -gt 0 ] 2>/dev/null; then traffic="interactive"; else traffic="quiet"; fi
@@ -462,7 +502,7 @@ EOF
 	fi
 	fi
 
-	echo "$epoch,$iso,$caps_t,$caps_r,$rss,$vsz,$rss_after,$poke_delta,$d_rss,$rate,$mp_seq,$mp_res,$mp_alloc,$rooms,$depth,$d_depth,$traffic,$gate,none,$d_mp,$rate_mp,$slope,$mp_td,$mp_typing,$mp_uia" >> "$CSV"
+	echo "$epoch,$iso,$caps_t,$caps_r,$rss,$vsz,$rss_after,$poke_delta,$d_rss,$rate,$mp_seq,$mp_res,$mp_alloc,$rooms,$depth,$d_depth,$traffic,$gate,none,$d_mp,$rate_mp,$slope,$mp_td,$mp_typing,$mp_uia,$barechat" >> "$CSV"
 
 	first_row=0
 	prev_rss=$rss; prev_mp_alloc=$mp_alloc; prev_epoch=$epoch; prev_depth=$depth

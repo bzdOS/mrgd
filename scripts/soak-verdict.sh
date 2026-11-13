@@ -76,6 +76,7 @@ C_DRSS=$(col d_rss_mib || true)
 C_MP=$(col mp_alloc_mib || true)
 C_SLOPE=$(col slope_theilsen_mib_h || true)
 C_GATE=$(col gate || true)
+C_BC=$(col barechat_total || true)
 [ -n "$C_EPOCH" ] && [ -n "$C_RSS" ] || {
 	echo "soak-verdict: header lacks epoch/rss_mib — refusing to report on guessed columns" >&2
 	exit 1
@@ -92,7 +93,7 @@ echo "  csv:  $CSV"
 awk -F, \
 	-v c_epoch="$C_EPOCH" -v c_iso="${C_ISO:-0}" -v c_rss="$C_RSS" \
 	-v c_drss="${C_DRSS:-0}" -v c_mp="${C_MP:-0}" -v c_slope="${C_SLOPE:-0}" \
-	-v c_gate="${C_GATE:-0}" -v gap="$GAP_SECONDS" -v gates_ok="$GATES_READABLE" -v gates="$GATES" \
+	-v c_gate="${C_GATE:-0}" -v c_bc="${C_BC:-0}" -v gap="$GAP_SECONDS" -v gates_ok="$GATES_READABLE" -v gates="$GATES" \
 	-v windows="$WINDOWS" '
 function push_delta(x) { if (nd < 5000) { nd++; d[nd] = x } }
 # Theil-Sen over the pairs of the points in GKX/GKY (sel=0) or AKX/AKY (sel=1), in MiB
@@ -162,6 +163,21 @@ NR == 1 { next }
 		slast = sv
 		ns++
 	}
+	# Console-client traffic, kept out of rss and mp_alloc: the column is a running
+	# count of the generator success lines, so consecutive rows give the traffic that
+	# belongs to THIS run. A count that falls means the log was rotated and the delta is
+	# not traffic — counted as a reset, never as a negative interval.
+	if (c_bc != "0" && $c_bc ~ /^[0-9]+$/) {
+		bcv = $c_bc + 0
+		if (bc_ok == 0) { bc_first = bcv; bc_last = bcv }
+		else {
+			bd = bcv - bc_last
+			if (bd < 0) bc_resets++
+			else { bc_sum += bd; if (bd > bc_max) bc_max = bd }
+			bc_last = bcv
+		}
+		bc_ok++
+	}
 	# which declared window, if any, this probe sits in
 	wi = 0
 	if ($c_iso != "" && $c_iso != "0")
@@ -198,6 +214,11 @@ END {
 	else
 		printf "  slope_theilsen (Theil-Sen, mp_alloc, МиБ/ч): последний=na min=na max=na (окно 2ч ещё не набрано)\n"
 	printf "  mp_alloc_mib: min=%.1f max=%.1f (размах %.1f)\n", mpmin, mpmax, mpmax - mpmin
+	if (c_bc != "0" && bc_ok > 0)
+		printf "  barechat (отдельно от rss/mp_alloc): сообщений в логе к концу=%d, за прогон=%d | за интервал max=%d, сбросов счётчика=%d\n", \
+			bc_last, bc_last - bc_first, bc_max, bc_resets + 0
+	else
+		printf "  barechat (отдельно от rss/mp_alloc): колонки/данных нет — трафик консольного клиента НЕ отделён\n"
 	if (nwin > 0) {
 		printf "  окна нагрузки: %d (из %s)\n", nwin, windows
 		for (i = 1; i <= nwin; i++) {
