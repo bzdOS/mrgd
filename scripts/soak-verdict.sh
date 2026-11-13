@@ -77,6 +77,7 @@ C_MP=$(col mp_alloc_mib || true)
 C_SLOPE=$(col slope_theilsen_mib_h || true)
 C_GATE=$(col gate || true)
 C_BC=$(col barechat_total || true)
+C_HF=$(col host_free_mib || true)
 [ -n "$C_EPOCH" ] && [ -n "$C_RSS" ] || {
 	echo "soak-verdict: header lacks epoch/rss_mib — refusing to report on guessed columns" >&2
 	exit 1
@@ -93,7 +94,7 @@ echo "  csv:  $CSV"
 awk -F, \
 	-v c_epoch="$C_EPOCH" -v c_iso="${C_ISO:-0}" -v c_rss="$C_RSS" \
 	-v c_drss="${C_DRSS:-0}" -v c_mp="${C_MP:-0}" -v c_slope="${C_SLOPE:-0}" \
-	-v c_gate="${C_GATE:-0}" -v c_bc="${C_BC:-0}" -v gap="$GAP_SECONDS" -v gates_ok="$GATES_READABLE" -v gates="$GATES" \
+	-v c_gate="${C_GATE:-0}" -v c_bc="${C_BC:-0}" -v c_hf="${C_HF:-0}" -v gap="$GAP_SECONDS" -v gates_ok="$GATES_READABLE" -v gates="$GATES" \
 	-v windows="$WINDOWS" '
 function push_delta(x) { if (nd < 5000) { nd++; d[nd] = x } }
 # Theil-Sen over the pairs of the points in GKX/GKY (sel=0) or AKX/AKY (sel=1), in MiB
@@ -178,6 +179,14 @@ NR == 1 { next }
 		}
 		bc_ok++
 	}
+	# Host free memory beside rss. A range only: another process on the host moves the same
+	# number, so this column says whether eviction is possible, never how much is leaking.
+	if (c_hf != "0" && $c_hf ~ /^[0-9.]+$/) {
+		hfv = $c_hf + 0
+		if (hf_n == 0) { hf_min = hfv; hf_max = hfv }
+		else { if (hfv < hf_min) hf_min = hfv; if (hfv > hf_max) hf_max = hfv }
+		hf_n++
+	}
 	# which declared window, if any, this probe sits in
 	wi = 0
 	if ($c_iso != "" && $c_iso != "0")
@@ -219,6 +228,10 @@ END {
 			bc_last, bc_last - bc_first, bc_max, bc_resets + 0
 	else
 		printf "  barechat (отдельно от rss/mp_alloc): колонки/данных нет — трафик консольного клиента НЕ отделён\n"
+	if (c_hf != "0" && hf_n > 0)
+		printf "  хост: свободно min=%.1f max=%.1f МиБ (%d проб) — наблюдаемая вытеснения, НЕ доказательство утечки\n", hf_min, hf_max, hf_n
+	else
+		printf "  хост: свободно — колонки/данных нет (host_free_mib UNREADABLE); плоский rss при этом ничего не различает\n"
 	if (nwin > 0) {
 		printf "  окна нагрузки: %d (из %s)\n", nwin, windows
 		for (i = 1; i <= nwin; i++) {

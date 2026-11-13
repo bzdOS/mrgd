@@ -21,6 +21,16 @@
 # testing a configuration nobody wrote down, so the recorder says so in the row and keeps
 # going — but the operator must treat an unreadable caps row as a STOP, not as a detail.
 #
+# HOST FREE MEMORY — WHY A FLAT RSS IS NOT ENOUGH. A soak that finds rss flat has two
+# possible readings, and they are opposites: (a) nothing accumulates, so there is no leak;
+# (b) the process leaks but the host evicts the pages, so rss stays flat while the host is
+# being eaten. The 2026-09-29 run said exactly the second and could not prove it — "the leak
+# is there, masked by host eviction" — because the recorder never looked at the host. The
+# column `host_free_mib` is host free memory, sampled beside rss at every checkpoint: rss flat
+# AND host_free flat means (a); rss flat while host_free falls means (b). It is an OBSERVABLE
+# OF EVICTION, not proof of a leak: other processes on the host move the same number, so the
+# verdict prints it as a range and never as a rate or a verdict.
+#
 # BARECHAT TRAFFIC, ON ITS OWN COLUMN. The console clients are a declared part of the soak
 # load, and a run whose RSS is read against "the pair 2×0.5 msg/s" while a chat client is also
 # writing is measuring two things at once. The generator writes one line per successful send
@@ -116,7 +126,7 @@ mkdir -p "$(dirname "$LOG")"
 
 CSV="$LOG"
 GATE_LOG="${LOG%.csv}.gates.log"
-CSV_HDR='epoch,iso,caps_timeline,caps_roomlog,rss_mib,vsz_mib,rss_after_poke_mib,poke_delta_mib,d_rss_mib,rate_mib_h,mp_seq,mp_resident_mib,mp_alloc_mib,rooms,served_depth,d_depth,traffic,gate,not_observable,d_mp_alloc_mib,rate_mp_alloc_mib,slope_theilsen_mib_h,td_seen,typing_rooms,uia_sessions,barechat_total'
+CSV_HDR='epoch,iso,caps_timeline,caps_roomlog,rss_mib,vsz_mib,rss_after_poke_mib,poke_delta_mib,d_rss_mib,rate_mib_h,mp_seq,mp_resident_mib,mp_alloc_mib,rooms,served_depth,d_depth,traffic,gate,not_observable,d_mp_alloc_mib,rate_mp_alloc_mib,slope_theilsen_mib_h,td_seen,typing_rooms,uia_sessions,barechat_total,host_free_mib'
 
 [ -s "$CSV" ] || echo "$CSV_HDR" > "$CSV"
 
@@ -293,6 +303,27 @@ barechat_total() {
 	awk '/barechat msg/ && /sent \+ synced/ {n++} END{print n+0}' "$BARE_CHAT_LOG" 2>/dev/null || echo "UNREADABLE"
 }
 
+# Host free memory, read without root: both knobs are world-readable. The binary is resolved
+# explicitly because this environment's PATH does not carry /sbin, and a bare `sysctl` that
+# is simply not found would be indistinguishable from a host that answered nothing. A knob
+# that does not return a number yields UNREADABLE, exactly as a missing barechat log does, so
+# an absent observable is never quoted as a flat zero.
+SYSCTL=$(command -v sysctl 2>/dev/null || true)
+if [ -z "$SYSCTL" ]; then
+	for _c in /sbin/sysctl /usr/sbin/sysctl; do
+		[ -x "$_c" ] && { SYSCTL=$_c; break; }
+	done
+fi
+
+host_free_mib() {
+	[ -n "$SYSCTL" ] || { echo "UNREADABLE"; return 0; }
+	_fc=$("$SYSCTL" -n vm.stats.vm.v_free_count 2>/dev/null || echo "")
+	_ps=$("$SYSCTL" -n vm.stats.vm.v_page_size 2>/dev/null || echo "")
+	case "$_fc" in ''|*[!0-9]*) echo "UNREADABLE"; return 0 ;; esac
+	case "$_ps" in ''|*[!0-9]*) echo "UNREADABLE"; return 0 ;; esac
+	awk -v c="$_fc" -v p="$_ps" 'BEGIN{printf "%.1f", c*p/1048576}'
+}
+
 prev_rss=$(last_field 5)
 prev_mp_alloc=$(last_field 13)   # the series the growth gates are computed from
 prev_epoch=$(last_field 1)
@@ -410,6 +441,9 @@ EOF
 	# interval the row covers, and hiding it behind the warm-up would make the first three
 	# checkpoints of every run look quieter than they were.
 	barechat=$(barechat_total)
+	# Sampled beside rss, in the same tick: the pair is what separates "flat because nothing
+	# accumulates" from "flat while the host is being evicted".
+	host_free=$(host_free_mib)
 	if [ "$first_row" != "1" ]; then
 		d_depth=$(awk -v a="$depth" -v b="$prev_depth" 'BEGIN{printf "%d", (a ~ /^[0-9]+$/ && b ~ /^[0-9]+$/) ? a-b : 0}')
 		if [ "$d_depth" -gt 0 ] 2>/dev/null; then traffic="interactive"; else traffic="quiet"; fi
@@ -502,7 +536,7 @@ EOF
 	fi
 	fi
 
-	echo "$epoch,$iso,$caps_t,$caps_r,$rss,$vsz,$rss_after,$poke_delta,$d_rss,$rate,$mp_seq,$mp_res,$mp_alloc,$rooms,$depth,$d_depth,$traffic,$gate,none,$d_mp,$rate_mp,$slope,$mp_td,$mp_typing,$mp_uia,$barechat" >> "$CSV"
+	echo "$epoch,$iso,$caps_t,$caps_r,$rss,$vsz,$rss_after,$poke_delta,$d_rss,$rate,$mp_seq,$mp_res,$mp_alloc,$rooms,$depth,$d_depth,$traffic,$gate,none,$d_mp,$rate_mp,$slope,$mp_td,$mp_typing,$mp_uia,$barechat,$host_free" >> "$CSV"
 
 	first_row=0
 	prev_rss=$rss; prev_mp_alloc=$mp_alloc; prev_epoch=$epoch; prev_depth=$depth

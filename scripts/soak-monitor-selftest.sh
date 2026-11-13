@@ -14,7 +14,11 @@
 #      asks for are really read from the probe line;
 #   4. rate_mp_alloc_mib_h is computed and non-zero: MiB/h is derived, not printed as 0;
 #   5. soak-verdict prints the barechat line with the same count;
-#   6. the default sample step is 600 s and the default warm-up is 3 checkpoints.
+#   6. the default sample step is 600 s and the default warm-up is 3 checkpoints;
+#   7. host_free_mib is a number > 0. That column exists to tell apart the two readings of a
+#      flat rss: "rss flat because nothing accumulates (host free steady)" and "rss flat while
+#      the host is being evicted (host free falling)". The check only proves the number is
+#      read; the eviction reading is the verdict's range, never a proof.
 #
 # Each check prints PASS or FAIL with the value it read, and the script exits non-zero if any
 # check failed. It starts and stops only processes it started itself, by exact pid.
@@ -140,6 +144,7 @@ C_TD=$(col td_seen)
 C_TY=$(col typing_rooms)
 C_UI=$(col uia_sessions)
 C_RATE=$(col rate_mp_alloc_mib_h)
+C_HF=$(col host_free_mib)
 C_ISO=$(col iso)
 
 # The writers keep appending until the recorder exits, so the honest expectation is the
@@ -164,6 +169,8 @@ check "uia_sessions is a number" \
 	"$(last "$C_UI" | awk '{print ($1 ~ /^[0-9]+$/ && $1 > 0) ? "ok" : "bad:" $1}')" "ok"
 check "rate_mp_alloc_mib_h derived (non-zero)" \
 	"$(last "$C_RATE" | awk '{print ($1 == "0.00" || $1 == "0") ? "bad:" $1 : "ok"}')" "ok"
+check "host_free_mib numeric (>0)" \
+	"$(last "$C_HF" | awk '{print ($1 ~ /^[0-9.]+$/ && $1 > 0) ? "ok" : "bad:" $1}')" "ok"
 
 # ── the verdict reads the column, on its own line ────────────────────────────────────────
 sh "$SCRIPT_DIR/soak-verdict.sh" --csv "$CSV" --gates "${CSV%.csv}.gates.log" \
