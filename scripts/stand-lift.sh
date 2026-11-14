@@ -88,7 +88,9 @@ esac
 # A tcp/ endpoint on 0.0.0.0, a public IP, or a hostname is a bug — refuse
 # the lift so the process never starts that way. Only tcp/ on loopback
 # (127.0.0.1, ::1, localhost) or an obfs/tls carrier is accepted.
-for _zen in "$MATRIX_HS_ZENOH_LISTEN" "$MATRIX_HS_ZENOH_CONNECT"; do
+# ZENOH_* are OPTIONAL: under `set -u` a bare "$VAR" aborts the lift with
+# "parameter not set" when the env file omits them, hence ${VAR:-} throughout.
+for _zen in "${MATRIX_HS_ZENOH_LISTEN:-}" "${MATRIX_HS_ZENOH_CONNECT:-}"; do
 	[ -z "$_zen" ] && continue
 	for _ep in $(echo "$_zen" | tr ',' ' '); do
 		case "$_ep" in
@@ -203,7 +205,13 @@ fi
 # поднять сокет (занятый порт, битый конфиг) — и следующий ход увидит стенд
 # лежащим и не поймёт почему. Тот же адресный тест, что и в гейте 3: строка
 # соседа на ДРУГОМ адресе того же порта подъёмом считаться не может.
-_wait=30
+# Ожидание настраиваемое: replay данных на живом стенде идёт ~35 с, 30 с давало
+# ложное «НЕ поднялся» при нормально поднимающемся процессе.
+_wait=${STAND_WAIT:-90}
+case "$_wait" in
+	''|*[!0-9]*) echo "stand-lift: STAND_WAIT='$_wait' — нужно целое число секунд." >&2; exit 2 ;;
+esac
+_t0=$(date +%s)
 # Итоговое время ожидания держим ОТДЕЛЬНО: счётчик ниже обнуляется циклом, и
 # печатать его в сообщении об отказе нельзя — оператор читал «не поднялся за
 # 0с» после тридцати секунд ожидания и искал не тот адрес (проверено 02.10 на
@@ -211,13 +219,13 @@ _wait=30
 _wait_total=$_wait
 while [ "$_wait" -gt 0 ]; do
 	if addr_taken; then
-		echo "stand-lift: ПОДНЯТ. $(sockstat -4 -l -p "$LISTEN_PORT" | grep -E "$ADDR_TAKEN")"
+		echo "stand-lift: ПОДНЯТ за $(( $(date +%s) - _t0 ))с. $(sockstat -4 -l -p "$LISTEN_PORT" | grep -E "$ADDR_TAKEN")"
 		exit 0
 	fi
 	sleep 1
 	_wait=$(( _wait - 1 ))
 done
 
-echo "stand-lift: НЕ поднялся за ${_wait_total}с — адрес $LISTEN_HOST:$LISTEN_PORT молчит." >&2
+echo "stand-lift: НЕ поднялся за $(( $(date +%s) - _t0 ))с (бюджет ${_wait_total}с, STAND_WAIT) — адрес $LISTEN_HOST:$LISTEN_PORT молчит." >&2
 tail -5 "$LOG" >&2 2>/dev/null || :
 exit 1
