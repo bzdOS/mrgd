@@ -1465,9 +1465,7 @@ mod cluster_tests {
     // silently dropped (Zenoh pub/sub has no replay for late subscribers).
     // This mirrors the identical delay in zenoh_crdt_roomlog_convergence (crdt.rs §1583).
     async fn open_pair() -> (Arc<ZenohCrdtSink>, Arc<ZenohCrdtSink>) {
-        let cfg = zenoh::Config::default();
-        let sess_a = zenoh::open(cfg.clone()).await.expect("session a");
-        let sess_b = zenoh::open(cfg).await.expect("session b");
+        let [sess_a, sess_b] = crate::test_util::open_mesh().await;
         let sink_a = Arc::new(
             ZenohCrdtSink::new(sess_a, "mrgd/coupling/barrier/test")
                 .await

@@ -2362,6 +2362,8 @@ mod tests {
                 &format!("[\"obfs/127.0.0.1:{port}#obfs_psk_base64={psk_bad}\"]"),
             )
             .unwrap();
+        // Dial-only: without this the default listen (tcp/[::]:0, every interface) is opened.
+        cfg_bad.insert_json5("listen/endpoints", "[]").unwrap();
         cfg_bad.insert_json5("scouting/multicast/enabled", "false").unwrap();
         cfg_bad.insert_json5("scouting/gossip/enabled", "false").unwrap();
         let sess_bad = zenoh::open(cfg_bad).await.expect("session opens");

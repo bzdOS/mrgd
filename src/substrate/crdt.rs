@@ -1715,11 +1715,7 @@ mod tests {
         // ── Open two Zenoh sessions in peer mode on localhost ─────────────────
         // Both sessions use the default config (no connect/listen — peer mode with
         // multicast/gossip scouting on loopback). Zenoh discovers peers automatically.
-        let cfg_a = zenoh::Config::default();
-        let cfg_b = zenoh::Config::default();
-
-        let sess_a = zenoh::open(cfg_a).await.expect("zenoh session A");
-        let sess_b = zenoh::open(cfg_b).await.expect("zenoh session B");
+        let [sess_a, sess_b] = crate::test_util::open_mesh().await;
 
         // ── Create two ZenohCrdtSink instances ────────────────────────────────
         let sink_a = ZenohCrdtSink::new(sess_a, prefix).await.expect("sink A");

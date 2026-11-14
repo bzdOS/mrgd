@@ -136,6 +136,8 @@ pub(crate) mod test_util {
     //   sideEffects: binds the loopback port for the session's lifetime
     // open_at:end
     pub(crate) async fn open_at(listen: &str, connect: &[String]) -> zenoh::Session {
+        assert_loopback_endpoint(listen);
+        connect.iter().for_each(|c| assert_loopback_endpoint(c));
         let mut cfg = zenoh::Config::default();
         cfg.insert_json5("listen/endpoints", &format!("[\"{listen}\"]"))
             .expect("zenoh listen config");
@@ -149,6 +151,34 @@ pub(crate) mod test_util {
         cfg.insert_json5("scouting/gossip/enabled", "false")
             .expect("zenoh gossip config");
         zenoh::open(cfg).await.expect("isolated zenoh session")
+    }
+
+    // assert_loopback_endpoint:start
+    //   purpose: Guard for the rule "a test may only listen on 127.0.0.1": panics unless the
+    //            endpoint is `<proto>/127.0.0.1:<port>[#config]`. Called by `open_at` for
+    //            every listen and connect endpoint, so no helper-built session can bind a
+    //            public interface (wildcard, [::], a LAN address) by accident.
+    //   input:  zenoh endpoint string
+    //   output: nothing; panics on a non-loopback host
+    //   sideEffects: none
+    // assert_loopback_endpoint:end
+    pub(crate) fn assert_loopback_endpoint(ep: &str) {
+        let host_port = ep.split_once('/').map(|(_, r)| r).unwrap_or("");
+        let host_port = host_port.split('#').next().unwrap_or("");
+        let ok = host_port.starts_with("127.0.0.1:");
+        assert!(ok, "test zenoh endpoint must be loopback (127.0.0.1), got {ep:?}");
+    }
+
+    #[test]
+    fn loopback_guard_accepts_loopback_only() {
+        assert_loopback_endpoint("tcp/127.0.0.1:0");
+        assert_loopback_endpoint("obfs/127.0.0.1:7447#obfs_psk_base64=AAAA");
+        for bad in ["tcp/[::]:0", "tcp/0.0.0.0:0", "tcp/192.0.2.1:7447", "tcp/localhost:1", ""] {
+            assert!(
+                std::panic::catch_unwind(|| assert_loopback_endpoint(bad)).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     pub(crate) async fn open_mesh<const N: usize>() -> [zenoh::Session; N] {

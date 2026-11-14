@@ -491,14 +491,13 @@ mod seam_test {
         let _zg = crate::test_util::ZENOH_TEST_LOCK.acquire().await.unwrap();
         use crate::state::{ClusterConfig, ClusterState};
 
-        let prefix = "mrgd/matrix/room/media-fetch-test";
+        let prefix_owned = crate::test_util::unique_prefix("mrgd/matrix/room/media-fetch-test");
+        let prefix = prefix_owned.as_str();
         let media_id = "test-media-id-abc";
         // Deliberately includes bytes that a text-oriented codec would mangle.
         let blob: Vec<u8> = (0u8..=255).chain(0u8..=64).collect();
 
-        let sess_root = zenoh::open(zenoh::Config::default())
-            .await
-            .expect("Zenoh session root");
+        let [sess_root] = crate::test_util::open_mesh().await;
         let sess_b = sess_root.clone();
 
         // ── Node A: holds the blob, and serves it on the media queryable ──────
@@ -586,10 +585,9 @@ mod seam_test {
         let _zg = crate::test_util::ZENOH_TEST_LOCK.acquire().await.unwrap();
         use crate::state::ClusterConfig;
 
-        let prefix = "mrgd/matrix/room/media-miss-test";
-        let sess = zenoh::open(zenoh::Config::default())
-            .await
-            .expect("Zenoh session");
+        let prefix_owned = crate::test_util::unique_prefix("mrgd/matrix/room/media-miss-test");
+        let prefix = prefix_owned.as_str();
+        let [sess] = crate::test_util::open_mesh().await;
         let state = AppState::with_cluster(ClusterConfig {
             session: sess,
             key_prefix: prefix.to_string(),

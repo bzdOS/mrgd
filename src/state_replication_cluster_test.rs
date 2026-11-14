@@ -90,12 +90,7 @@ mod tests {
     async fn state_replication_membership_converges() {
         let _zg = crate::test_util::ZENOH_TEST_LOCK.acquire().await.unwrap();
         // ── Two Zenoh peer sessions ────────────────────────────────────────────
-        let sess_a = zenoh::open(zenoh::Config::default())
-            .await
-            .expect("zenoh session A");
-        let sess_b = zenoh::open(zenoh::Config::default())
-            .await
-            .expect("zenoh session B");
+        let [sess_a, sess_b] = crate::test_util::open_mesh().await;
 
         let prefix = "mrgd/matrix/room/state-cluster-test-0";
 
