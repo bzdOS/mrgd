@@ -32,6 +32,7 @@ use zenoh_protocol::{
 use zenoh_result::{zerror, ZResult};
 
 mod crypto;
+mod reject;
 mod unicast;
 
 pub use crypto::{PreSharedKey, StaticServerKey, KEY_LEN, MAX_PAYLOAD};

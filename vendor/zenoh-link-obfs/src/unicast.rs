@@ -48,6 +48,7 @@ use zenoh_result::{bail, zerror, ZResult};
 
 use crate::{
     crypto::{ObfsStream, StaticServerKey},
+    reject,
     load_psk, OBFS_ACCEPT_THROTTLE_TIME, OBFS_DEFAULT_MTU, OBFS_LINGER_TIMEOUT,
     OBFS_LOCATOR_PREFIX,
 };
@@ -566,6 +567,27 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastObfs {
     // get_locators:end
 }
 
+/// Run the server-side handshake and first-frame authentication under one
+/// deadline. On any failure the connection is dropped (closing the fd), the
+/// rejection is counted and (rate-limited) logged, and `None` is returned.
+async fn guarded_accept(
+    tcp_stream: TcpStream,
+    dst_addr: SocketAddr,
+    server_static: &StaticServerKey,
+    deadline: Duration,
+) -> Option<ObfsStream<TcpStream>> {
+    match ObfsStream::accept_authenticated(tcp_stream, server_static, deadline).await {
+        Ok(stream) => {
+            eprintln!("[obfs-accept] Handshake OK from {:?}", dst_addr);
+            Some(stream)
+        }
+        Err((reason, e)) => {
+            reject::record(dst_addr, reason, &e);
+            None
+        }
+    }
+}
+
 // accept_task:start
 //   purpose: Accept incoming TCP connections, perform AEAD handshake, deliver established links to the Zenoh channel.
 //   input:  socket: TcpListener — the bound TCP listener; server_static: Arc<StaticServerKey> — the server static key for handshake; token: CancellationToken — cancellation signal; manager: NewLinkChannelSender — channel to send new links
@@ -588,8 +610,14 @@ async fn accept_task(
 
     tracing::trace!("Ready to accept obfs connections on: {:?}", src_addr);
     eprintln!("[obfs-accept] ENTERING_LOOP");
+    let mut summary_tick = tokio::time::interval(Duration::from_secs(60));
+    summary_tick.tick().await; // first tick is immediate
     loop {
         tokio::select! {
+            _ = summary_tick.tick() => {
+                reject::flush_summary();
+            }
+
             _ = token.cancelled() => {
                 eprintln!("[obfs-accept] CANCELLED — loop exit");
                 break;
@@ -620,8 +648,8 @@ async fn accept_task(
                         // or malicious peer cannot stall other connections.
                         zenoh_runtime::ZRuntime::Acceptor.spawn(async move {
                             eprintln!("[obfs-accept] Starting handshake with {:?}", dst_addr);
-                            match ObfsStream::accept(tcp_stream, &server_static).await {
-                                Ok(obfs_stream) => {
+                            match guarded_accept(tcp_stream, dst_addr, &server_static, reject::handshake_timeout()).await {
+                                Some(obfs_stream) => {
                                     eprintln!("[obfs-accept] Handshake OK from {:?}", dst_addr);
                                     tracing::debug!(
                                         "Accepted obfs connection on {:?}: {:?}",
@@ -649,13 +677,7 @@ async fn accept_task(
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    eprintln!("[obfs-accept] Handshake FAILED from {:?}: {}", dst_addr, e);
-                                    tracing::debug!(
-                                        "obfs handshake (accept) from {:?} failed: {}",
-                                        dst_addr, e
-                                    );
-                                }
+                                None => {} // rejection already recorded by guarded_accept
                             }
                         });
                     }
@@ -671,3 +693,94 @@ async fn accept_task(
     Ok(())
 }
 // accept_task:end
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::PreSharedKey;
+    use crate::reject::RejectReason;
+    use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn pair() -> (TcpStream, TcpStream, SocketAddr) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let c = TcpStream::connect(addr).await.unwrap();
+        let (s, peer) = l.accept().await.unwrap();
+        (c, s, peer)
+    }
+
+    fn key(b: u8) -> (PreSharedKey, StaticServerKey) {
+        let psk = PreSharedKey([b; crate::KEY_LEN]);
+        let k = StaticServerKey::derive_from_psk(&psk);
+        (psk, k)
+    }
+
+    #[tokio::test]
+    async fn silent_client_is_closed_after_deadline() {
+        let before = reject::totals();
+        let (mut client, server, peer) = pair().await;
+        let (_, k) = key(1);
+        let t0 = Instant::now();
+        let r = guarded_accept(server, peer, &k, Duration::from_secs(2)).await;
+        let dt = t0.elapsed();
+        assert!(r.is_none());
+        assert!(dt >= Duration::from_millis(1900) && dt < Duration::from_secs(4), "{dt:?}");
+        // The server side was dropped: the silent client observes EOF.
+        let mut b = [0u8; 1];
+        assert_eq!(client.read(&mut b).await.unwrap(), 0);
+        // Counters are process-global and tests run in parallel: require >= 1.
+        assert!(reject::totals()[RejectReason::Timeout as usize] > before[RejectReason::Timeout as usize]);
+    }
+
+    #[tokio::test]
+    async fn partial_hello_times_out() {
+        let before = reject::totals();
+        let (mut client, server, peer) = pair().await;
+        let (_, k) = key(1);
+        client.write_all(&[0x16, 0x03, 0x01, 0x00, 0xc8, 0x01]).await.unwrap();
+        let r = guarded_accept(server, peer, &k, Duration::from_secs(1)).await;
+        assert!(r.is_none());
+        let after = reject::totals();
+        assert!(after[RejectReason::Timeout as usize] > before[RejectReason::Timeout as usize]);
+    }
+
+    #[tokio::test]
+    async fn wrong_psk_is_rejected_as_auth() {
+        let before = reject::totals();
+        let (client, server, peer) = pair().await;
+        let (_, server_key) = key(1);
+        let (bad_psk, _) = key(2);
+        let c = tokio::spawn(async move {
+            let mut s = ObfsStream::connect(client, &bad_psk).await.unwrap();
+            s.write_frames(b"first frame").await.unwrap();
+            s.flush().await.unwrap();
+            // Server must close on us.
+            let mut b = [0u8; 16];
+            s.inner_mut().read(&mut b).await.unwrap_or(0)
+        });
+        let r = guarded_accept(server, peer, &server_key, Duration::from_secs(5)).await;
+        assert!(r.is_none());
+        let n = c.await.unwrap();
+        assert_eq!(n, 0, "server must close the connection");
+        let after = reject::totals();
+        assert!(after[RejectReason::Auth as usize] > before[RejectReason::Auth as usize]);
+    }
+
+    #[tokio::test]
+    async fn right_psk_first_frame_is_preserved() {
+        let (client, server, peer) = pair().await;
+        let (psk, k) = key(3);
+        let c = tokio::spawn(async move {
+            let mut s = ObfsStream::connect(client, &psk).await.unwrap();
+            s.write_frames(b"hello").await.unwrap();
+            s.flush().await.unwrap();
+            s
+        });
+        let mut srv = guarded_accept(server, peer, &k, Duration::from_secs(5)).await.expect("ok");
+        let mut buf = [0u8; 5];
+        srv.read_exact_into(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+        drop(c.await.unwrap());
+    }
+}

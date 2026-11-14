@@ -44,6 +44,7 @@
 // 32 bytes — the representative itself, uniformly random end-to-end.
 //
 use core::fmt;
+use crate::reject::RejectReason;
 
 // hex_repr:start
 //   purpose: Format a 32-byte array as a lowercase hex string for debug logging.
@@ -176,26 +177,46 @@ async fn tls_read_random<S: tokio::io::AsyncRead + Unpin>(
     expected_hs_type: u8,
     label: &str,
 ) -> ZResult<[u8; 32]> {
-    let mut hdr = [0u8; 5];
-    s.read_exact(&mut hdr)
+    tls_read_random_kind(s, expected_hs_type, label)
         .await
-        .map_err(|e| zerror!("obfs/tls: failed to read record header ({label}): {e}"))?;
+        .map_err(|(_, e)| e)
+}
+
+/// Same as `tls_read_random` but classifies the failure (EOF vs malformed).
+async fn tls_read_random_kind<S: tokio::io::AsyncRead + Unpin>(
+    s: &mut S,
+    expected_hs_type: u8,
+    label: &str,
+) -> Result<[u8; 32], (RejectReason, zenoh_result::Error)> {
+    // Any read I/O error (EOF, reset, abort) means the peer went away.
+    let io_kind = |_: &std::io::Error| RejectReason::Eof;
+    let mut hdr = [0u8; 5];
+    s.read_exact(&mut hdr).await.map_err(|e| {
+        (io_kind(&e), zerror!("obfs/tls: failed to read record header ({label}): {e}").into())
+    })?;
     if hdr[0] != 0x16 {
-        return Err(zerror!("obfs/tls: {label}: expected Handshake record 0x16, got {:#04x}", hdr[0]).into());
+        return Err((
+            RejectReason::BadHello,
+            zerror!("obfs/tls: {label}: expected Handshake record 0x16, got {:#04x}", hdr[0]).into(),
+        ));
     }
     let record_len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
     // Minimum: hs_header(4) + version(2) + random(32) = 38
     if record_len < 38 {
-        return Err(zerror!("obfs/tls: {label}: record too short: {record_len}").into());
+        return Err((
+            RejectReason::BadHello,
+            zerror!("obfs/tls: {label}: record too short: {record_len}").into(),
+        ));
     }
     let mut body = vec![0u8; record_len];
-    s.read_exact(&mut body)
-        .await
-        .map_err(|e| zerror!("obfs/tls: failed to read {label} body: {e}"))?;
+    s.read_exact(&mut body).await.map_err(|e| {
+        (io_kind(&e), zerror!("obfs/tls: failed to read {label} body: {e}").into())
+    })?;
     if body[0] != expected_hs_type {
-        return Err(
+        return Err((
+            RejectReason::BadHello,
             zerror!("obfs/tls: {label}: expected hs type {expected_hs_type:#04x}, got {:#04x}", body[0]).into(),
-        );
+        ));
     }
     // body layout: type(1) + length(3) + version(2) + random(32) + ...
     // index 6..38 = random
@@ -685,6 +706,62 @@ where
     }
     // accept:end
 
+    /// Server-side handshake plus first-frame authentication, bounded by one
+    /// overall deadline. Reads and decrypts the first AEAD record (kept in the
+    /// read carry, so no data is lost) before the stream is handed on. Failures
+    /// are classified: `timeout` / `bad-hello` / `auth` / `eof`.
+    // accept_authenticated:start
+    pub async fn accept_authenticated(
+        inner: S,
+        server_static: &StaticServerKey,
+        deadline: core::time::Duration,
+    ) -> Result<ObfsStream<S>, (RejectReason, zenoh_result::Error)> {
+        let fut = Self::accept_authenticated_inner(inner, server_static);
+        match tokio::time::timeout(deadline, fut).await {
+            Ok(r) => r,
+            Err(_) => Err((
+                RejectReason::Timeout,
+                zerror!("handshake/first frame not completed within {}s", deadline.as_secs_f32()).into(),
+            )),
+        }
+    }
+
+    async fn accept_authenticated_inner(
+        mut inner: S,
+        server_static: &StaticServerKey,
+    ) -> Result<ObfsStream<S>, (RejectReason, zenoh_result::Error)> {
+        let client_repr = tls_read_random_kind(&mut inner, 0x01, "ClientHello").await?;
+        let client_eph_pub = decode_representative(&client_repr)
+            .map_err(|e| (RejectReason::BadHello, e))?;
+        let (server_secret, server_eph_pub, server_repr) =
+            gen_ephemeral_elligator().map_err(|e| (RejectReason::BadHello, e))?;
+        let eof = |e: std::io::Error| {
+            (RejectReason::Eof, zerror!("obfs handshake: failed to send server hello: {e}").into())
+        };
+        inner.write_all(&tls_server_hello(&server_repr)).await.map_err(eof)?;
+        inner.flush().await.map_err(eof)?;
+        let dh_ephemeral = *server_secret.diffie_hellman(&client_eph_pub).as_bytes();
+        let dh_static = server_static.dh(&client_eph_pub);
+        let session_key = derive_session_key(
+            &dh_ephemeral,
+            &dh_static,
+            client_eph_pub.as_bytes(),
+            server_eph_pub.as_bytes(),
+        )
+        .map_err(|e| (RejectReason::BadHello, e))?;
+        let (c2s, s2c) = Self::split_directional(&session_key)
+            .map_err(|e| (RejectReason::BadHello, e))?;
+        let mut stream = Self::new_with_keys(inner, s2c, c2s);
+        match stream.read_record_kind().await? {
+            Some(payload) => stream.read_carry = payload,
+            None => {
+                return Err((RejectReason::Eof, zerror!("peer closed before first frame").into()))
+            }
+        }
+        Ok(stream)
+    }
+    // accept_authenticated:end
+
     /// Encrypt and write a buffer as one or more AEAD records.
     ///
     /// Splits `buf` into chunks of at most [`MAX_PAYLOAD`] bytes and emits, per
@@ -753,6 +830,15 @@ where
 //   output: ZResult<Option<Vec<u8>>> — Some(payload) on success, None on clean EOF at a record boundary, error on auth failure or I/O error
 //   sideEffects: Reads from underlying I/O stream; decrypts via ChaCha20-Poly1305
     async fn read_record(&mut self) -> ZResult<Option<Vec<u8>>> {
+        self.read_record_kind().await.map_err(|(_, e)| e)
+    }
+
+    /// Like `read_record`, but classifies failures (`Eof` for I/O, `Auth` for
+    /// AEAD/length-frame verification).
+    async fn read_record_kind(&mut self) -> Result<Option<Vec<u8>>, (RejectReason, zenoh_result::Error)> {
+        type E = (RejectReason, zenoh_result::Error);
+        let io = |e: zenoh_result::Error| -> E { (RejectReason::Eof, e) };
+        let auth = |e: zenoh_result::Error| -> E { (RejectReason::Auth, e) };
         // 1) Peek the first byte to distinguish clean EOF from mid-record EOF.
         //    read_exact on a closed stream with 0 bytes consumed returns
         //    UnexpectedEof; we want to surface Ok(None) only when the peer
@@ -760,7 +846,7 @@ where
         let mut len_frame = [0u8; LEN_FRAME];
         // Read the first byte with a plain read() so we can detect 0-byte EOF.
         let first = self.inner.read(&mut len_frame[..1]).await
-            .map_err(|e| zerror!("obfs: read length frame failed: {e}"))?;
+            .map_err(|e| io(zerror!("obfs: read length frame failed: {e}").into()))?;
         if first == 0 {
             // Clean EOF: peer closed the connection at a record boundary.
             return Ok(None);
@@ -769,20 +855,20 @@ where
         self.inner
             .read_exact(&mut len_frame[1..])
             .await
-            .map_err(|e| zerror!("obfs: read length frame failed (mid-record EOF): {e}"))?;
-        let len_nonce = self.recv_nonce.next()?;
+            .map_err(|e| io(zerror!("obfs: read length frame failed (mid-record EOF): {e}").into()))?;
+        let len_nonce = self.recv_nonce.next().map_err(auth)?;
         let len_plain = self
             .recv_cipher
             .decrypt(&len_nonce, Payload { msg: &len_frame, aad: AAD_LEN_FRAME })
             .map_err(|_| {
-                zerror!("obfs: length frame authentication failed (bad PSK or tampering)")
+                auth(zerror!("obfs: length frame authentication failed (bad PSK or tampering)").into())
             })?;
         if len_plain.len() != 2 {
-            return Err(zerror!("obfs: decrypted length frame has wrong size").into());
+            return Err(auth(zerror!("obfs: decrypted length frame has wrong size").into()));
         }
         let payload_len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
         if payload_len == 0 || payload_len > MAX_PAYLOAD {
-            return Err(zerror!("obfs: invalid payload length {payload_len}").into());
+            return Err(auth(zerror!("obfs: invalid payload length {payload_len}").into()));
         }
 
         // 2) Read + decrypt the payload frame.
@@ -790,13 +876,13 @@ where
         self.inner
             .read_exact(&mut payload_frame)
             .await
-            .map_err(|e| zerror!("obfs: read payload frame failed: {e}"))?;
-        let payload_nonce = self.recv_nonce.next()?;
+            .map_err(|e| io(zerror!("obfs: read payload frame failed: {e}").into()))?;
+        let payload_nonce = self.recv_nonce.next().map_err(auth)?;
         let payload = self
             .recv_cipher
             .decrypt(&payload_nonce, Payload { msg: &payload_frame, aad: AAD_PAYLOAD_FRAME })
             .map_err(|_| {
-                zerror!("obfs: payload authentication failed (bad PSK or tampering)")
+                auth(zerror!("obfs: payload authentication failed (bad PSK or tampering)").into())
             })?;
         Ok(Some(payload))
     }
