@@ -310,7 +310,6 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
         let env = cluster_env::ClusterEnv::from_process_env();
         let to_json5 = cluster_env::to_json5_endpoints;
         let connect = env.connect.clone();
-        let listen = env.listen.clone();
         let scouting_off = env.scouting_off;
         let client_mode = env.client_mode;
         env.validate_transport_security()
@@ -325,10 +324,10 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                 cfg.insert_json5("connect/endpoints", &to_json5(c))
                     .map_err(|e| format!("zenoh connect config: {e}"))?;
             }
-            if let Some(l) = listen.as_deref() {
-                cfg.insert_json5("listen/endpoints", &to_json5(l))
-                    .map_err(|e| format!("zenoh listen config: {e}"))?;
-            }
+            // Always explicit: unset LISTEN must not fall back to the zenoh peer
+            // default (tcp/[::]:0, all interfaces).
+            cfg.insert_json5("listen/endpoints", &env.listen_endpoints_json5())
+                .map_err(|e| format!("zenoh listen config: {e}"))?;
             if scouting_off {
                 cfg.insert_json5("scouting/multicast/enabled", "false")
                     .map_err(|e| format!("zenoh scouting config: {e}"))?;
@@ -341,7 +340,10 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
             zenoh::open(cfg).await?
         } else {
             println!("{}", env.describe(&prefix));
-            zenoh::open(zenoh::Config::default()).await?
+            let mut cfg = zenoh::Config::default();
+            cfg.insert_json5("listen/endpoints", &env.listen_endpoints_json5())
+                .map_err(|e| format!("zenoh listen config: {e}"))?;
+            zenoh::open(cfg).await?
         };
 
         // ── Coordination-free grow-set barrier ────────────────────────────────
@@ -1068,9 +1070,8 @@ async fn open_cluster_session() -> Result<zenoh::Session, String> {
     if let Ok(c) = std::env::var("MATRIX_HS_ZENOH_CONNECT") {
         let _ = cfg.insert_json5("connect/endpoints", &to_json5(&c));
     }
-    if let Ok(l) = std::env::var("MATRIX_HS_ZENOH_LISTEN") {
-        let _ = cfg.insert_json5("listen/endpoints", &to_json5(&l));
-    }
+    let env = cluster_env::ClusterEnv::from_process_env();
+    let _ = cfg.insert_json5("listen/endpoints", &env.listen_endpoints_json5());
     zenoh::open(cfg).await.map_err(|e| e.to_string())
 }
 

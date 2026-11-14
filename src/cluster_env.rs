@@ -83,7 +83,21 @@ impl ClusterEnv {
          }
      }
 
-    /// Reject plaintext `tcp/` Zenoh endpoints on non-loopback addresses.
+    /// The `listen/endpoints` value (JSON5 array) this env asks for. Zenoh's peer
+    /// default is `tcp/[::]:0` (zenoh-config defaults.rs) — a listener on every
+    /// interface — so an unset or empty MATRIX_HS_ZENOH_LISTEN becomes an explicit
+    /// empty list, which zenoh binds nothing for (zenoh orchestrator.rs,
+    /// bind_listeners: "Starting with no listener endpoints!"). Such a node only
+    /// dials out. A set LISTEN is passed through as written.
+    pub fn listen_endpoints_json5(&self) -> String {
+        match self.listen.as_deref().map(str::trim) {
+            Some(l) if !l.is_empty() => to_json5_endpoints(l),
+            _ => "[]".to_string(),
+        }
+    }
+
+    /// Reject plaintext `tcp/` Zenoh endpoints on non-loopback addresses, and
+    /// wildcard listen (0.0.0.0, [::]) under any protocol.
     /// Per the fleet rule (see .env.example: "never plaintext Zenoh on a public
     /// interface"), such a configuration is a security bug, not a transport
     /// choice. Returns Err with the first insecure endpoint found.
@@ -98,9 +112,15 @@ impl ClusterEnv {
                     if ep.is_empty() {
                         continue;
                     }
-                    if let Some(host) = ep.strip_prefix("tcp/") {
-                        let host = host.split(':').next().unwrap_or("");
-                        if !host.is_empty() && !is_loopback_host(host) {
+                    let host = endpoint_host(ep);
+                    if label == "MATRIX_HS_ZENOH_LISTEN" && is_wildcard_host(&host) {
+                        return Err(format!(
+                            "{label}: endpoint {ep} listens on all interfaces; \
+                             name a loopback/private address"
+                        ));
+                    }
+                    if ep.starts_with("tcp/") {
+                        if !host.is_empty() && !is_loopback_host(&host) {
                             return Err(format!(
                                 "{label}: plaintext tcp/ endpoint on non-loopback address \
                                  {} is forbidden; use obfs/ or TLS instead (see .env.example rule)",
@@ -115,13 +135,28 @@ impl ClusterEnv {
     }
 }
 
+/// Host part of "proto/host:port#meta": brackets removed for IPv6; an unbracketed
+/// address with several colons ("::", "::1:7448") is returned up to `#` as is.
+fn endpoint_host(ep: &str) -> String {
+    let addr = ep.split_once('/').map_or(ep, |(_, a)| a);
+    let addr = addr.split('#').next().unwrap_or("");
+    if let Some(rest) = addr.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or("").to_string();
+    }
+    if addr.matches(':').count() > 1 {
+        return addr.to_string();
+    }
+    addr.split(':').next().unwrap_or("").to_string()
+}
+
+/// True for the "all interfaces" addresses.
+fn is_wildcard_host(host: &str) -> bool {
+    matches!(host, "0.0.0.0" | "::" | "::0" | "0:0:0:0:0:0:0:0")
+}
+
 /// True for loopback addresses that are safe for plaintext tcp/.
 fn is_loopback_host(host: &str) -> bool {
-    match host {
-        "127.0.0.1" | "::1" | "localhost" => true,
-        h if h.starts_with("[::1]") => true,
-        _ => false,
-    }
+    matches!(host, "127.0.0.1" | "::1" | "localhost") || host.starts_with("::1:")
 }
 
 /// "ep1, ep2" -> ["ep1","ep2"], the shape zenoh's JSON5 endpoint setters take.
@@ -265,6 +300,62 @@ mod tests {
         let e = env_of(&[("MATRIX_HS_ZENOH_SCOUTING", "off")]);
         assert!(e.validate_transport_security().is_ok());
         let e = env_of(&[("MATRIX_HS_ZENOH_LISTEN", "")]);
+        assert!(e.validate_transport_security().is_ok());
+    }
+
+    #[test]
+    fn unset_or_empty_listen_becomes_an_explicit_empty_list() {
+        // Zenoh's peer default is tcp/[::]:0 — all interfaces. "[]" is what keeps it off.
+        assert_eq!(env_of(&[]).listen_endpoints_json5(), "[]");
+        let e = env_of(&[("MATRIX_HS_ZENOH_CONNECT", "tcp/127.0.0.1:7449")]);
+        assert_eq!(e.listen_endpoints_json5(), "[]");
+        assert_eq!(env_of(&[("MATRIX_HS_ZENOH_LISTEN", "")]).listen_endpoints_json5(), "[]");
+        assert_eq!(env_of(&[("MATRIX_HS_ZENOH_LISTEN", "  ")]).listen_endpoints_json5(), "[]");
+    }
+
+    #[test]
+    fn explicit_listen_is_passed_through() {
+        let e = env_of(&[("MATRIX_HS_ZENOH_LISTEN", "tcp/127.0.0.1:7448")]);
+        assert_eq!(e.listen_endpoints_json5(), "[\"tcp/127.0.0.1:7448\"]");
+    }
+
+    #[test]
+    fn wildcard_listen_is_rejected_under_any_protocol() {
+        for ep in [
+            "tcp/0.0.0.0:7448",
+            "udp/0.0.0.0:7448",
+            "tls/0.0.0.0:7448",
+            "obfs/0.0.0.0:7447#obfs_psk_base64=AAECAw==",
+            "tcp/[::]:7448",
+            "udp/[::]:7448",
+            "obfs/[::]:7447#obfs_psk_base64=AAECAw==",
+            "quic/[::]:7448",
+            "tcp/127.0.0.1:7448,obfs/0.0.0.0:7447",
+        ] {
+            let e = env_of(&[("MATRIX_HS_ZENOH_LISTEN", ep)]);
+            let err = e.validate_transport_security().unwrap_err();
+            assert!(err.contains("MATRIX_HS_ZENOH_LISTEN"), "{ep}: {err}");
+        }
+    }
+
+    #[test]
+    fn named_interface_listen_and_bracketed_loopback_are_allowed() {
+        for ep in [
+            "obfs/198.51.100.7:7447#obfs_psk_base64=AAECAw==",
+            "udp/198.51.100.7:7448",
+            "tcp/[::1]:7448",
+            "tcp/::1:7448",
+            "udp/127.0.0.1:7448",
+        ] {
+            let e = env_of(&[("MATRIX_HS_ZENOH_LISTEN", ep)]);
+            assert!(e.validate_transport_security().is_ok(), "{ep}");
+        }
+    }
+
+    #[test]
+    fn wildcard_in_connect_is_not_a_listen_error() {
+        // CONNECT to 0.0.0.0 is not a listener; only plaintext-tcp rules apply to it.
+        let e = env_of(&[("MATRIX_HS_ZENOH_CONNECT", "obfs/0.0.0.0:7447")]);
         assert!(e.validate_transport_security().is_ok());
     }
 }

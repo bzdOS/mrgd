@@ -9,6 +9,10 @@
 #   c  ZENOH_LISTEN=tcp/0.0.0.0:...    -> отказ гейта 5, rc=1
 #   d  ZENOH_LISTEN=obfs/... и бинарь без кластерного слоя -> отказ гейта 4
 #   e  HUBD_QUEUES_DIR в env           -> отказ моста, rc=1
+#   f  ZENOH_CONNECT без LISTEN, peer  -> отказ гейта 5 (неявный wildcard), rc=1
+#   g  ZENOH_LISTEN=obfs/0.0.0.0:...   -> отказ гейта 5 (wildcard, любой протокол)
+#   h  ZENOH_LISTEN=udp/[::]:...       -> то же
+# f/g/h — отказ ДО запуска бинаря: ни pid-файла, ни слушателя на порту.
 # Случай d пропускается (SKIP), если бинарь кластерный.
 #
 # Использование: sh scripts/stand-lift-selftest.sh <matrix-hs> [порт]
@@ -70,6 +74,15 @@ run() { # name, expected rc, expected substring
 	grep -q -- "$3" "$T/out" || { echo "  FAIL: нет '$3' в выводе" >&2; fail=1; }
 }
 
+# Отказ гейта обязан случиться до запуска бинаря: нет pid-файла, порт свободен.
+refused_before_start() {
+	[ ! -f "$PIDFILE" ] || { echo "  FAIL: pid-файл есть — бинарь стартовал" >&2; fail=1; }
+	if sockstat -46 -l -p "$PORT" 2>/dev/null | grep -qE ":$PORT[[:space:]]"; then
+		echo "  FAIL: порт $PORT слушается — бинарь стартовал" >&2; fail=1
+	fi
+	! grep -q 'ПОДНЯТ' "$T/out" || { echo "  FAIL: в выводе ПОДНЯТ" >&2; fail=1; }
+}
+
 write_env ""
 run a 0 'ПОДНЯТ'
 sockstat -4 -l -p "$PORT" | grep -q "127.0.0.1:$PORT" || { echo "  FAIL: порт не слушает" >&2; fail=1; }
@@ -90,6 +103,16 @@ fi
 
 write_env "MATRIX_HS_HUBD_QUEUES_DIR=$H/q"
 run e 1 'мост hubd'
+
+write_env "MATRIX_HS_ZENOH_CONNECT=tcp/127.0.0.1:7998"
+run f 1 'without explicit MATRIX_HS_ZENOH_LISTEN'
+refused_before_start
+write_env "MATRIX_HS_ZENOH_LISTEN=obfs/0.0.0.0:7999#obfs_psk_base64=AAECAw=="
+run g 1 'listens on all interfaces'
+refused_before_start
+write_env "MATRIX_HS_ZENOH_LISTEN=udp/[::]:7999"
+run h 1 'listens on all interfaces'
+refused_before_start
 
 [ -f "$PIDFILE" ] && { echo "  FAIL: pid-файл остался после отказов" >&2; fail=1; }
 if [ "$fail" -eq 0 ]; then echo "OK: все случаи как надо (порт $PORT)"; else echo "FAIL" >&2; fi

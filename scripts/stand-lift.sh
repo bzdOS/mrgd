@@ -106,6 +106,31 @@ for _zen in "${MATRIX_HS_ZENOH_LISTEN:-}" "${MATRIX_HS_ZENOH_CONNECT:-}"; do
 done
 unset _zen _ep _h
 
+# Wildcard listen, ANY protocol (tcp/udp/tls/obfs...): 0.0.0.0 and [::] open the
+# node on every interface, obfs or not — a public host must name its interface.
+for _ep in $(echo "${MATRIX_HS_ZENOH_LISTEN:-}" | tr ',' ' '); do
+	_a=${_ep#*/}
+	_a=${_a%%#*}
+	case "$_a" in
+		0.0.0.0|0.0.0.0:*|'[::]'|'[::]:'*|'[0:0:0:0:0:0:0:0]'|'[0:0:0:0:0:0:0:0]:'*|::|::0)
+			echo "stand-lift: MATRIX_HS_ZENOH_LISTEN endpoint '$_ep' listens on all interfaces — forbidden; name a loopback/private address." >&2
+			exit 1
+			;;
+	esac
+done
+unset _ep _a
+
+# Peer mode with CONNECT but no explicit LISTEN: zenoh peers open a
+# listener on all interfaces by default (tcp/[::]:0, zenoh-config defaults.rs). Refuse before
+# exec; set a loopback/private LISTEN, or MATRIX_HS_ZENOH_MODE=client.
+_zmode=$(printf '%s' "${MATRIX_HS_ZENOH_MODE:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+if [ -n "${MATRIX_HS_ZENOH_CONNECT:-}" ] && [ -z "${MATRIX_HS_ZENOH_LISTEN:-}" ] \
+	&& [ "$_zmode" != client ]; then
+	echo "stand-lift: peer mode without explicit MATRIX_HS_ZENOH_LISTEN would listen on all interfaces; set a loopback/private listen or MATRIX_HS_ZENOH_MODE=client." >&2
+	exit 1
+fi
+unset _zmode
+
 # Живой hubd не трогаем: если кто-то дописал очереди в env, подъём стенда их
 # оживит. Стоит ДО exec.
 if [ -n "${MATRIX_HS_HUBD_QUEUES_DIR:-}${MATRIX_HS_HUBD_HUB_DIR:-}" ]; then
