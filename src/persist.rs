@@ -313,6 +313,32 @@ fn append_files(
 }
 // append_files:end
 
+// compaction_test_hook:start
+//   purpose: Test-only seam. Lets a test run code at the exact point a compaction
+//            has finished reading and writing its temp file but not yet swapped
+//            it in, i.e. inside the window where a concurrent append used to be
+//            lost. Keyed by the live file path so parallel tests cannot trigger
+//            each other's hooks; the hook fires once.
+//   input:  path — the live journal/sidecar about to be replaced
+//   output: none
+//   sideEffects: runs and removes the registered hook for that path
+// compaction_test_hook:end
+#[cfg(test)]
+type CompactionHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+pub(crate) static COMPACTION_HOOKS: std::sync::Mutex<Vec<(PathBuf, CompactionHook)>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn compaction_test_hook(path: &Path) {
+    let hook = {
+        let mut g = COMPACTION_HOOKS.lock().unwrap();
+        g.iter().position(|(p, _)| p == path).map(|i| g.remove(i).1)
+    };
+    if let Some(h) = hook {
+        h();
+    }
+}
+
 // swap_journal_file:start
 //   purpose: Atomically replace a journal file AND drop its cached append
 //            handle under one hold of the append lock — the only correct shape
@@ -325,14 +351,48 @@ fn append_files(
 //   output: Result<(), io::Error> from the rename
 //   sideEffects: renames tmp→final; removes final_path from the append cache
 fn swap_journal_file(tmp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    swap_journal_file_carry(tmp_path, final_path, None)
+}
+// swap_journal_file:end
+
+// swap_journal_file_carry:start
+//   purpose: swap_journal_file plus tail carry-over. A compaction reads the live
+//            file, rewrites it to a temp and renames; every append that lands
+//            between its read hitting EOF and the rename would be silently
+//            discarded (the rename replaces the file that holds it). Appends are
+//            serialised by the same lock the swap holds, so under the lock the
+//            bytes past `consumed` (what the compaction actually read) are exactly
+//            the appends it missed: copy them onto the temp before renaming.
+//   input:  tmp_path; final_path; consumed — byte length the compaction read
+//           from final_path (None = file was not read from the live path)
+//   output: Result<(), io::Error>
+//   sideEffects: as swap_journal_file; may append bytes to tmp_path
+// swap_journal_file_carry:end
+fn swap_journal_file_carry(
+    tmp_path: &Path,
+    final_path: &Path,
+    consumed: Option<u64>,
+) -> std::io::Result<()> {
     let mut files = append_files()
         .lock()
         .map_err(|_| std::io::Error::other("append cache poisoned"))?;
+    if let Some(off) = consumed {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut live = File::open(final_path)?;
+        live.seek(SeekFrom::Start(off))?;
+        let mut tail = Vec::new();
+        live.read_to_end(&mut tail)?;
+        if !tail.is_empty() {
+            let mut tmp = OpenOptions::new().append(true).open(tmp_path)?;
+            tmp.write_all(&tail)?;
+            tmp.flush()?;
+            tmp.sync_data()?;
+        }
+    }
     fs::rename(tmp_path, final_path)?;
     files.remove(final_path);
     Ok(())
 }
-// swap_journal_file:end
 
 // ── Compaction ─────────────────────────────────────────────────────────────────
 
@@ -467,15 +527,23 @@ pub fn compact_room_pdumeta(dir: &Path, room_id: &str, event_ids_kept: &HashSet<
     let tmp_path = dir.join("rooms").join(format!("{filename}.compact.tmp"));
 
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let file = File::open(&final_path)?;
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::new(File::open(&final_path)?);
 
-        let mut seen_ids: HashSet<String> = HashSet::new();
-        let mut lines: Vec<String> = Vec::new();
+        // (event_id, line, kept-by-snapshot). A record whose id is NOT in the
+        // caller's snapshot is not necessarily garbage: the snapshot may be older
+        // than the record (the event was inserted after it was taken), see below.
+        let mut recs: Vec<(String, String, bool)> = Vec::new();
         let mut total_parsed = 0usize;
-        for line_result in reader.lines() {
-            let line = line_result?;
-            let trimmed = line.trim();
+        let mut consumed: u64 = 0;
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            let n = reader.read_line(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            consumed += n as u64;
+            let trimmed = buf.trim();
             if trimmed.is_empty() {
                 continue;
             }
@@ -489,15 +557,43 @@ pub fn compact_room_pdumeta(dir: &Path, room_id: &str, event_ids_kept: &HashSet<
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            if event_id.is_empty()
-                || !event_ids_kept.contains(&event_id)
-                || !seen_ids.insert(event_id.clone())
-            {
+            if event_id.is_empty() {
                 continue;
             }
+            let kept = event_ids_kept.contains(&event_id);
             let mut out_line = trimmed.to_string();
             out_line.push('\n');
-            lines.push(out_line);
+            recs.push((event_id, out_line, kept));
+        }
+
+        // RACE GUARD 1 (snapshot older than record). Callers build `event_ids_kept`
+        // from the timeline BEFORE the journal compaction and this call. An event
+        // inserted in that window is journalled and then meta-appended; if its
+        // journal line landed after the journal rewrite, the journal keeps the line
+        // while this pass would drop its meta (id not in the snapshot) — replay then
+        // rebuilds it as an UNSIGNED synthetic PDU that peers reject. Writers append
+        // the journal line BEFORE the meta line, so any meta record read above has
+        // its journal line on disk already: an id absent from the snapshot is only
+        // garbage if the journal does not hold it either. Read the journal only
+        // when there is something to drop (GC passes; boot compaction has none).
+        let journal_ids: Option<HashSet<String>> = if recs.iter().any(|(_, _, k)| !*k) {
+            let jpath = dir.join("rooms").join(format!("{}.jsonl", sanitize_filename(room_id)));
+            Some(
+                read_room_journal_events(&jpath)
+                    .iter()
+                    .filter_map(|ev| ev.get("event_id").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        let mut lines: Vec<String> = Vec::new();
+        for (id, line, kept) in recs {
+            let keep = kept || journal_ids.as_ref().is_some_and(|j| j.contains(&id));
+            if keep && seen_ids.insert(id) {
+                lines.push(line);
+            }
         }
 
         // SKIP-WHEN-CLEAN, same reasoning as compact_room: if every parsed line
@@ -519,7 +615,12 @@ pub fn compact_room_pdumeta(dir: &Path, room_id: &str, event_ids_kept: &HashSet<
         tmp.sync_data()?;
         drop(tmp);
 
-        swap_journal_file(&tmp_path, &final_path)?;
+        #[cfg(test)]
+        compaction_test_hook(&final_path);
+
+        // RACE GUARD 2 (append between read EOF and rename): the swap carries
+        // over whatever was appended past `consumed`.
+        swap_journal_file_carry(&tmp_path, &final_path, Some(consumed))?;
         Ok(())
     })();
 
@@ -588,12 +689,19 @@ pub fn prune_room_journal(dir: &Path, room_id: &str, event_ids_kept: &HashSet<St
     let tmp_path = dir.join("rooms").join(format!("{filename}.prune.tmp"));
 
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let reader = BufReader::new(File::open(&final_path)?);
+        let mut reader = BufReader::new(File::open(&final_path)?);
         let mut seen: HashSet<String> = HashSet::new();
         let mut lines: Vec<String> = Vec::new();
-        for line_result in reader.lines() {
-            let line = line_result?;
-            let trimmed = line.trim();
+        let mut consumed: u64 = 0;
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            let n = reader.read_line(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            consumed += n as u64;
+            let trimmed = buf.trim();
             if trimmed.is_empty() {
                 continue;
             }
@@ -630,7 +738,10 @@ pub fn prune_room_journal(dir: &Path, room_id: &str, event_ids_kept: &HashSet<St
         // so the next append_line writes into a file nobody reads — the event
         // exists in the pdumeta sidecar and in the RoomLog, but never reaches the
         // journal. compact_room/compact_room_pdumeta already go through it.
-        crate::persist::swap_journal_file(&tmp_path, &final_path)?;
+        #[cfg(test)]
+        compaction_test_hook(&final_path);
+        // Lines appended after our read hit EOF are carried over, not dropped.
+        swap_journal_file_carry(&tmp_path, &final_path, Some(consumed))?;
         Ok(())
     })();
 

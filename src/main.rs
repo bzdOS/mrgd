@@ -638,7 +638,7 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                         let delta_bytes: Vec<u8> = match state_clone.rooms.lock() {
                             Ok(rooms) => rooms
                                 .get(&room_id)
-                                .map(|log| delta_to_bytes(&log.delta()))
+                                .map(|log| delta_to_bytes(&log.delta_signed()))
                                 .unwrap_or_default(),
                             Err(e) => {
                                 eprintln!("[matrix-hs] history queryable: rooms lock: {e}");

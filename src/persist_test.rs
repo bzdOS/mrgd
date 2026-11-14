@@ -1644,6 +1644,134 @@ mod persist_tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    // pdumeta_survives_stale_snapshot_compaction:start
+    //   purpose: Regression for the lost-pdumeta race (root cause of unsigned
+    //            synthetic PDUs after a restart). Callers hand compact_room_pdumeta
+    //            an id snapshot taken from the timeline BEFORE the compaction runs.
+    //            An event inserted after that snapshot (journal line, then meta
+    //            line) must keep its meta: before the fix the pass dropped it
+    //            because its id was not in the snapshot, while the journal line
+    //            stayed, so replay rebuilt the event unsigned (empty sig/signer,
+    //            prev=[], depth=0) and peers rejected it.
+    //            Deterministic: the "concurrent" insert is an explicit call between
+    //            snapshot and compaction. A truly collected event must still go.
+    // pdumeta_survives_stale_snapshot_compaction:end
+    #[test]
+    fn pdumeta_survives_stale_snapshot_compaction() {
+        let data_dir = make_temp_dir();
+        let state = AppState::with_data_dir(data_dir.to_path_buf());
+        let room_id = "!meta_race_probe:localhost";
+        let ev = |id: &str, ts: i64| {
+            json!({ "event_id": id, "room_id": room_id, "type": "m.room.message",
+                    "sender": "@u:localhost", "origin_server_ts": ts, "content": {} })
+        };
+        let put = |id: &str, ts: i64| {
+            state.persist_room_event(room_id, &ev(id, ts));
+            state.persist_room_pdu_meta(room_id, id, &[7u8; 64], "node-a", &[], ts as u64, b"{}");
+        };
+        let meta_ids = |dd: &Path| -> Vec<String> {
+            let p = dd.join("rooms").join(format!("{}.pdumeta.jsonl", crate::persist::sanitize_filename(room_id)));
+            std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .filter_map(|v| v.get("event_id").and_then(|e| e.as_str()).map(str::to_string))
+                .collect()
+        };
+
+        put("$old1", 1);
+        put("$old2", 2);
+        put("$gone", 3);
+        // Snapshot as the caller takes it: $gone was collected, $new not inserted yet.
+        let snapshot: std::collections::HashSet<String> =
+            ["$old1".to_string(), "$old2".to_string()].into_iter().collect();
+        // Callers shrink the journal to the same snapshot first (GC: prune_room_journal;
+        // post-merge: compact_room), so $gone is gone from the journal too.
+        crate::persist::prune_room_journal(&data_dir, room_id, &snapshot);
+        // The race: a send lands after the snapshot (journal then meta).
+        put("$new", 4);
+
+        crate::persist::compact_room_pdumeta(&data_dir, room_id, &snapshot);
+
+        let ids = meta_ids(&data_dir);
+        assert!(
+            ids.iter().any(|i| i == "$new"),
+            "meta of an event inserted after the snapshot must survive compaction; sidecar holds {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|i| i == "$gone"),
+            "meta of a genuinely collected event must still be dropped; sidecar holds {ids:?}"
+        );
+        assert_eq!(ids.len(), 3, "old1, old2, new expected: {ids:?}");
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // compaction_carries_appends_made_during_rewrite:start
+    //   purpose: Second window of the same family: a line appended AFTER the
+    //            compaction read the file to EOF but BEFORE the rename was
+    //            replaced away with the old file. The test hook appends exactly
+    //            there, for both the pdumeta sidecar and the room journal prune.
+    // compaction_carries_appends_made_during_rewrite:end
+    #[test]
+    fn compaction_carries_appends_made_during_rewrite() {
+        let data_dir = make_temp_dir();
+        let state = AppState::with_data_dir(data_dir.to_path_buf());
+        let room_id = "!tail_race_probe:localhost";
+        let ev = |id: &str, ts: i64| {
+            json!({ "event_id": id, "room_id": room_id, "type": "m.room.message",
+                    "sender": "@u:localhost", "origin_server_ts": ts, "content": {} })
+        };
+        let rooms = data_dir.join("rooms");
+        let sane = crate::persist::sanitize_filename(room_id);
+        let meta_path = rooms.join(format!("{sane}.pdumeta.jsonl"));
+        let journal_path = rooms.join(format!("{sane}.jsonl"));
+        let ids_of = |p: &Path| -> Vec<String> {
+            std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .filter_map(|v| v.get("event_id").and_then(|e| e.as_str()).map(str::to_string))
+                .collect()
+        };
+        for (id, ts) in [("$a", 1), ("$b", 2), ("$drop", 3)] {
+            state.persist_room_event(room_id, &ev(id, ts));
+            state.persist_room_pdu_meta(room_id, id, &[7u8; 64], "node-a", &[], ts as u64, b"{}");
+        }
+        let kept: std::collections::HashSet<String> =
+            ["$a".to_string(), "$b".to_string()].into_iter().collect();
+        // $drop leaves the journal first (as in GC), its meta is what compaction must drop.
+        crate::persist::prune_room_journal(&data_dir, room_id, &kept);
+        state.persist_room_event(room_id, &ev("$drop2", 5)); // journal-only, pruned below
+
+        // pdumeta: append "$late" inside the read→swap window.
+        let (st, r) = (state.clone(), room_id.to_string());
+        crate::persist::COMPACTION_HOOKS.lock().unwrap().push((
+            meta_path.clone(),
+            Box::new(move || {
+                st.persist_room_event(&r, &json!({"event_id":"$late","room_id":r,"type":"m.room.message","sender":"@u:localhost","origin_server_ts":9,"content":{}}));
+                st.persist_room_pdu_meta(&r, "$late", &[7u8; 64], "node-a", &[], 9, b"{}");
+            }),
+        ));
+        crate::persist::compact_room_pdumeta(&data_dir, room_id, &kept);
+        let m = ids_of(&meta_path);
+        assert!(m.iter().any(|i| i == "$late"), "pdumeta line appended mid-compaction was lost: {m:?}");
+        assert!(!m.iter().any(|i| i == "$drop"), "collected meta must be gone: {m:?}");
+
+        // journal prune: same window.
+        let (st, r) = (state.clone(), room_id.to_string());
+        crate::persist::COMPACTION_HOOKS.lock().unwrap().push((
+            journal_path.clone(),
+            Box::new(move || {
+                st.persist_room_event(&r, &json!({"event_id":"$late2","room_id":r,"type":"m.room.message","sender":"@u:localhost","origin_server_ts":10,"content":{}}));
+            }),
+        ));
+        crate::persist::prune_room_journal(&data_dir, room_id, &kept);
+        let j = ids_of(&journal_path);
+        assert!(j.iter().any(|i| i == "$late2"), "journal line appended mid-prune was lost: {j:?}");
+        assert!(!j.iter().any(|i| i == "$drop2"), "pruned event must be gone: {j:?}");
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
 }
 
     // doc_markers_balanced:start

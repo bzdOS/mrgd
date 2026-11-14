@@ -172,12 +172,11 @@ pub(crate) async fn insert_pdu(
             .ok_or_else(|| HsError::RoomNotFound(room_id.to_string()))?;
 
         // Determine prev_events + depth from the current tail of ordered().
-        let ordered = log.ordered();
-        let (prev_events, depth) = if ordered.is_empty() {
-            (vec![], 0u64)
-        } else {
-            let tail = ordered.last().expect("non-empty ordered");
-            (vec![tail.event_id.clone()], tail.depth + 1)
+        // tip(): last SIGNED event, so an unsigned synthetic (replay of an event
+        // whose pdumeta was lost) never becomes a prev peers cannot resolve.
+        let (prev_events, depth) = match log.tip() {
+            None => (vec![], 0u64),
+            Some((id, d)) => (vec![id], d + 1),
         };
 
         // Real wall-clock ts so clients (Element) date and order the timeline

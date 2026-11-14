@@ -408,6 +408,42 @@ impl RoomLog {
         }
     }
 
+    // RoomLog::delta_signed:start
+    //   purpose: delta() restricted to PDUs a peer can verify. Replay rebuilds an
+    //            event whose pdumeta sidecar record is missing as an UNSIGNED
+    //            synthetic PDU (empty sig/signer, prev=[], depth=0); every peer
+    //            rejects those in apply_delta_verified, so serving them in a
+    //            catch-up reply only produces REJECT noise and rejected counts.
+    //            Such events stay in the log for local reads, they just are not
+    //            gossiped.
+    //   input:  none
+    //   output: RoomLogDelta of the signed PDUs
+    //   sideEffects: none
+    // RoomLog::delta_signed:end
+    pub fn delta_signed(&self) -> RoomLogDelta {
+        RoomLogDelta {
+            pdus: self.events.values().filter(|p| p.is_signed()).cloned().collect(),
+            collected_depth: self.collected_depth,
+        }
+    }
+
+    // RoomLog::tip:start
+    //   purpose: The event a new local PDU should chain from: the last SIGNED
+    //            event in ordered(). An unsigned synthetic (see delta_signed) is
+    //            unknown to peers, so a prev pointing at it would leave the new
+    //            event blocked on the peer side. Falls back to the plain last
+    //            event when the room holds nothing signed (pre-sidecar journals),
+    //            which is the previous behaviour.
+    //   input:  none
+    //   output: Option<(event_id, depth)>
+    //   sideEffects: none
+    // RoomLog::tip:end
+    pub fn tip(&self) -> Option<(String, u64)> {
+        let ordered = self.ordered();
+        let p = ordered.iter().rev().find(|p| p.is_signed()).or(ordered.last())?;
+        Some((p.event_id.clone(), p.depth))
+    }
+
     // RoomLog::apply_delta:start
     //   purpose: Merge a received RoomLogDelta into this log WITHOUT signature verification.
     //            Suitable for in-process (trusted) paths: local PDUs, test helpers,
@@ -2193,5 +2229,33 @@ mod tests {
             "an honest PDU must still be accepted"
         );
         assert_eq!(log.len(), 1);
+    }
+    // roomlog:unsigned_not_published_nor_tip:start
+    //   purpose: An unsigned synthetic PDU (replay of an event whose pdumeta was
+    //            lost) is excluded from delta_signed() and from tip(), but stays
+    //            in the log. A room with nothing signed keeps the old tail.
+    // roomlog:unsigned_not_published_nor_tip:end
+    #[test]
+    fn unsigned_synthetic_is_not_published_and_not_the_tip() {
+        use crate::substrate::node_auth::NodeSigner;
+        let signer = NodeSigner::from_seed([11u8; 32], "node-a".to_string());
+        let s0 = Pdu::signed("!r:s".into(), "@u:node-a".into(), "m.t".into(), b"0".to_vec(), vec![], 0, 10, &signer);
+        let s1 = Pdu::signed("!r:s".into(), "@u:node-a".into(), "m.t".into(), b"1".to_vec(), vec![s0.event_id.clone()], 1, 20, &signer);
+        // Synthetic: no prev, deep depth so it would sort last.
+        let u = pdu("$unsigned", &[], 9, 999);
+        let mut log = RoomLog::new();
+        log.add(s0.clone());
+        log.add(s1.clone());
+        log.add(u);
+        assert_eq!(log.ordered().last().unwrap().event_id, "$unsigned", "precondition: unsigned sorts last");
+        assert_eq!(log.tip(), Some((s1.event_id.clone(), 1)), "tip skips the unsigned event");
+        let d = log.delta_signed();
+        assert_eq!(d.pdus.len(), 2, "unsigned event is not published");
+        assert!(d.pdus.iter().all(|p| p.is_signed()));
+        assert_eq!(log.len(), 3, "still readable locally");
+
+        let mut only_unsigned = RoomLog::new();
+        only_unsigned.add(pdu("$u0", &[], 0, 1));
+        assert_eq!(only_unsigned.tip(), Some(("$u0".to_string(), 0)), "nothing signed: old tail");
     }
 }
