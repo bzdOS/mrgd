@@ -43,7 +43,7 @@
 //   retained bytes = published bytes - drained bytes, i.e. what is still sitting
 //                    undrained in the sink inboxes.  This is the quantity that
 //                    grew without bound in the incident.
-//   cpu seconds    = utime+stime of this process from /proc/self/stat, so it
+//   cpu seconds    = utime+stime of this process from getrusage, so it
 //                    covers every Zenoh background thread too.
 //   wall to quiescence, peak RSS (VmHWM — the exact metric the 9.5 GB was
 //   recorded in), plus per-family convergence checks.
@@ -254,45 +254,29 @@ mod scenario {
 
     // ── Process measures ───────────────────────────────────────────────────────
 
-    /// utime+stime of this process in seconds, from /proc/self/stat.  Covers
-    /// every thread, so the Zenoh background tasks are included — which is where
-    /// the incident's CPU went.
-    fn cpu_seconds() -> f64 {
-        let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
-            return 0.0;
-        };
-        // comm may contain spaces, so split after the LAST ')'.  Fields are
-        // 1-indexed from 'pid'; after comm the next field is #3 (state), so
-        // field N lives at index N-3 of the tail.
-        let Some(close) = stat.rfind(')') else {
-            return 0.0;
-        };
-        let tail: Vec<&str> = stat[close + 1..].split_whitespace().collect();
-        let pick = |field: usize| -> f64 {
-            tail.get(field.saturating_sub(3))
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.0)
-        };
-        // utime=#14, stime=#15; the clock-tick rate is 100 Hz on Linux.
-        (pick(14) + pick(15)) / 100.0
+    /// getrusage(RUSAGE_SELF) snapshot; covers every thread, so the Zenoh
+    /// background tasks are included (which is where the incident's CPU went).
+    /// Portable: /proc is absent on FreeBSD.
+    fn rusage() -> Option<libc::rusage> {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: ru is a valid, writable rusage; RUSAGE_SELF needs no other state.
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+        (rc == 0).then_some(ru)
     }
 
-    /// Peak resident set size in kB (VmHWM) — the exact metric the 9.5 GB
-    /// incident was recorded in.
-    fn vm_hwm_kb() -> u64 {
-        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-            return 0;
+    /// utime+stime of this process in seconds.
+    fn cpu_seconds() -> f64 {
+        let Some(ru) = rusage() else {
+            return 0.0;
         };
-        for line in status.lines() {
-            if let Some(rest) = line.strip_prefix("VmHWM:") {
-                return rest
-                    .split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(0);
-            }
-        }
-        0
+        let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+        tv(ru.ru_utime) + tv(ru.ru_stime)
+    }
+
+    /// Peak resident set size in kB (ru_maxrss; kilobytes on both Linux and
+    /// FreeBSD) — the metric the 9.5 GB incident was recorded in.
+    fn vm_hwm_kb() -> u64 {
+        rusage().map_or(0, |ru| ru.ru_maxrss.max(0) as u64)
     }
 
     // ── Wire encodings for the two generic families ────────────────────────────

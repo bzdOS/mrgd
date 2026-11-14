@@ -945,7 +945,16 @@ impl CrdtSink for ZenohCrdtSink {
         // invariant is always satisfied when ZenohCrdtSink exists.
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(async move { session.put(&zenoh_key, bytes).await })
+                .block_on(async move {
+                    // Block, not the default Drop: a burst of deltas overflows the
+                    // transport queue, and Drop discards the overflow silently, so
+                    // replicas diverge (only the claims family has anti-entropy to
+                    // repair that). Block applies backpressure to the publisher instead.
+                    session
+                        .put(&zenoh_key, bytes)
+                        .congestion_control(zenoh::qos::CongestionControl::Block)
+                        .await
+                })
         })
         .map_err(|e| CrdtError::ZenohPut(e.to_string()))
     }
