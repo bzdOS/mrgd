@@ -26,7 +26,17 @@
 pub struct ClusterEnv {
     pub connect: Option<String>,
     pub listen: Option<String>,
+    /// Scouting was explicitly turned off (off/0/false). Only feeds `wants_cluster`
+    /// and the log line; scouting is off whenever `scouting_on` is false.
     pub scouting_off: bool,
+    /// Multicast + gossip scouting asked for BY NAME (on/1/true/yes). Anything else,
+    /// including unset, empty or unknown text, leaves it off: Zenoh's own default is
+    /// multicast on 224.0.0.224:7446 over every interface, which a host with a public
+    /// address must not open by accident.
+    pub scouting_on: bool,
+    /// Optional `MATRIX_HS_ZENOH_SCOUTING_INTERFACE`: interface name or address the
+    /// multicast scouting is confined to (zenoh `scouting/multicast/interface`).
+    pub scouting_interface: Option<String>,
     pub client_mode: bool,
 }
 
@@ -47,6 +57,12 @@ impl ClusterEnv {
             scouting_off: get("MATRIX_HS_ZENOH_SCOUTING")
                 .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false"))
                 .unwrap_or(false),
+            scouting_on: get("MATRIX_HS_ZENOH_SCOUTING")
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes"))
+                .unwrap_or(false),
+            scouting_interface: get("MATRIX_HS_ZENOH_SCOUTING_INTERFACE")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
             client_mode: get("MATRIX_HS_ZENOH_MODE")
                 .map(|v| v.trim().eq_ignore_ascii_case("client"))
                 .unwrap_or(false),
@@ -61,7 +77,11 @@ impl ClusterEnv {
     /// Does this env ask for the cluster layer? True for either endpoint, for scouting
     /// turned off, or for client mode — the same four-way condition build_state used.
     pub fn wants_cluster(&self) -> bool {
-        self.connect.is_some() || self.listen.is_some() || self.scouting_off || self.client_mode
+        self.connect.is_some()
+            || self.listen.is_some()
+            || self.scouting_off
+            || self.scouting_on
+            || self.client_mode
     }
 
     /// The line the binary prints when it opens a configured session. It names connect
@@ -75,13 +95,43 @@ impl ClusterEnv {
                 self.connect,
                 self.listen,
                 if self.client_mode { "client" } else { "peer" },
-                if self.scouting_off { "off" } else { "on" },
+                if self.scouting_on { "on" } else { "off" },
                 prefix
             )
         } else {
-             format!("cluster mode: peer/scouting (no connect/listen env) prefix={prefix}")
+             format!("cluster mode: peer, scouting off (no connect/listen env) prefix={prefix}")
          }
      }
+
+    /// The zenoh config keys (JSON5 values) that implement the scouting decision.
+    /// Off (the default): multicast and gossip disabled, so the node opens no UDP
+    /// socket for discovery. On (explicit): zenoh defaults, with the multicast
+    /// interface confined when `MATRIX_HS_ZENOH_SCOUTING_INTERFACE` names one.
+    /// Every place that opens a session applies this same list.
+    pub fn scouting_config(&self) -> Vec<(&'static str, String)> {
+        if !self.scouting_on {
+            return vec![
+                ("scouting/multicast/enabled", "false".to_string()),
+                ("scouting/gossip/enabled", "false".to_string()),
+            ];
+        }
+        match self.scouting_interface.as_deref() {
+            Some(i) => vec![(
+                "scouting/multicast/interface",
+                format!("\"{}\"", i.replace('\\', "\\\\").replace('"', "\\\"")),
+            )],
+            None => vec![],
+        }
+    }
+
+    /// Warning for the log when scouting is explicitly on and not confined to an
+    /// interface: zenoh then uses "auto" and listens on all of them.
+    pub fn scouting_warning(&self) -> Option<&'static str> {
+        (self.scouting_on && self.scouting_interface.is_none()).then_some(
+            "WARNING: MATRIX_HS_ZENOH_SCOUTING=on without MATRIX_HS_ZENOH_SCOUTING_INTERFACE: \
+             multicast scouting listens on ALL interfaces (224.0.0.224:7446)",
+        )
+    }
 
     /// The `listen/endpoints` value (JSON5 array) this env asks for. Zenoh's peer
     /// default is `tcp/[::]:0` (zenoh-config defaults.rs) — a listener on every
@@ -204,7 +254,7 @@ mod tests {
     fn an_env_without_any_of_the_four_does_not_want_the_cluster() {
         let e = env_of(&[("MATRIX_HS_SERVER_NAME", "localhost")]);
         assert!(!e.wants_cluster());
-        assert!(e.describe("p").contains("peer/scouting (no connect/listen env)"));
+        assert!(e.describe("p").contains("peer, scouting off (no connect/listen env)"));
     }
 
     #[test]
@@ -221,12 +271,58 @@ mod tests {
     }
 
     #[test]
+    fn scouting_is_off_unless_named_on() {
+        let off = vec![
+            ("scouting/multicast/enabled", "false".to_string()),
+            ("scouting/gossip/enabled", "false".to_string()),
+        ];
+        // unset, empty, explicit off, and unrecognised text all keep it off
+        let unset = env_of(&[("MATRIX_HS_SERVER_NAME", "x")]);
+        assert!(!unset.scouting_on);
+        assert_eq!(unset.scouting_config(), off);
+        assert!(unset.scouting_warning().is_none());
+        for v in ["", "off", "0", "false", "maybe", "enable"] {
+            let e = env_of(&[("MATRIX_HS_ZENOH_SCOUTING", v)]);
+            assert!(!e.scouting_on, "{v:?}");
+            assert_eq!(e.scouting_config(), off, "{v:?}");
+        }
+        // an interface without scouting=on changes nothing
+        let e = env_of(&[("MATRIX_HS_ZENOH_SCOUTING_INTERFACE", "lo0")]);
+        assert_eq!(e.scouting_config(), off);
+    }
+
+    #[test]
+    fn explicit_scouting_on_confines_the_interface_or_warns() {
+        let e = env_of(&[
+            ("MATRIX_HS_ZENOH_SCOUTING", "on"),
+            ("MATRIX_HS_ZENOH_SCOUTING_INTERFACE", " 10.0.0.5 "),
+        ]);
+        assert_eq!(
+            e.scouting_config(),
+            vec![("scouting/multicast/interface", "\"10.0.0.5\"".to_string())]
+        );
+        assert!(e.scouting_warning().is_none());
+        assert!(e.describe("p").contains("scouting=on"));
+
+        let e = env_of(&[("MATRIX_HS_ZENOH_SCOUTING", "on")]);
+        assert!(e.scouting_config().is_empty(), "zenoh defaults, nothing to disable");
+        assert!(e.scouting_warning().unwrap().contains("ALL interfaces"));
+        // naming scouting either way is an explicit cluster setting: the marker line
+        // must then report the real value, not the unset-env wording
+        assert!(e.wants_cluster());
+        assert!(e.describe("p").contains("scouting=on"));
+    }
+
+    #[test]
     fn scouting_off_spellings_and_mode_case_do_not_matter() {
         for v in ["off", "OFF", " Off ", "0", "false"] {
             assert!(env_of(&[("MATRIX_HS_ZENOH_SCOUTING", v)]).scouting_off, "{v:?}");
         }
         for v in ["on", "yes", "1", "true", ""] {
             assert!(!env_of(&[("MATRIX_HS_ZENOH_SCOUTING", v)]).scouting_off, "{v:?}");
+        }
+        for v in ["on", "ON", " On ", "1", "true", "yes"] {
+            assert!(env_of(&[("MATRIX_HS_ZENOH_SCOUTING", v)]).scouting_on, "{v:?}");
         }
         for v in ["client", "Client", "CLIENT", " client "] {
             assert!(env_of(&[("MATRIX_HS_ZENOH_MODE", v)]).client_mode, "{v:?}");

@@ -15,7 +15,7 @@
 //            MATRIX_HS_ZENOH_LISTEN  — listen/endpoints  (e.g. "tcp/0.0.0.0:7448")
 //          A cross-host peer needs one side to LISTEN on a known port and the other to
 //          CONNECT to it (multicast/gossip scouting does not cross subnets).  With neither
-//          var set the server starts in peer/scouting mode (loopback gossip only).
+//          var set the server starts in peer mode with scouting off (opt in: MATRIX_HS_ZENOH_SCOUTING=on).
 //          MATRIX_HS_ZENOH_PREFIX controls the key prefix (default "mrgd/matrix/room").
 //
 //          Distributed barrier (cluster feature) — coordination-free grow-set:
@@ -284,7 +284,7 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
         //
         // Parse MATRIX_HS_ZENOH_CONNECT="tcp/ip:port,tcp/ip2:port" into Zenoh config.
         // Format: JSON5 array of endpoint strings, e.g. ["tcp/192.0.2.1:7447"].
-        // If unset: use default config (peer mode, multicast/gossip scouting).
+        // If unset: peer mode, no listener, scouting off (see below).
         //
         // MATRIX_HS_ZENOH_SCOUTING=off disables multicast discovery, so the only
         // peers are the ones named above. Three reasons it exists, all measured:
@@ -296,7 +296,10 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
         //     suite discover it and ~4 tests fail per run with a shifting set.
         //   - two unrelated clusters on one host TOFU-trust each other's key
         //     announcements (the deployment topology record (kept private) §3).
-        // Default stays on: LAN peer mode is ladder rung 1 and depends on it.
+        // Default is OFF since 2026-11: zenoh's own default opens UDP multicast on
+        // 224.0.0.224:7446 over every interface, including a public one. Scouting
+        // runs only with MATRIX_HS_ZENOH_SCOUTING=on, optionally confined by
+        // MATRIX_HS_ZENOH_SCOUTING_INTERFACE; LAN peer mode needs that opt-in.
         //
         // MATRIX_HS_ZENOH_MODE=client switches the session to zenoh CLIENT mode —
         // the topology a ROUTER carrier is built for. Peer-mode sessions behind a
@@ -310,7 +313,6 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
         let env = cluster_env::ClusterEnv::from_process_env();
         let to_json5 = cluster_env::to_json5_endpoints;
         let connect = env.connect.clone();
-        let scouting_off = env.scouting_off;
         let client_mode = env.client_mode;
         env.validate_transport_security()
             .map_err(|e| format!("refusing to start: {e}"))?;
@@ -328,11 +330,12 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
             // default (tcp/[::]:0, all interfaces).
             cfg.insert_json5("listen/endpoints", &env.listen_endpoints_json5())
                 .map_err(|e| format!("zenoh listen config: {e}"))?;
-            if scouting_off {
-                cfg.insert_json5("scouting/multicast/enabled", "false")
-                    .map_err(|e| format!("zenoh scouting config: {e}"))?;
-                cfg.insert_json5("scouting/gossip/enabled", "false")
-                    .map_err(|e| format!("zenoh gossip config: {e}"))?;
+            for (k, v) in env.scouting_config() {
+                cfg.insert_json5(k, &v)
+                    .map_err(|e| format!("zenoh scouting config {k}: {e}"))?;
+            }
+            if let Some(w) = env.scouting_warning() {
+                eprintln!("{w}");
             }
             // The line the stand-lift gate greps for, printed from the same function
             // the unit test checks, so the marker cannot drift from the marker.
@@ -343,6 +346,13 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
             let mut cfg = zenoh::Config::default();
             cfg.insert_json5("listen/endpoints", &env.listen_endpoints_json5())
                 .map_err(|e| format!("zenoh listen config: {e}"))?;
+            for (k, v) in env.scouting_config() {
+                cfg.insert_json5(k, &v)
+                    .map_err(|e| format!("zenoh scouting config {k}: {e}"))?;
+            }
+            if let Some(w) = env.scouting_warning() {
+                eprintln!("{w}");
+            }
             zenoh::open(cfg).await?
         };
 
@@ -1072,6 +1082,10 @@ async fn open_cluster_session() -> Result<zenoh::Session, String> {
     }
     let env = cluster_env::ClusterEnv::from_process_env();
     let _ = cfg.insert_json5("listen/endpoints", &env.listen_endpoints_json5());
+    for (k, v) in env.scouting_config() {
+        cfg.insert_json5(k, &v)
+            .map_err(|e| format!("zenoh scouting config {k}: {e}"))?;
+    }
     zenoh::open(cfg).await.map_err(|e| e.to_string())
 }
 

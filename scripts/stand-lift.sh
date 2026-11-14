@@ -170,6 +170,23 @@ if [ -n "${MATRIX_HS_ZENOH_LISTEN:-}${MATRIX_HS_ZENOH_CONNECT:-}" ] \
 	fi
 fi
 
+# ── Гейт 4b: кластерный бинарь и скаутинг явно включён — отказ ────────────────
+# Причина: на хосте с публичным интерфейсом мультикаст-скаутинг Zenoh слушает на
+# ВСЕХ интерфейсах (UDP, 224.0.0.224:7446 и адреса каждого интерфейса), а правило —
+# слушать только loopback или частный адрес. По умолчанию скаутинг выключен;
+# MATRIX_HS_ZENOH_SCOUTING=on на стенде не поднимаем.
+_zsc=$(printf '%s' "${MATRIX_HS_ZENOH_SCOUTING:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+case "$_zsc" in
+	on|1|true|yes)
+		if strings -a "$BIN" 2>/dev/null | grep -q 'cluster mode: connect='; then
+			echo "stand-lift: MATRIX_HS_ZENOH_SCOUTING включён, а бинарь кластерный — отказ: скаутинг слушает на всех интерфейсах." >&2
+			echo "stand-lift: убери переменную или поставь MATRIX_HS_ZENOH_SCOUTING=off." >&2
+			exit 1
+		fi
+		;;
+esac
+unset _zsc
+
 # ── Гейт 3: наш адрес занят, а пид-файла нет — это не наш процесс ───────────
 if addr_taken; then
 	echo "stand-lift: адрес $LISTEN_HOST:$LISTEN_PORT УЖЕ слушает, а pid-файла нет." >&2

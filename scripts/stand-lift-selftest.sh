@@ -12,6 +12,7 @@
 #   f  ZENOH_CONNECT без LISTEN, peer  -> отказ гейта 5 (неявный wildcard), rc=1
 #   g  ZENOH_LISTEN=obfs/0.0.0.0:...   -> отказ гейта 5 (wildcard, любой протокол)
 #   h  ZENOH_LISTEN=udp/[::]:...       -> то же
+#   i  ZENOH_SCOUTING=on, кластерный бинарь -> отказ гейта 4b (на некластерном SKIP)
 # f/g/h — отказ ДО запуска бинаря: ни pid-файла, ни слушателя на порту.
 # Случай d пропускается (SKIP), если бинарь кластерный.
 #
@@ -58,6 +59,7 @@ write_env() {
 		MATRIX_HS_TOKEN_SECRET=$SECRET
 		MATRIX_HS_DATA_DIR=$H/data
 		MALLOC_CONF=
+		MATRIX_HS_ZENOH_SCOUTING=off
 		$1
 	ENV
 }
@@ -113,6 +115,16 @@ refused_before_start
 write_env "MATRIX_HS_ZENOH_LISTEN=udp/[::]:7999"
 run h 1 'listens on all interfaces'
 refused_before_start
+
+# Базовый env несёт SCOUTING=off, чтобы самотест сам ничего не биндил вне
+# loopback; последняя строка env побеждает при source, поэтому on идёт после.
+if strings -a "$H/bin/matrix-hs" | grep -q 'cluster mode: connect='; then
+	write_env "MATRIX_HS_ZENOH_SCOUTING=on"
+	run i 1 'скаутинг слушает на всех интерфейсах'
+	refused_before_start
+else
+	echo "(i) SKIP: бинарь не кластерный, гейт 4b не применим"
+fi
 
 [ -f "$PIDFILE" ] && { echo "  FAIL: pid-файл остался после отказов" >&2; fail=1; }
 if [ "$fail" -eq 0 ]; then echo "OK: все случаи как надо (порт $PORT)"; else echo "FAIL" >&2; fi
