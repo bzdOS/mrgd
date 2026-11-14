@@ -575,12 +575,12 @@ async fn guarded_accept(
     dst_addr: SocketAddr,
     server_static: &StaticServerKey,
     deadline: Duration,
+    slot: reject::PendingGuard,
 ) -> Option<ObfsStream<TcpStream>> {
-    match ObfsStream::accept_authenticated(tcp_stream, server_static, deadline).await {
-        Ok(stream) => {
-            eprintln!("[obfs-accept] Handshake OK from {:?}", dst_addr);
-            Some(stream)
-        }
+    let res = ObfsStream::accept_authenticated(tcp_stream, server_static, deadline).await;
+    drop(slot); // handshake finished (or failed): no longer pending
+    match res {
+        Ok(stream) => Some(stream),
         Err((reason, e)) => {
             reject::record(dst_addr, reason, &e);
             None
@@ -630,7 +630,6 @@ async fn accept_task(
             res = socket.accept() => {
                 match res {
                     Ok((tcp_stream, dst_addr)) => {
-                        eprintln!("[obfs-accept] TCP connection from {:?}", dst_addr);
                         let local_addr = match tcp_stream.local_addr() {
                             Ok(sa) => sa,
                             Err(e) => {
@@ -642,13 +641,21 @@ async fn accept_task(
                             tracing::warn!("Unable to set NODELAY on accepted obfs link: {err}");
                         }
 
+                        // Bound unfinished handshakes (global + per IP). Over the
+                        // limit: close now, read and send nothing.
+                        let slot = match reject::pending().try_acquire(dst_addr.ip()) {
+                            Some(s) => s,
+                            None => {
+                                reject::record(dst_addr, reject::RejectReason::Limit, &"pending-handshake limit");
+                                continue; // tcp_stream dropped here
+                            }
+                        };
                         let server_static = server_static.clone();
                         let manager = manager.clone();
                         // Perform the AEAD handshake off the accept loop so a slow
                         // or malicious peer cannot stall other connections.
                         zenoh_runtime::ZRuntime::Acceptor.spawn(async move {
-                            eprintln!("[obfs-accept] Starting handshake with {:?}", dst_addr);
-                            match guarded_accept(tcp_stream, dst_addr, &server_static, reject::handshake_timeout()).await {
+                            match guarded_accept(tcp_stream, dst_addr, &server_static, reject::handshake_timeout(), slot).await {
                                 Some(obfs_stream) => {
                                     eprintln!("[obfs-accept] Handshake OK from {:?}", dst_addr);
                                     tracing::debug!(
@@ -710,6 +717,11 @@ mod tests {
         (c, s, peer)
     }
 
+    fn test_slot() -> reject::PendingGuard {
+        let p: &'static reject::Pending = Box::leak(Box::new(reject::Pending::new(8, 8)));
+        p.try_acquire("127.0.0.1".parse().unwrap()).unwrap()
+    }
+
     fn key(b: u8) -> (PreSharedKey, StaticServerKey) {
         let psk = PreSharedKey([b; crate::KEY_LEN]);
         let k = StaticServerKey::derive_from_psk(&psk);
@@ -722,7 +734,7 @@ mod tests {
         let (mut client, server, peer) = pair().await;
         let (_, k) = key(1);
         let t0 = Instant::now();
-        let r = guarded_accept(server, peer, &k, Duration::from_secs(2)).await;
+        let r = guarded_accept(server, peer, &k, Duration::from_secs(2), test_slot()).await;
         let dt = t0.elapsed();
         assert!(r.is_none());
         assert!(dt >= Duration::from_millis(1900) && dt < Duration::from_secs(4), "{dt:?}");
@@ -739,7 +751,7 @@ mod tests {
         let (mut client, server, peer) = pair().await;
         let (_, k) = key(1);
         client.write_all(&[0x16, 0x03, 0x01, 0x00, 0xc8, 0x01]).await.unwrap();
-        let r = guarded_accept(server, peer, &k, Duration::from_secs(1)).await;
+        let r = guarded_accept(server, peer, &k, Duration::from_secs(1), test_slot()).await;
         assert!(r.is_none());
         let after = reject::totals();
         assert!(after[RejectReason::Timeout as usize] > before[RejectReason::Timeout as usize]);
@@ -759,7 +771,7 @@ mod tests {
             let mut b = [0u8; 16];
             s.inner_mut().read(&mut b).await.unwrap_or(0)
         });
-        let r = guarded_accept(server, peer, &server_key, Duration::from_secs(5)).await;
+        let r = guarded_accept(server, peer, &server_key, Duration::from_secs(5), test_slot()).await;
         assert!(r.is_none());
         let n = c.await.unwrap();
         assert_eq!(n, 0, "server must close the connection");
@@ -777,7 +789,7 @@ mod tests {
             s.flush().await.unwrap();
             s
         });
-        let mut srv = guarded_accept(server, peer, &k, Duration::from_secs(5)).await.expect("ok");
+        let mut srv = guarded_accept(server, peer, &k, Duration::from_secs(5), test_slot()).await.expect("ok");
         let mut buf = [0u8; 5];
         srv.read_exact_into(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hello");

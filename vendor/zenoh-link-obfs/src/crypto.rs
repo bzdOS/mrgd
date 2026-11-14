@@ -46,15 +46,6 @@
 use core::fmt;
 use crate::reject::RejectReason;
 
-// hex_repr:start
-//   purpose: Format a 32-byte array as a lowercase hex string for debug logging.
-//   input:  b: &[u8; 32] — the byte slice to format
-//   output: String — hex-encoded representation
-//   sideEffects: none
-fn hex_repr(b: &[u8; 32]) -> String {
-    b.iter().map(|x| format!("{:02x}", x)).collect()
-}
-// hex_repr:end
 
 // ---------------------------------------------------------------------------
 // TLS camouflage — wraps the 32-byte Elligator2 representatives in a minimal
@@ -197,7 +188,7 @@ async fn tls_read_random_kind<S: tokio::io::AsyncRead + Unpin>(
     if hdr[0] != 0x16 {
         return Err((
             RejectReason::BadHello,
-            zerror!("obfs/tls: {label}: expected Handshake record 0x16, got {:#04x}", hdr[0]).into(),
+            zerror!("obfs/tls: {label}: not a TLS handshake record").into(),
         ));
     }
     let record_len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
@@ -205,7 +196,7 @@ async fn tls_read_random_kind<S: tokio::io::AsyncRead + Unpin>(
     if record_len < 38 {
         return Err((
             RejectReason::BadHello,
-            zerror!("obfs/tls: {label}: record too short: {record_len}").into(),
+            zerror!("obfs/tls: {label}: record too short").into(),
         ));
     }
     let mut body = vec![0u8; record_len];
@@ -215,7 +206,7 @@ async fn tls_read_random_kind<S: tokio::io::AsyncRead + Unpin>(
     if body[0] != expected_hs_type {
         return Err((
             RejectReason::BadHello,
-            zerror!("obfs/tls: {label}: expected hs type {expected_hs_type:#04x}, got {:#04x}", body[0]).into(),
+            zerror!("obfs/tls: {label}: unexpected handshake message type").into(),
         ));
     }
     // body layout: type(1) + length(3) + version(2) + random(32) + ...
@@ -670,12 +661,9 @@ where
         let client_repr = tls_read_random(&mut inner, 0x01, "ClientHello")
             .await
             .map_err(|e| zerror!("obfs handshake: failed to read client ephemeral: {e}"))?;
-        eprintln!("[obfs-crypto] accept: read client repr OK: {}", hex_repr(&client_repr));
         let client_eph_pub = decode_representative(&client_repr)?;
-        eprintln!("[obfs-crypto] accept: decode repr OK");
 
         let (server_secret, server_eph_pub, server_repr) = gen_ephemeral_elligator()?;
-        eprintln!("[obfs-crypto] accept: gen server ephemeral OK");
 
         // Send fake TLS ServerHello with server_random = our Elligator2 representative.
         inner
