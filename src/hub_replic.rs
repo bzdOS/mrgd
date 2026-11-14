@@ -26,7 +26,7 @@ use crate::routes::send::insert_pdu;
 use crate::state::{AppState, StateEvent};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -699,6 +699,8 @@ async fn materialise(state: &Arc<AppState>, cfg: &HubReplicConfig, mem: &mut Car
         None => 0,
     };
 
+    let applied_path = cfg.state_dir.join("hubrep-applied");
+    let ev_id = |e: &Value| e.get("event_id").and_then(|v| v.as_str()).map(str::to_string);
     let rebuild = start_idx == 0
         && last.as_ref().is_some_and(|id| !id.is_empty())
         || last.is_none();
@@ -760,9 +762,17 @@ async fn materialise(state: &Arc<AppState>, cfg: &HubReplicConfig, mem: &mut Car
         }
         mem.dirty = true;
     } else {
-        for ev in events.iter().skip(start_idx) {
-            if !foreign(ev) {
-                // own or non-hub event: just advance past it
+        // ordered() is a (depth, ts, id) linearisation, so an event from a peer
+        // branch that forked below our cursor sorts BEFORE it: `skip(start_idx)`
+        // would never apply it. Track applied ids instead (migration: no file ⇒
+        // everything up to the cursor counts as applied).
+        let applied: HashSet<String> = match std::fs::read_to_string(&applied_path) {
+            Ok(s) => s.lines().map(str::to_string).collect(),
+            Err(_) => events.iter().take(start_idx).filter_map(&ev_id).collect(),
+        };
+        for ev in events.iter() {
+            if ev_id(ev).is_some_and(|id| applied.contains(&id)) || !foreign(ev) {
+                // already applied, own or non-hub event: just advance past it
                 continue;
             }
             let Some(h) = decode_hub_event(ev) else { continue };
@@ -774,6 +784,13 @@ async fn materialise(state: &Arc<AppState>, cfg: &HubReplicConfig, mem: &mut Car
         }
     }
 
+    // Everything in the room is now considered; persist the id set (pruned to
+    // ids still present). Written only when it changed.
+    let all_ids: Vec<String> = events.iter().filter_map(&ev_id).collect();
+    if rebuild || std::fs::read_to_string(&applied_path).ok().map(|s| s.lines().count()) != Some(all_ids.len()) {
+        let _ = std::fs::create_dir_all(&cfg.state_dir);
+        let _ = std::fs::write(&applied_path, all_ids.join("\n"));
+    }
     // Advance the cursor to the last event id we considered.
     if let Some(id) = events
         .last()
