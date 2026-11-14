@@ -867,3 +867,17 @@ pub fn spawn_with(state: Arc<AppState>, cfg: HubReplicConfig) -> bool {
     });
     true
 }
+
+// materialise_for_test:start
+//   purpose: Test entry for materialise() with a fresh card memory per call
+//            (the production driver keeps one CardMem across ticks; the
+//            cursor/applied-set logic under test lives on disk, not in it).
+//   input:  state, cfg
+//   output: none
+//   sideEffects: as materialise
+// materialise_for_test:end
+#[cfg(test)]
+pub(crate) async fn materialise_for_test(state: &Arc<AppState>, cfg: &HubReplicConfig) {
+    let mut mem = CardMem::default();
+    materialise(state, cfg, &mut mem).await;
+}

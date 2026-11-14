@@ -236,6 +236,8 @@ mod ephemeral_test;
 mod hubd_bridge_test;
 #[cfg(all(test, feature = "cluster"))]
 mod hub_replic_test;
+#[cfg(test)]
+mod hub_replic_materialise_test;
 #[cfg(all(test, feature = "cluster"))]
 mod keys_cluster_test;
 #[cfg(all(test, feature = "cluster"))]
