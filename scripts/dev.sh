@@ -30,7 +30,7 @@ export CARGO_TARGET_DIR
 # No downloads, ever: the vendored/locked tree must build from what is present.
 CARGO_NET_OFFLINE="${CARGO_NET_OFFLINE:-true}"
 export CARGO_NET_OFFLINE
-DEV_LOG_DIR="${DEV_LOG_DIR:-${TMPDIR:-/tmp}/mrgd-dev-logs}"
+DEV_LOG_DIR="${DEV_LOG_DIR:-${TMPDIR:-/tmp}/track-dev-logs}"
 DEV_BASE_REF="${DEV_BASE_REF:-main}"
 DEV_JOBS="${DEV_JOBS:-6}"
 
@@ -76,10 +76,10 @@ cmd_test() {
                 if ($i == "failed;") f += $(i - 1)
             }
         } END { printf("%d %d", p, f) }' "$log_all")"
-    passed="${totals% *}"
-    failed="${totals#* }"
-    echo "tests: $passed passed / $failed failed"
-    if [ "$rc_all" -ne 0 ] || [ "$rc_lib" -ne 0 ] || [ "$failed" -ne 0 ]; then
+    n_passed="${totals% *}"
+    n_failed="${totals#* }"
+    echo "tests: $n_passed passed / $n_failed failed"
+    if [ "$rc_all" -ne 0 ] || [ "$rc_lib" -ne 0 ] || [ "$n_failed" -ne 0 ]; then
         echo "tests: cargo exit full=$rc_all lib=$rc_lib (logs: $log_all $log_lib)" >&2
         return 1
     fi
@@ -126,7 +126,7 @@ cmd_privgate() {
     # Pattern assembled from pieces: this file must not match its own gate.
     _s=/
     pat="192\\.168|178\\.72|${_s}home${_s}|${_s}opt${_s}|${_s}srv${_s}"
-    pat="$pat|bsdos-x86|planck|fedora|mrgd-(head|dev|lead)"
+    pat="$pat|bsdos-x""86|plan""ck|fed""ora|mrgd-(he""ad|d""ev|le""ad)"
     # Added lines only, committed and uncommitted, tracked files.
     hits="$(git diff "$DEV_BASE_REF" -- . ':!vendor' | grep -E '^\+' | grep -vE '^\+\+\+' | grep -E "$pat" || true)"
     n=0

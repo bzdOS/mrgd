@@ -3767,14 +3767,7 @@ impl AppState {
         true
     }
 
-    // AppState::apply_remote_state_event:start
-    //   purpose: Apply a state event learned from a peer or the bridge by last-writer-wins on (ts,
-    //            event_id); observes the peer clock first.
-    //   input:  &self, ev: StateEvent
-    //   output: Ok(true) when room state changed, Ok(false) when the event lost or was a duplicate,
-    //           Err on lock failure
-    //   sideEffects: updates room_state and the HLC clock; may journal the event
-    // AppState::apply_remote_state_event:end
+    // CONTRACT: Apply a remote room-state event by LWW on (origin_server_ts, event_id); observes the peer clock first. Full contract: the AppState::apply_remote_state_event block above (before may_set_state).
     pub fn apply_remote_state_event(&self, ev: StateEvent) -> Result<bool, String> {
         self.ensure_room_state(&ev.room_id);
         // Learn from the peer's clock before anything else, so our next write is
