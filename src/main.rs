@@ -90,7 +90,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Inert otherwise — see src/memprobe.rs. Installed before anything is
     // built or served so the first sample is the startup baseline.
     #[cfg(target_os = "freebsd")]
-    memprobe::install();
+    let usr2_inactive_reason: Option<String> = memprobe::install();
+    #[cfg(not(target_os = "freebsd"))]
+    let usr2_inactive_reason: Option<String> = Some("unsupported platform".to_string());
+    // SIGUSR2 must never kill the process: the default action is termination, and
+    // external samplers send it to every node regardless of platform or env.
+    #[cfg(unix)]
+    if let Some(reason) = usr2_inactive_reason {
+        guard_sigusr2(reason);
+    }
+    #[cfg(not(unix))]
+    let _ = usr2_inactive_reason;
 
     let listen: SocketAddr = std::env::var("MATRIX_HS_LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:8448".to_string())
@@ -140,6 +150,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Keep SIGUSR2 from terminating the process when memprobe does not own it.
+/// The first signal logs one stderr line; later ones are counted silently.
+/// Falls back to SIG_IGN if the tokio listener cannot be registered.
+#[cfg(unix)]
+fn guard_sigusr2(reason: String) {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::user_defined2()) {
+        Ok(mut s) => {
+            tokio::spawn(async move {
+                let mut n: u64 = 0;
+                while s.recv().await.is_some() {
+                    n += 1;
+                    if n == 1 {
+                        eprintln!(
+                            "[matrix-hs] SIGUSR2 received, memprobe not active ({reason}) — ignored (further signals counted silently)"
+                        );
+                    }
+                }
+            });
+        }
+        Err(e) => {
+            eprintln!("[matrix-hs] SIGUSR2 listener unavailable ({e}); setting SIG_IGN");
+            // SAFETY: SIG_IGN installation is async-signal-safe and done once at startup.
+            unsafe {
+                libc::signal(libc::SIGUSR2, libc::SIG_IGN);
+            }
+        }
+    }
 }
 
 // async_shutdown_signal:start

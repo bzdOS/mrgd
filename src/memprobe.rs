@@ -249,20 +249,23 @@ fn sample(trigger: &str) {
 /// MATRIX_HS_MEMPROBE_LOG names a writable file; that variable is the only
 /// switch, so a deployment that does not set it runs exactly the code it ran
 /// before this module existed.
-pub fn install() {
+///
+/// Returns None when the probe is active (it owns SIGUSR2), or Some(reason) when
+/// it is not, so the caller can still keep SIGUSR2 from killing the process.
+pub fn install() -> Option<String> {
     let path = match std::env::var("MATRIX_HS_MEMPROBE_LOG") {
         Ok(p) if !p.is_empty() => p,
-        _ => return,
+        _ => return Some("MATRIX_HS_MEMPROBE_LOG not set".to_string()),
     };
     let file = match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("[memprobe] disabled: cannot open {path}: {e}");
-            return;
+            return Some(format!("cannot open probe log: {e}"));
         }
     };
     if LOG.set(Mutex::new(file)).is_err() {
-        return; // already installed
+        return None; // already installed
     }
     // SAFETY: on_sigusr2 performs one relaxed-ordered atomic store on a static,
     // which is async-signal-safe; signal() is called before any request is
@@ -271,7 +274,7 @@ pub fn install() {
     let prev = unsafe { libc::signal(libc::SIGUSR2, on_sigusr2 as *const () as libc::sighandler_t) };
     if prev == libc::SIG_ERR {
         eprintln!("[memprobe] disabled: cannot install SIGUSR2 handler");
-        return;
+        return Some("cannot install SIGUSR2 handler".to_string());
     }
     std::thread::Builder::new()
         .name("memprobe".into())
@@ -286,6 +289,7 @@ pub fn install() {
         })
         .map(|_| ())
         .unwrap_or_else(|e| eprintln!("[memprobe] disabled: cannot spawn sampler: {e}"));
+    None
 }
 
 // watch:start
