@@ -1,3 +1,13 @@
+// START_AI_HEADER
+// MODULE: zenoh-link-obfs/src/reject.rs
+// PURPOSE: Accounting, per-IP log rate limiting and pending-handshake caps for rejected inbound
+//          obfs connections.
+// DEPENDENCIES: std, tracing
+// PUBLIC_API: HANDSHAKE_TIMEOUT_ENV, MAX_PENDING_ENV, MAX_PENDING_PER_IP_ENV, REJECT_LINE_PREFIX,
+//              handshake_timeout, RejectReason, Counts, totals, LineLimiter, record, summary_line,
+//              flush_summary, Pending, PendingGuard, pending
+// END_AI_HEADER
+
 //
 // bsdOS — zenoh-link-obfs
 //
@@ -32,6 +42,7 @@ pub const MAX_PENDING_PER_IP_ENV: &str = "BSDOS_OBFS_MAX_PENDING_PER_IP";
 const DEFAULT_MAX_PENDING: usize = 256;
 const DEFAULT_MAX_PENDING_PER_IP: usize = 16;
 
+// CONTRACT: Positive usize from an env var, else the default.
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -43,6 +54,13 @@ fn env_usize(name: &str, default: usize) -> usize {
 /// Stable prefix of every per-connection rejection line (grep-able).
 pub const REJECT_LINE_PREFIX: &str = "[obfs-accept] Handshake FAILED from";
 
+// handshake_timeout:start
+//   purpose: Accept-side deadline from ClientHello to the first decrypted AEAD record, read once
+//            from BSDOS_OBFS_HANDSHAKE_TIMEOUT_SECS.
+//   input:  env BSDOS_OBFS_HANDSHAKE_TIMEOUT_SECS
+//   output: Duration (default 10 s)
+//   sideEffects: reads env once, caches in a OnceLock
+// handshake_timeout:end
 /// Accept-side deadline from ClientHello to the first decrypted AEAD record.
 pub fn handshake_timeout() -> Duration {
     static T: OnceLock<Duration> = OnceLock::new();
@@ -66,6 +84,12 @@ pub enum RejectReason {
 }
 
 impl RejectReason {
+    // RejectReason::as_str:start
+    //   purpose: Stable lowercase name of a reject reason, used in log lines.
+    //   input:  self
+    //   output: &str: timeout, bad-hello, auth, eof or limit
+    //   sideEffects: none
+    // RejectReason::as_str:end
     pub fn as_str(self) -> &'static str {
         match self {
             RejectReason::Timeout => "timeout",
@@ -75,6 +99,7 @@ impl RejectReason {
             RejectReason::Limit => "limit",
         }
     }
+    // CONTRACT: Index of the reason into the Counts arrays.
     fn idx(self) -> usize {
         self as usize
     }
@@ -87,6 +112,12 @@ const Z: AtomicU64 = AtomicU64::new(0);
 static WINDOW: [AtomicU64; 5] = [Z; 5];
 static TOTAL: [AtomicU64; 5] = [Z; 5];
 
+// totals:start
+//   purpose: Process-lifetime rejection counters per reason.
+//   input:  none
+//   output: Counts
+//   sideEffects: none
+// totals:end
 /// Process-lifetime rejection counters (for tests / diagnostics).
 pub fn totals() -> Counts {
     std::array::from_fn(|i| TOTAL[i].load(Ordering::Relaxed))
@@ -101,9 +132,22 @@ pub struct LineLimiter {
 const MAX_TRACKED: usize = 4096;
 
 impl LineLimiter {
+    // LineLimiter::new:start
+    //   purpose: Create a per-IP line limiter with the given interval.
+    //   input:  interval
+    //   output: LineLimiter
+    //   sideEffects: none
+    // LineLimiter::new:end
     pub fn new(interval: Duration) -> Self {
         Self { last: HashMap::new(), interval }
     }
+    // LineLimiter::allow:start
+    //   purpose: Permit at most one log line per IP per interval; bounded to MAX_TRACKED addresses
+    //            (a flood from many addresses is left to the summary line).
+    //   input:  &mut self, ip, now
+    //   output: true when a line may be logged
+    //   sideEffects: updates the last-seen map, may prune it
+    // LineLimiter::allow:end
     pub fn allow(&mut self, ip: IpAddr, now: Instant) -> bool {
         if let Some(t) = self.last.get(&ip) {
             if now.saturating_duration_since(*t) < self.interval {
@@ -122,11 +166,19 @@ impl LineLimiter {
     }
 }
 
+// CONTRACT: Process-wide LineLimiter with a 1 s interval.
 fn limiter() -> &'static Mutex<LineLimiter> {
     static L: OnceLock<Mutex<LineLimiter>> = OnceLock::new();
     L.get_or_init(|| Mutex::new(LineLimiter::new(Duration::from_secs(1))))
 }
 
+// record:start
+//   purpose: Record one rejected connection: bump window and total counters, log one rate-limited
+//            line.
+//   input:  peer addr, reason, detail
+//   output: none
+//   sideEffects: increments atomics, writes to stderr and the debug trace
+// record:end
 /// Record one rejected connection: bump counters, log (rate-limited per IP).
 pub fn record(addr: std::net::SocketAddr, reason: RejectReason, detail: &dyn std::fmt::Display) {
     WINDOW[reason.idx()].fetch_add(1, Ordering::Relaxed);
@@ -141,6 +193,12 @@ pub fn record(addr: std::net::SocketAddr, reason: RejectReason, detail: &dyn std
     }
 }
 
+// summary_line:start
+//   purpose: Format the 60 s summary line, or None when nothing was rejected.
+//   input:  c: Counts
+//   output: Some(line) when the sum is non-zero
+//   sideEffects: none
+// summary_line:end
 /// Format the summary line for a window, or None when nothing was rejected.
 pub fn summary_line(c: Counts) -> Option<String> {
     let n: u64 = c.iter().sum();
@@ -157,6 +215,12 @@ pub fn summary_line(c: Counts) -> Option<String> {
     ))
 }
 
+// flush_summary:start
+//   purpose: Take and reset the window counters; print the summary line if non-empty.
+//   input:  none
+//   output: none
+//   sideEffects: resets the window counters, writes to stderr
+// flush_summary:end
 /// Take and reset the window counters; print the summary if non-empty.
 pub fn flush_summary() {
     let c: Counts = std::array::from_fn(|i| WINDOW[i].swap(0, Ordering::Relaxed));
@@ -179,9 +243,21 @@ pub struct PendingGuard {
 }
 
 impl Pending {
+    // Pending::new:start
+    //   purpose: Create a tracker with a global and a per-IP cap on unfinished handshakes.
+    //   input:  max_total, max_per_ip
+    //   output: Pending
+    //   sideEffects: none
+    // Pending::new:end
     pub fn new(max_total: usize, max_per_ip: usize) -> Self {
         Self { inner: Mutex::new((0, HashMap::new())), max_total, max_per_ip }
     }
+    // Pending::try_acquire:start
+    //   purpose: Take a handshake slot unless either cap is reached.
+    //   input:  &self (static), ip
+    //   output: Some(PendingGuard) or None
+    //   sideEffects: increments the global and per-IP counts
+    // Pending::try_acquire:end
     /// Try to take a slot; None when either cap is reached.
     pub fn try_acquire(&'static self, ip: IpAddr) -> Option<PendingGuard> {
         let mut g = self.inner.lock().ok()?;
@@ -196,12 +272,25 @@ impl Pending {
         g.1.insert(ip, per + 1);
         Some(PendingGuard { pending: self, ip })
     }
+    // Pending::current:start
+    //   purpose: Number of unfinished handshakes now.
+    //   input:  &self
+    //   output: count
+    //   sideEffects: none
+    // Pending::current:end
     pub fn current(&self) -> usize {
         self.inner.lock().map(|g| g.0).unwrap_or(0)
     }
 }
 
 impl Drop for PendingGuard {
+    // PendingGuard::drop:start
+    //   purpose: Release the slot: decrement the global count and the per-IP count, removing a zero
+    //            entry.
+    //   input:  &mut self
+    //   output: none
+    //   sideEffects: updates the tracker
+    // PendingGuard::drop:end
     fn drop(&mut self) {
         if let Ok(mut g) = self.pending.inner.lock() {
             g.0 = g.0.saturating_sub(1);
@@ -215,6 +304,12 @@ impl Drop for PendingGuard {
     }
 }
 
+// pending:start
+//   purpose: Process-wide pending-handshake tracker with limits read once from env.
+//   input:  env BSDOS_OBFS_MAX_PENDING, BSDOS_OBFS_MAX_PENDING_PER_IP
+//   output: &static Pending
+//   sideEffects: reads env once, caches in a OnceLock
+// pending:end
 /// Process-wide pending-handshake tracker, limits read once from env.
 pub fn pending() -> &'static Pending {
     static P: OnceLock<Pending> = OnceLock::new();
@@ -228,6 +323,9 @@ pub fn pending() -> &'static Pending {
 
 #[cfg(test)]
 mod tests {
+    // pending_caps_total_and_per_ip_and_releases:start
+    //   purpose: Per-IP and total caps refuse further slots; dropping a guard frees one.
+    // pending_caps_total_and_per_ip_and_releases:end
     #[test]
     fn pending_caps_total_and_per_ip_and_releases() {
         use super::*;
@@ -250,6 +348,10 @@ mod tests {
 
     use super::*;
 
+    // limiter_one_line_per_ip_per_second:start
+    //   purpose: One line per IP per interval; another IP is independent; allowed again after the
+    //            interval.
+    // limiter_one_line_per_ip_per_second:end
     #[test]
     fn limiter_one_line_per_ip_per_second() {
         let mut l = LineLimiter::new(Duration::from_secs(1));
@@ -262,6 +364,9 @@ mod tests {
         assert!(l.allow(a, t0 + Duration::from_millis(1001)));
     }
 
+    // summary_only_when_nonzero:start
+    //   purpose: summary_line is None for zero counts and formats the exact line otherwise.
+    // summary_only_when_nonzero:end
     #[test]
     fn summary_only_when_nonzero() {
         assert_eq!(summary_line([0, 0, 0, 0, 0]), None);

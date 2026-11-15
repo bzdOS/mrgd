@@ -1,4 +1,12 @@
 #!/bin/sh
+# START_AI_HEADER
+# MODULE: scripts/soak-gen.sh
+# PURPOSE: Steady chat-load generator for a soak run: one persistent set of users and rooms kept in
+#          a 0600 state file, never exits on an error, logs failures and backs off.
+# DEPENDENCIES: sh, curl, awk
+# PUBLIC_API: script (run by soak-run.sh)
+# END_AI_HEADER
+
 # soak-gen.sh — steady chat-load generator for a soak run (no flapping).
 #
 # WHY THIS EXISTS. The previous generator ran under `set -eu`, so any curl timeout
@@ -107,6 +115,7 @@ TOKEN_FILE="$RUN_DIR/token"
 chmod 600 "$STATE"
 : > "$HDR"; chmod 600 "$HDR"
 
+# CONTRACT: Append a timestamped line to the run log; never fails.
 log() { printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*" >> "$LOG"; }
 
 NSENT=0; NERR=0; NREG=0; NROOM=0
@@ -114,6 +123,12 @@ CONSEC=0
 trap 'log "SUMMARY sent=$NSENT errors=$NERR registrations=$NREG rooms=$NROOM"; rm -f "$HDR"; exit 0' INT TERM
 
 # ── HTTP: sets CODE (status, or curl:<rc>) and BODY. Never exits. ──────────────
+# req:start
+#   purpose: One HTTP call with curl; never exits the script on failure.
+#   input:  method, path, optional token, optional JSON body
+#   output: sets CODE (status or curl:<rc>) and BODY
+#   sideEffects: network call to the node under test
+# req:end
 req() { # method path [token] [json]
 	_m=$1; _p=$2; _t=${3:-}; _d=${4:-}
 	if [ -n "$_t" ]; then
@@ -139,10 +154,12 @@ req() { # method path [token] [json]
 	[ "$CODE" = 200 ]
 }
 
+# CONTRACT: Value of the first "key":"value" pair of BODY.
 jget() { # key -> value of first "key":"value" in BODY
 	printf '%s' "$BODY" | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" | head -n 1
 }
 
+# CONTRACT: Record an error for an op and sleep exponentially, capped.
 backoff() { # op  (records an error and sleeps exponentially, capped)
 	NERR=$((NERR + 1)); CONSEC=$((CONSEC + 1))
 	_ec=$(jget errcode)
@@ -155,8 +172,11 @@ backoff() { # op  (records an error and sleeps exponentially, capped)
 }
 
 # ── State: lines "u IDX NAME PASS TOKEN" and "r IDX ROOMID" and "t TAG" ──────
+# CONTRACT: Field f of the state-file user line with index i.
 st_get_u() { awk -v i="$1" -v f="$2" '$1=="u" && $2==i {print $f}' "$STATE" | tail -n 1; }
+# CONTRACT: Room id of the state-file room line with index i.
 st_get_r() { awk -v i="$1" '$1=="r" && $2==i {print $3}' "$STATE" | tail -n 1; }
+# CONTRACT: Rewrite the token of user idx in the state file atomically, keeping mode 0600.
 st_set_tok() { # idx token: rewrite atomically, keep 0600
 	awk -v i="$1" -v t="$2" '$1=="u" && $2==i {$5=t} {print}' "$STATE" > "$STATE.new" \
 		&& chmod 600 "$STATE.new" && mv "$STATE.new" "$STATE"
@@ -168,8 +188,10 @@ if [ -z "$TAG" ]; then
 	echo "t $TAG" >> "$STATE"
 fi
 
+# CONTRACT: 12 random bytes as hex, used as a throwaway password.
 mkpass() { od -An -N12 -tx1 /dev/urandom | tr -d ' \n'; }
 
+# CONTRACT: Log the user idx in again with its stored password and store the new token; no new account.
 login() { # idx -> sets token in state; uses stored password of the same user
 	_n=$(st_get_u "$1" 3); _pw=$(st_get_u "$1" 4)
 	req POST /_matrix/client/v3/login "" \
@@ -180,6 +202,7 @@ login() { # idx -> sets token in state; uses stored password of the same user
 	log "SETUP relogin user=$1"
 }
 
+# CONTRACT: Register user idx; appended to the state file only once a token is in hand.
 register_user() { # idx; appends the user to state only once a token is in hand
 	_n="soakgen_${TAG}_$1"; _pw=$(mkpass)
 	req POST /_matrix/client/v3/register "" "{\"username\":\"$_n\",\"password\":\"$_pw\"}"

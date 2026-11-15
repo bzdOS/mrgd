@@ -38,6 +38,7 @@ mod tests {
         p
     }
 
+    // CONTRACT: BridgeConfig for a test root and node name, not readonly, no send command.
     fn cfg_for(root: &Path, node: &str) -> BridgeConfig {
         BridgeConfig {
             queues_dir: root.join("queues"),

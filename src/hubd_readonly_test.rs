@@ -22,6 +22,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
+    // CONTRACT: Unique per-test temp dir (pid + counter) holding a copy of the hub layout.
     fn tmp(tag: &str) -> PathBuf {
         static N: AtomicU32 = AtomicU32::new(0);
         let p = std::env::temp_dir().join(format!(
@@ -36,10 +37,18 @@ mod tests {
         p
     }
 
+    // CONTRACT: Path of the hub copy inside a test root.
     fn hub(root: &Path) -> PathBuf {
         root.join("srv/hub")
     }
 
+    // seed_hub:start
+    //   purpose: Seed a hub copy the way hubd would have left it: a queue file, a journal, a
+    //            project card, sections.json.
+    //   input:  test root
+    //   output: none
+    //   sideEffects: writes files under the root hub copy
+    // seed_hub:end
     /// Seed a hub copy the way hubd would have left it.
     fn seed_hub(root: &Path) {
         let h = hub(root);
@@ -53,6 +62,7 @@ mod tests {
         std::fs::write(h.join("sections.json"), "{\"next\":1}").unwrap();
     }
 
+    // CONTRACT: Env lookup map pointing the bridge at the test hub, with optional extra overrides.
     fn lookup(root: &Path, extra: &[(&str, String)]) -> HashMap<String, String> {
         let h = hub(root);
         let mut m: HashMap<String, String> = HashMap::new();
@@ -67,20 +77,31 @@ mod tests {
         m
     }
 
+    // CONTRACT: Env lookup map with MATRIX_HS_HUBD_READONLY=1.
     fn ro_env(root: &Path) -> HashMap<String, String> {
         lookup(root, &[("MATRIX_HS_HUBD_READONLY", "1".into())])
     }
 
+    // CONTRACT: BridgeConfig built from a lookup map; panics when none results.
     fn bcfg(m: &HashMap<String, String>) -> BridgeConfig {
         BridgeConfig::from_lookup(&|k| m.get(k).cloned()).expect("bridge cfg")
     }
 
+    // CONTRACT: HubReplicConfig built from a lookup map; panics when none results.
     fn rcfg(m: &HashMap<String, String>) -> HubReplicConfig {
         HubReplicConfig::from_lookup(&|k| m.get(k).cloned()).expect("replic cfg")
     }
 
+    // manifest:start
+    //   purpose: Fingerprint a directory tree: name -> "kind size mtime_ns sha256" for every entry,
+    //            directories included.
+    //   input:  dir
+    //   output: BTreeMap of relative name to fingerprint
+    //   sideEffects: reads the tree
+    // manifest:end
     /// name -> "kind size mtime_ns sha256" for every entry under `dir`, dirs included.
     fn manifest(dir: &Path) -> BTreeMap<String, String> {
+        // CONTRACT: Recursive helper of manifest(); fills the map for one directory level.
         fn walk(base: &Path, cur: &Path, out: &mut BTreeMap<String, String>) {
             use std::os::unix::fs::MetadataExt;
             for e in std::fs::read_dir(cur).unwrap().flatten() {
@@ -107,10 +128,13 @@ mod tests {
     /// chmod -R a-w (or chflags uchg when running as root, which ignores modes).
     struct Locked(PathBuf);
     impl Locked {
+        // CONTRACT: Lock a path read-only (apply with lock=true) and remember it for unlocking on drop.
         fn new(p: &Path) -> Self {
             Self::apply(p, true);
             Locked(p.to_path_buf())
         }
+        // CONTRACT: Lock or unlock recursively: chmod for ordinary users, chflags uchg/nouchg when running as
+        //    root.
         fn apply(p: &Path, lock: bool) {
             let root = unsafe { libc::geteuid() } == 0;
             let (prog, args): (&str, Vec<&str>) = match (root, lock) {
@@ -124,11 +148,13 @@ mod tests {
         }
     }
     impl Drop for Locked {
+        // CONTRACT: Unlock the path again so the temp tree can be removed.
         fn drop(&mut self) {
             Self::apply(&self.0, false);
         }
     }
 
+    // CONTRACT: Decoded m.room.message contents of a room in timeline order.
     fn room_msgs(state: &Arc<AppState>, room_id: &str) -> Vec<Value> {
         let rooms = state.rooms.lock().unwrap();
         rooms
@@ -143,6 +169,7 @@ mod tests {
             .unwrap_or_default()
     }
 
+    // CONTRACT: Poll a condition every 50 ms for up to 10 s; returns its final value.
     async fn wait_until(mut f: impl FnMut() -> bool) -> bool {
         for _ in 0..200 {
             if f() {
@@ -153,6 +180,13 @@ mod tests {
         f()
     }
 
+    // client_say:start
+    //   purpose: Post a client message into a role queue room as a local user, with optional extra
+    //            content keys.
+    //   input:  state, role, user name, text, extra JSON object
+    //   output: none
+    //   sideEffects: inserts a PDU through the send route
+    // client_say:end
     async fn client_say(state: &Arc<AppState>, role: &str, who: &str, text: &str, extra: Value) {
         let room_id = ensure_queue_room(state, role);
         let mut c = json!({ "msgtype": "m.text", "body": text });
@@ -173,6 +207,12 @@ mod tests {
         .expect("insert");
     }
 
+    // stub:start
+    //   purpose: Create a stub `hub queue send` script that logs "role|body|from" to a file.
+    //   input:  test root
+    //   output: (script path, log path)
+    //   sideEffects: writes an executable script under the root
+    // stub:end
     /// A stub `hub queue send`: logs "role|body|from" to a file under the test dir.
     fn stub(root: &Path) -> (String, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -190,6 +230,7 @@ mod tests {
         (sh.display().to_string(), log)
     }
 
+    // CONTRACT: Lines of the stub log, empty when it does not exist.
     fn log_lines(log: &Path) -> Vec<String> {
         std::fs::read_to_string(log)
             .unwrap_or_default()
@@ -199,6 +240,10 @@ mod tests {
     }
 
     // (a) ─────────────────────────────────────────────────────────────────────
+    // readonly_node_starts_and_ingests_on_a_read_only_hub:start
+    //   purpose: (a) A node on a filesystem-read-only hub starts and ingests; cursors land in the
+    //            data dir only.
+    // readonly_node_starts_and_ingests_on_a_read_only_hub:end
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn readonly_node_starts_and_ingests_on_a_read_only_hub() {
         let root = tmp("a");
@@ -233,6 +278,9 @@ mod tests {
     }
 
     // (b) ─────────────────────────────────────────────────────────────────────
+    // hub_manifest_is_identical_after_many_ingest_cycles:start
+    //   purpose: (b) The hub directory manifest does not change across many ingest cycles.
+    // hub_manifest_is_identical_after_many_ingest_cycles:end
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hub_manifest_is_identical_after_many_ingest_cycles() {
         let root = tmp("b");
@@ -252,6 +300,10 @@ mod tests {
     }
 
     // (c) ─────────────────────────────────────────────────────────────────────
+    // room_message_goes_out_once_through_the_command_and_not_again_after_restart:start
+    //   purpose: (c) A client message reaches the send command exactly once, also after a node
+    //            restart, and nothing is written into the hub tree.
+    // room_message_goes_out_once_through_the_command_and_not_again_after_restart:end
     #[tokio::test]
     async fn room_message_goes_out_once_through_the_command_and_not_again_after_restart() {
         let root = tmp("c");
@@ -286,6 +338,9 @@ mod tests {
         assert_eq!(std::fs::read_dir(hub(&root).join("queues")).unwrap().count(), 0);
     }
 
+    // without_a_send_command_nothing_is_sent_and_nothing_written:start
+    //   purpose: (c) With no send command configured nothing is sent and nothing is written.
+    // without_a_send_command_nothing_is_sent_and_nothing_written:end
     #[tokio::test]
     async fn without_a_send_command_nothing_is_sent_and_nothing_written() {
         let root = tmp("c2");
@@ -302,6 +357,10 @@ mod tests {
     }
 
     // (d) ─────────────────────────────────────────────────────────────────────
+    // without_the_flag_behaviour_is_unchanged:start
+    //   purpose: (d) Without exactly MATRIX_HS_HUBD_READONLY=1 the old behaviour holds: cursors
+    //            beside the hub, peer blocks materialise.
+    // without_the_flag_behaviour_is_unchanged:end
     #[tokio::test]
     async fn without_the_flag_behaviour_is_unchanged() {
         let root = tmp("d");
@@ -343,6 +402,10 @@ mod tests {
         assert!(hub(&root).join("queues/sec.Beta.queue.md").exists());
     }
 
+    // readonly_refuses_unsafe_cursor_locations_and_never_materialises:start
+    //   purpose: Readonly refuses a missing data dir or one inside the hub, and materialize_role is
+    //            inert.
+    // readonly_refuses_unsafe_cursor_locations_and_never_materialises:end
     #[tokio::test]
     async fn readonly_refuses_unsafe_cursor_locations_and_never_materialises() {
         let root = tmp("d2");
@@ -375,6 +438,10 @@ mod tests {
     }
 
     // (e) ─────────────────────────────────────────────────────────────────────
+    // eco_loop_a_mirrored_hub_block_never_goes_back_through_send:start
+    //   purpose: (e) A block mirrored from a hub file or a peer hub, or a forged hub-looking
+    //            message, never goes through send; a real client message still does.
+    // eco_loop_a_mirrored_hub_block_never_goes_back_through_send:end
     #[tokio::test]
     async fn eco_loop_a_mirrored_hub_block_never_goes_back_through_send() {
         let root = tmp("e");

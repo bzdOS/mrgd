@@ -50,6 +50,7 @@ mod tests {
         )
     }
 
+    // CONTRACT: Create a public_chat room with the given alias as `auth`; returns the room id.
     async fn create_room(
         server: &TestServer,
         auth: &(HeaderName, HeaderValue),

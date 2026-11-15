@@ -289,6 +289,7 @@ fn is_managed_room(room_id: &str) -> bool {
         || room_id == crate::hub_replic::HUB_ROOM_ID
 }
 
+// CONTRACT: Content of the empty-key state event of a type in a room, if present. Full contract: block above.
 fn room_state_content(state: &Arc<AppState>, room_id: &str, event_type: &str) -> Option<Value> {
     let rs = state.room_state.lock().ok()?;
     rs.get(room_id)?
@@ -297,6 +298,8 @@ fn room_state_content(state: &Arc<AppState>, room_id: &str, event_type: &str) ->
         .map(|e| e.content.clone())
 }
 
+// CONTRACT: Join policy: ban refuses, a joined member passes, otherwise join_rule decides (managed rooms are
+//    invite-only). Full contract: block above.
 fn require_join_allowed(
     state: &Arc<AppState>,
     room_id: &str,
@@ -334,6 +337,8 @@ fn require_join_allowed(
     }
 }
 
+// CONTRACT: Read policy: token required, unknown room 404, then membership or world_readable. Full contract:
+//    block above.
 fn require_read_access(
     state: &Arc<AppState>,
     headers: &HeaderMap,

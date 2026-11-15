@@ -567,6 +567,13 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastObfs {
     // get_locators:end
 }
 
+// guarded_accept:start
+//   purpose: Run the server-side handshake and first-frame authentication under one deadline; on
+//            failure drop the connection, count and log the rejection.
+//   input:  tcp stream, peer addr, server key, deadline, pending slot
+//   output: Some(ObfsStream) on success, None on failure
+//   sideEffects: releases the pending slot, records the rejection, closes the stream on failure
+// guarded_accept:end
 /// Run the server-side handshake and first-frame authentication under one
 /// deadline. On any failure the connection is dropped (closing the fd), the
 /// rejection is counted and (rate-limited) logged, and `None` is returned.
@@ -709,6 +716,7 @@ mod tests {
     use std::time::Instant;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    // CONTRACT: Connected loopback TCP pair (client, server, peer addr).
     async fn pair() -> (TcpStream, TcpStream, SocketAddr) {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
@@ -717,17 +725,23 @@ mod tests {
         (c, s, peer)
     }
 
+    // CONTRACT: A pending-handshake slot from a leaked tracker with generous caps.
     fn test_slot() -> reject::PendingGuard {
         let p: &'static reject::Pending = Box::leak(Box::new(reject::Pending::new(8, 8)));
         p.try_acquire("127.0.0.1".parse().unwrap()).unwrap()
     }
 
+    // CONTRACT: Pre-shared key filled with byte b, and the server static key derived from it.
     fn key(b: u8) -> (PreSharedKey, StaticServerKey) {
         let psk = PreSharedKey([b; crate::KEY_LEN]);
         let k = StaticServerKey::derive_from_psk(&psk);
         (psk, k)
     }
 
+    // silent_client_is_closed_after_deadline:start
+    //   purpose: A client that sends nothing is closed at the deadline, sees EOF and the Timeout
+    //            counter rises.
+    // silent_client_is_closed_after_deadline:end
     #[tokio::test]
     async fn silent_client_is_closed_after_deadline() {
         let before = reject::totals();
@@ -745,6 +759,9 @@ mod tests {
         assert!(reject::totals()[RejectReason::Timeout as usize] > before[RejectReason::Timeout as usize]);
     }
 
+    // partial_hello_times_out:start
+    //   purpose: A truncated ClientHello leads to a Timeout rejection.
+    // partial_hello_times_out:end
     #[tokio::test]
     async fn partial_hello_times_out() {
         let before = reject::totals();
@@ -757,6 +774,9 @@ mod tests {
         assert!(after[RejectReason::Timeout as usize] > before[RejectReason::Timeout as usize]);
     }
 
+    // wrong_psk_is_rejected_as_auth:start
+    //   purpose: A client with the wrong PSK is closed and counted as Auth.
+    // wrong_psk_is_rejected_as_auth:end
     #[tokio::test]
     async fn wrong_psk_is_rejected_as_auth() {
         let before = reject::totals();
@@ -779,6 +799,10 @@ mod tests {
         assert!(after[RejectReason::Auth as usize] > before[RejectReason::Auth as usize]);
     }
 
+    // right_psk_first_frame_is_preserved:start
+    //   purpose: With the right PSK the first frame sent with the handshake is still readable on
+    //            the accepted stream.
+    // right_psk_first_frame_is_preserved:end
     #[tokio::test]
     async fn right_psk_first_frame_is_preserved() {
         let (client, server, peer) = pair().await;

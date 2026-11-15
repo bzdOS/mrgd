@@ -725,6 +725,7 @@ mod tests {
         );
     }
 
+    // CONTRACT: Two-step UIA registration of user alice; returns the final response.
     async fn reg_alice(server: &TestServer) -> axum_test::TestResponse {
         let c: Value = server
             .post("/_matrix/client/v3/register")
@@ -785,6 +786,9 @@ mod tests {
     }
 
     // A single node (no gate) is unaffected.
+    // no_gate_no_503:start
+    //   purpose: A node without a startup gate never answers 503 on register.
+    // no_gate_no_503:end
     #[tokio::test]
     async fn no_gate_no_503() {
         let (server, _store) = barrier_test_server();

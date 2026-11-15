@@ -330,6 +330,7 @@ type CompactionHook = Box<dyn FnOnce() + Send>;
 #[cfg(test)]
 pub(crate) static COMPACTION_HOOKS: std::sync::Mutex<Vec<(PathBuf, CompactionHook)>> =
     std::sync::Mutex::new(Vec::new());
+// CONTRACT: Test-only: run and remove the hook registered for this path, if any, before compaction proceeds.
 #[cfg(test)]
 fn compaction_test_hook(path: &Path) {
     let hook = {
@@ -350,6 +351,7 @@ fn compaction_test_hook(path: &Path) {
 #[cfg(test)]
 pub(crate) static APPEND_HOOKS: std::sync::Mutex<Vec<(PathBuf, CompactionHook)>> =
     std::sync::Mutex::new(Vec::new());
+// CONTRACT: Test-only: run and remove the hook registered for this path, if any, before an append proceeds.
 #[cfg(test)]
 fn append_test_hook(path: &Path) {
     let hook = {
@@ -916,6 +918,7 @@ pub fn compact_to_device_journal(dir: &Path, keep_msg_ids: &HashSet<String>) {
     }
 }
 
+// CONTRACT: Test-only wrapper exposing read_room_journal_events.
 #[cfg(test)]
 pub(crate) fn read_room_journal_events_for_test(path: &Path) -> Vec<Value> {
     read_room_journal_events(path)

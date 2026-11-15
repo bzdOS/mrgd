@@ -1,3 +1,11 @@
+// START_AI_HEADER
+// MODULE: tests/sigusr2_safe.rs
+// PURPOSE: Integration test: SIGUSR2 must not kill the matrix-hs binary when memprobe is not
+//          active.
+// DEPENDENCIES: matrix-hs binary (CARGO_BIN_EXE), std
+// PUBLIC_API: sigusr2_without_memprobe_keeps_process_alive
+// END_AI_HEADER
+
 //! SIGUSR2 must not kill matrix-hs when memprobe is not active.
 #![cfg(unix)]
 use std::io::{Read, Write};
@@ -5,6 +13,7 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+// CONTRACT: GET /_matrix/client/versions on 127.0.0.1:port; returns the HTTP status line or None.
 fn versions_status(port: u16) -> Option<String> {
     let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
@@ -14,6 +23,10 @@ fn versions_status(port: u16) -> Option<String> {
     b.lines().next().map(|l| l.to_string())
 }
 
+// sigusr2_without_memprobe_keeps_process_alive:start
+//   purpose: Start the server without MATRIX_HS_MEMPROBE_LOG, send SIGUSR2, and require that it
+//            still answers /versions.
+// sigusr2_without_memprobe_keeps_process_alive:end
 #[test]
 fn sigusr2_without_memprobe_keeps_process_alive() {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();

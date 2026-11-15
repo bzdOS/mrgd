@@ -149,6 +149,12 @@ pub const ENV_READONLY: &str = "MATRIX_HS_HUBD_READONLY";
 /// External command that delivers a room message into the hub in readonly mode.
 pub const ENV_SEND_CMD: &str = "MATRIX_HS_HUBD_SEND_CMD";
 
+// readonly_requested:start
+//   purpose: Whether MATRIX_HS_HUBD_READONLY is exactly "1".
+//   input:  get: env lookup closure
+//   output: bool
+//   sideEffects: none
+// readonly_requested:end
 pub fn readonly_requested(get: &dyn Fn(&str) -> Option<String>) -> bool {
     get(ENV_READONLY).is_some_and(|v| v.trim() == "1")
 }
@@ -750,6 +756,8 @@ pub fn block_from_event(content: &Value, sender: &str, ts: u64) -> Block {
 // PRIVATE_TS / private_event_id / harden_room / invite_operators:end
 const PRIVATE_TS: u64 = 1;
 
+// CONTRACT: Deterministic sha256-based event id for a private-room state event; same on every node. Full
+//    contract: the PRIVATE_TS block above.
 fn private_event_id(event_type: &str, room_id: &str, state_key: &str) -> String {
     let mut h = Sha256::new();
     h.update(b"hubd-private-v1\0");
@@ -761,6 +769,8 @@ fn private_event_id(event_type: &str, room_id: &str, state_key: &str) -> String 
     format!("${}", URL_SAFE_NO_PAD.encode(h.finalize()))
 }
 
+// CONTRACT: Switch a managed room to join_rule=invite / history_visibility=joined; true when state changed.
+//    Full contract: the PRIVATE_TS block above.
 pub(crate) fn harden_room(state: &Arc<AppState>, room_id: &str) -> bool {
     let want = [
         ("m.room.join_rules", json!({ "join_rule": "invite" })),
@@ -807,6 +817,13 @@ pub(crate) fn harden_room(state: &Arc<AppState>, room_id: &str) -> bool {
     changed
 }
 
+// operators_from_env:start
+//   purpose: Parse MATRIX_HS_HUBD_OPERATORS (comma separated); keep only entries shaped like an
+//            mxid.
+//   input:  env MATRIX_HS_HUBD_OPERATORS
+//   output: Vec of mxids, empty when unset
+//   sideEffects: reads the process env
+// operators_from_env:end
 pub fn operators_from_env() -> Vec<String> {
     std::env::var("MATRIX_HS_HUBD_OPERATORS")
         .map(|v| {
@@ -818,6 +835,8 @@ pub fn operators_from_env() -> Vec<String> {
         .unwrap_or_default()
 }
 
+// CONTRACT: Invite each configured operator once from BRIDGE_USER if it has no membership event. Full
+//    contract: the PRIVATE_TS block above.
 pub(crate) fn invite_operators(state: &Arc<AppState>, room_id: &str, operators: &[String]) {
     for user in operators {
         let known = state
@@ -1304,6 +1323,8 @@ fn append(path: &Path, text: &str) -> std::io::Result<u64> {
 static SEND_CMD_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+// CONTRACT: Readonly return path: hand client messages of a role to the external send command exactly once.
+//    Full contract: the send_role block above.
 pub(crate) fn send_role(
     state: &Arc<AppState>,
     cfg: &BridgeConfig,
@@ -1404,6 +1425,13 @@ pub(crate) fn send_role(
     n
 }
 
+// run_send_cmd:start
+//   purpose: Run the external send command `<cmd> <role> <body> --from <who>` with no shell and no
+//            stdio, killing it after SEND_TIMEOUT.
+//   input:  cmd argv, role, body, from
+//   output: Ok(()) on exit 0, Err(reason) on spawn failure, non-zero exit or timeout
+//   sideEffects: spawns a process; may kill it on timeout
+// run_send_cmd:end
 fn run_send_cmd(cmd: &[String], role: &str, body: &str, from: &str) -> Result<(), String> {
     let mut c = std::process::Command::new(&cmd[0]);
     c.args(&cmd[1..])

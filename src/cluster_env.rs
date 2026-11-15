@@ -1,3 +1,12 @@
+// START_AI_HEADER
+// MODULE: src/cluster_env.rs
+// PURPOSE: The cluster layer env decision as a pure function over the env values: whether the
+//          cluster is wanted, which mode, which endpoints, scouting config and transport-security
+//          validation. Opens nothing.
+// DEPENDENCIES: std only
+// PUBLIC_API: ClusterEnv, to_json5_endpoints
+// END_AI_HEADER
+
 // cluster_env.rs — the cluster layer's env decision, as a pure function.
 //
 // WHY IT IS SEPARATE. Until 05.10 this decision lived inline in build_state(), and the
@@ -41,6 +50,14 @@ pub struct ClusterEnv {
 }
 
 impl ClusterEnv {
+    // ClusterEnv::from_lookup:start
+    //   purpose: Read the four cluster env variables (plus scouting interface) through a lookup
+    //            closure into a ClusterEnv.
+    //   input:  get: name -> Option<value>;
+    //           MATRIX_HS_ZENOH_{CONNECT,LISTEN,SCOUTING,SCOUTING_INTERFACE,MODE}
+    //   output: ClusterEnv
+    //   sideEffects: none (the process env is not touched)
+    // ClusterEnv::from_lookup:end
     /// Read the four variables with `get`. `MATRIX_HS_ZENOH_SCOUTING` accepts
     /// off/0/false, case- and space-insensitive; `MATRIX_HS_ZENOH_MODE=client` is
     /// case-insensitive. An empty string counts as set for the endpoints, exactly as
@@ -74,6 +91,13 @@ impl ClusterEnv {
         Self::from_lookup(|k| std::env::var(k).ok())
     }
 
+    // ClusterEnv::wants_cluster:start
+    //   purpose: Decide whether the env asks for the cluster layer: any endpoint, scouting named on
+    //            or off, or client mode.
+    //   input:  &self
+    //   output: bool
+    //   sideEffects: none
+    // ClusterEnv::wants_cluster:end
     /// Does this env ask for the cluster layer? True for either endpoint, for scouting
     /// turned off, or for client mode — the same four-way condition build_state used.
     pub fn wants_cluster(&self) -> bool {
@@ -84,6 +108,13 @@ impl ClusterEnv {
             || self.client_mode
     }
 
+    // ClusterEnv::describe:start
+    //   purpose: Build the "cluster mode:" log line, usable as the marker that this binary carries
+    //            the cluster layer.
+    //   input:  &self, key prefix
+    //   output: one-line string
+    //   sideEffects: none
+    // ClusterEnv::describe:end
     /// The line the binary prints when it opens a configured session. It names connect
     /// and listen as Option<String>, so an unset one reads None and a set one reads
     /// Some(".."), which is what makes this string usable as the marker for "this
@@ -103,6 +134,13 @@ impl ClusterEnv {
          }
      }
 
+    // ClusterEnv::scouting_config:start
+    //   purpose: List the zenoh config keys implementing the scouting decision: off by default,
+    //            interface-confined when on.
+    //   input:  &self
+    //   output: Vec of (key, JSON5 value)
+    //   sideEffects: none
+    // ClusterEnv::scouting_config:end
     /// The zenoh config keys (JSON5 values) that implement the scouting decision.
     /// Off (the default): multicast and gossip disabled, so the node opens no UDP
     /// socket for discovery. On (explicit): zenoh defaults, with the multicast
@@ -124,6 +162,13 @@ impl ClusterEnv {
         }
     }
 
+    // ClusterEnv::scouting_warning:start
+    //   purpose: Warn when scouting is explicitly on without an interface (listens on all
+    //            interfaces).
+    //   input:  &self
+    //   output: Some(warning text) or None
+    //   sideEffects: none
+    // ClusterEnv::scouting_warning:end
     /// Warning for the log when scouting is explicitly on and not confined to an
     /// interface: zenoh then uses "auto" and listens on all of them.
     pub fn scouting_warning(&self) -> Option<&'static str> {
@@ -133,6 +178,13 @@ impl ClusterEnv {
         )
     }
 
+    // ClusterEnv::listen_endpoints_json5:start
+    //   purpose: Render listen/endpoints; unset or empty LISTEN becomes an explicit empty list so
+    //            zenoh binds nothing.
+    //   input:  &self
+    //   output: JSON5 array string
+    //   sideEffects: none
+    // ClusterEnv::listen_endpoints_json5:end
     /// The `listen/endpoints` value (JSON5 array) this env asks for. Zenoh's peer
     /// default is `tcp/[::]:0` (zenoh-config defaults.rs) — a listener on every
     /// interface — so an unset or empty MATRIX_HS_ZENOH_LISTEN becomes an explicit
@@ -146,6 +198,13 @@ impl ClusterEnv {
         }
     }
 
+    // ClusterEnv::validate_transport_security:start
+    //   purpose: Reject plaintext tcp/ on non-loopback hosts and wildcard listen under any
+    //            protocol.
+    //   input:  &self (connect and listen lists)
+    //   output: Ok(()) or Err naming the first insecure endpoint
+    //   sideEffects: none
+    // ClusterEnv::validate_transport_security:end
     /// Reject plaintext `tcp/` Zenoh endpoints on non-loopback addresses, and
     /// wildcard listen (0.0.0.0, [::]) under any protocol.
     /// Per the fleet rule (see .env.example: "never plaintext Zenoh on a public
@@ -185,6 +244,7 @@ impl ClusterEnv {
     }
 }
 
+// CONTRACT: Host part of proto/host:port#meta, brackets stripped for IPv6.
 /// Host part of "proto/host:port#meta": brackets removed for IPv6; an unbracketed
 /// address with several colons ("::", "::1:7448") is returned up to `#` as is.
 fn endpoint_host(ep: &str) -> String {
@@ -199,16 +259,24 @@ fn endpoint_host(ep: &str) -> String {
     addr.split(':').next().unwrap_or("").to_string()
 }
 
+// CONTRACT: True for all-interfaces addresses.
 /// True for the "all interfaces" addresses.
 fn is_wildcard_host(host: &str) -> bool {
     matches!(host, "0.0.0.0" | "::" | "::0" | "0:0:0:0:0:0:0:0")
 }
 
+// CONTRACT: True for loopback hosts safe for plaintext tcp/.
 /// True for loopback addresses that are safe for plaintext tcp/.
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1" | "localhost") || host.starts_with("::1:")
 }
 
+// to_json5_endpoints:start
+//   purpose: Turn a comma separated endpoint list into a JSON5 array of quoted, trimmed strings.
+//   input:  s: "ep1, ep2"
+//   output: string like ["ep1","ep2"]
+//   sideEffects: none
+// to_json5_endpoints:end
 /// "ep1, ep2" -> ["ep1","ep2"], the shape zenoh's JSON5 endpoint setters take.
 pub fn to_json5_endpoints(s: &str) -> String {
     let quoted: Vec<String> = s.split(',').map(|e| format!("\"{}\"", e.trim())).collect();
@@ -219,6 +287,8 @@ pub fn to_json5_endpoints(s: &str) -> String {
 mod tests {
     use super::*;
 
+    // CONTRACT: Build a ClusterEnv from (name, value) pairs through from_lookup, without touching the process
+    //    env.
     fn env_of(pairs: &[(&str, &str)]) -> ClusterEnv {
         let v: Vec<(String, String)> =
             pairs.iter().map(|(k, x)| (k.to_string(), x.to_string())).collect();
@@ -228,6 +298,7 @@ mod tests {
     // The stand's env, as read from its own file on 06.10: a listen endpoint in obfs
     // form, scouting off, no connect. This is the pair of values whose absence in a
     // binary produced a healthy, empty stand.
+    // CONTRACT: The stand env as read on 06.10: obfs listen endpoint, scouting off, no connect.
     fn stand_env() -> ClusterEnv {
         env_of(&[
             ("MATRIX_HS_ZENOH_LISTEN", "obfs/198.51.100.7:7447"),
@@ -235,6 +306,10 @@ mod tests {
         ])
     }
 
+    // stand_env_wants_the_cluster_and_describes_its_listener:start
+    //   purpose: The stand env asks for the cluster, is a peer, and its marker line names both
+    //            endpoints.
+    // stand_env_wants_the_cluster_and_describes_its_listener:end
     #[test]
     fn stand_env_wants_the_cluster_and_describes_its_listener() {
         let e = stand_env();
@@ -250,6 +325,9 @@ mod tests {
         assert!(line.contains("scouting=off"), "{line}");
     }
 
+    // an_env_without_any_of_the_four_does_not_want_the_cluster:start
+    //   purpose: An env with none of the four variables does not ask for the cluster layer.
+    // an_env_without_any_of_the_four_does_not_want_the_cluster:end
     #[test]
     fn an_env_without_any_of_the_four_does_not_want_the_cluster() {
         let e = env_of(&[("MATRIX_HS_SERVER_NAME", "localhost")]);
@@ -257,6 +335,10 @@ mod tests {
         assert!(e.describe("p").contains("peer, scouting off (no connect/listen env)"));
     }
 
+    // each_of_the_four_alone_is_enough:start
+    //   purpose: Any one of CONNECT, LISTEN, SCOUTING=off or MODE=client alone asks for the cluster
+    //            layer.
+    // each_of_the_four_alone_is_enough:end
     #[test]
     fn each_of_the_four_alone_is_enough() {
         for pairs in [
@@ -270,6 +352,9 @@ mod tests {
         }
     }
 
+    // scouting_is_off_unless_named_on:start
+    //   purpose: Scouting stays off unless named on; unset, empty and unknown text leave it off.
+    // scouting_is_off_unless_named_on:end
     #[test]
     fn scouting_is_off_unless_named_on() {
         let off = vec![
@@ -291,6 +376,10 @@ mod tests {
         assert_eq!(e.scouting_config(), off);
     }
 
+    // explicit_scouting_on_confines_the_interface_or_warns:start
+    //   purpose: Scouting on with an interface confines multicast to it; without one a warning is
+    //            produced.
+    // explicit_scouting_on_confines_the_interface_or_warns:end
     #[test]
     fn explicit_scouting_on_confines_the_interface_or_warns() {
         let e = env_of(&[
@@ -313,6 +402,9 @@ mod tests {
         assert!(e.describe("p").contains("scouting=on"));
     }
 
+    // scouting_off_spellings_and_mode_case_do_not_matter:start
+    //   purpose: off/0/false and client mode are matched case- and space-insensitively.
+    // scouting_off_spellings_and_mode_case_do_not_matter:end
     #[test]
     fn scouting_off_spellings_and_mode_case_do_not_matter() {
         for v in ["off", "OFF", " Off ", "0", "false"] {
@@ -330,6 +422,10 @@ mod tests {
         assert!(!env_of(&[("MATRIX_HS_ZENOH_MODE", "peer")]).client_mode);
     }
 
+    // an_empty_endpoint_var_still_asks_for_the_cluster:start
+    //   purpose: An endpoint variable set to the empty string still counts as asking for the
+    //            cluster.
+    // an_empty_endpoint_var_still_asks_for_the_cluster:end
     #[test]
     fn an_empty_endpoint_var_still_asks_for_the_cluster() {
         // env::var(..).ok() sees Some(""), and asking for a cluster with an empty
@@ -340,6 +436,9 @@ mod tests {
         assert!(e.describe("p").contains("listen=Some(\"\")"));
     }
 
+    // endpoints_become_a_json5_array:start
+    //   purpose: to_json5_endpoints quotes and trims each entry, and quotes an empty string.
+    // endpoints_become_a_json5_array:end
     #[test]
     fn endpoints_become_a_json5_array() {
         assert_eq!(to_json5_endpoints("tcp/a:1"), "[\"tcp/a:1\"]");
@@ -347,6 +446,9 @@ mod tests {
         assert_eq!(to_json5_endpoints(""), "[\"\"]");
     }
 
+    // plaintext_tcp_on_loopback_is_allowed:start
+    //   purpose: Plaintext tcp/ on loopback hosts passes validate_transport_security.
+    // plaintext_tcp_on_loopback_is_allowed:end
     #[test]
     fn plaintext_tcp_on_loopback_is_allowed() {
         let e = env_of(&[("MATRIX_HS_ZENOH_LISTEN", "tcp/127.0.0.1:7448")]);
@@ -357,6 +459,9 @@ mod tests {
         assert!(e.validate_transport_security().is_ok());
     }
 
+    // obfs_on_any_address_is_allowed:start
+    //   purpose: obfs/ endpoints pass the transport check on any address.
+    // obfs_on_any_address_is_allowed:end
     #[test]
     fn obfs_on_any_address_is_allowed() {
         let e = env_of(&[(
@@ -371,6 +476,9 @@ mod tests {
         assert!(e.validate_transport_security().is_ok());
     }
 
+    // plaintext_tcp_on_public_address_is_rejected:start
+    //   purpose: Plaintext tcp/ on a non-loopback address is rejected.
+    // plaintext_tcp_on_public_address_is_rejected:end
     #[test]
     fn plaintext_tcp_on_public_address_is_rejected() {
         let e = env_of(&[("MATRIX_HS_ZENOH_LISTEN", "tcp/0.0.0.0:7448")]);
@@ -399,6 +507,9 @@ mod tests {
         assert!(e.validate_transport_security().is_ok());
     }
 
+    // unset_or_empty_listen_becomes_an_explicit_empty_list:start
+    //   purpose: Unset or empty LISTEN renders as [].
+    // unset_or_empty_listen_becomes_an_explicit_empty_list:end
     #[test]
     fn unset_or_empty_listen_becomes_an_explicit_empty_list() {
         // Zenoh's peer default is tcp/[::]:0 — all interfaces. "[]" is what keeps it off.
@@ -409,12 +520,18 @@ mod tests {
         assert_eq!(env_of(&[("MATRIX_HS_ZENOH_LISTEN", "  ")]).listen_endpoints_json5(), "[]");
     }
 
+    // explicit_listen_is_passed_through:start
+    //   purpose: A set LISTEN is passed through as written.
+    // explicit_listen_is_passed_through:end
     #[test]
     fn explicit_listen_is_passed_through() {
         let e = env_of(&[("MATRIX_HS_ZENOH_LISTEN", "tcp/127.0.0.1:7448")]);
         assert_eq!(e.listen_endpoints_json5(), "[\"tcp/127.0.0.1:7448\"]");
     }
 
+    // wildcard_listen_is_rejected_under_any_protocol:start
+    //   purpose: Wildcard listen (0.0.0.0, [::]) is rejected for every protocol.
+    // wildcard_listen_is_rejected_under_any_protocol:end
     #[test]
     fn wildcard_listen_is_rejected_under_any_protocol() {
         for ep in [
@@ -434,6 +551,9 @@ mod tests {
         }
     }
 
+    // named_interface_listen_and_bracketed_loopback_are_allowed:start
+    //   purpose: A named-address listen and bracketed loopback pass the transport check.
+    // named_interface_listen_and_bracketed_loopback_are_allowed:end
     #[test]
     fn named_interface_listen_and_bracketed_loopback_are_allowed() {
         for ep in [
@@ -448,6 +568,9 @@ mod tests {
         }
     }
 
+    // wildcard_in_connect_is_not_a_listen_error:start
+    //   purpose: A wildcard host in CONNECT is not a listen error.
+    // wildcard_in_connect_is_not_a_listen_error:end
     #[test]
     fn wildcard_in_connect_is_not_a_listen_error() {
         // CONNECT to 0.0.0.0 is not a listener; only plaintext-tcp rules apply to it.

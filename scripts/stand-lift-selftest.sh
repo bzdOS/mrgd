@@ -1,4 +1,12 @@
 #!/bin/sh
+# START_AI_HEADER
+# MODULE: scripts/stand-lift-selftest.sh
+# PURPOSE: Run the stand-lift.sh gates on a copy in a temporary stand under a free loopback port;
+#          the live stand is never touched.
+# DEPENDENCIES: sh, sockstat, stand-lift.sh
+# PUBLIC_API: script (env: STAND_WAIT)
+# END_AI_HEADER
+
 # stand-lift-selftest.sh — прогон гейтов stand-lift.sh на КОПИИ, во временном
 # стенде. Живой стенд не трогается: свой STAND_HOME под mktemp, своя копия
 # бинаря, свой порт на 127.0.0.1, свой pid-файл; в конце процесс снимается.
@@ -61,6 +69,7 @@ cp "$SRC" "$H/bin/matrix-hs"
 chmod 755 "$H/bin/matrix-hs"
 PIDFILE="$H/mrgd.pid"
 
+# CONTRACT: Stop the stand started by the selftest and remove its temp tree.
 cleanup() {
 	if [ -f "$PIDFILE" ]; then
 		_pid=$(cat "$PIDFILE" 2>/dev/null || echo "")
@@ -72,6 +81,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 SECRET=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+# CONTRACT: Write the selftest env file with a random secret and loopback listen; $1 adds extra lines.
 write_env() {
 	cat > "$H/mrgd.env" <<-ENV
 		MATRIX_HS_LISTEN=127.0.0.1:$PORT
@@ -85,6 +95,8 @@ write_env() {
 }
 
 fail=0
+# CONTRACT: Run stand-lift.sh against the temp stand and check the exit code ($2) and an output substring
+#    ($3); sets fail=1 on mismatch.
 run() { # name, expected rc, expected substring
 	set +e
 	STAND_HOME="$H" STAND_WAIT=${STAND_WAIT:-60} sh "$HERE/stand-lift.sh" > "$T/out" 2>&1
@@ -97,6 +109,7 @@ run() { # name, expected rc, expected substring
 }
 
 # Отказ гейта обязан случиться до запуска бинаря: нет pid-файла, порт свободен.
+# CONTRACT: Assert that a gate refusal happened before the binary started: no pid file, port free.
 refused_before_start() {
 	[ ! -f "$PIDFILE" ] || { echo "  FAIL: pid-файл есть — бинарь стартовал" >&2; fail=1; }
 	if sockstat -46 -l -p "$PORT" 2>/dev/null | grep -qE ":$PORT[[:space:]]"; then

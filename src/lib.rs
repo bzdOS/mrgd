@@ -197,6 +197,10 @@ pub(crate) mod test_util {
         assert!(ok, "test zenoh endpoint must be loopback (127.0.0.1), got {ep:?}");
     }
 
+    // loopback_guard_accepts_loopback_only:start
+    //   purpose: assert_loopback_endpoint accepts 127.0.0.1 endpoints (tcp and obfs) and panics on
+    //            wildcard, hostname, public or empty ones.
+    // loopback_guard_accepts_loopback_only:end
     #[test]
     fn loopback_guard_accepts_loopback_only() {
         assert_loopback_endpoint("tcp/127.0.0.1:0");

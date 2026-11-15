@@ -24,6 +24,12 @@ use std::sync::Arc;
 
 type Bearer = (HeaderName, HeaderValue);
 
+// register:start
+//   purpose: Register a user through the two-step UIA flow and return a ready Authorization header.
+//   input:  server, username
+//   output: Bearer header pair
+//   sideEffects: two POSTs to /register on the test server
+// register:end
 async fn register(server: &TestServer, username: &str) -> Bearer {
     let ch: Value = server
         .post("/_matrix/client/v3/register")
@@ -46,10 +52,17 @@ async fn register(server: &TestServer, username: &str) -> Bearer {
     )
 }
 
+// CONTRACT: Full mxid of a local user name on this state server.
 fn uid(state: &Arc<AppState>, name: &str) -> String {
     format!("@{name}:{}", state.server_name)
 }
 
+// create:start
+//   purpose: Create a room as `who` with the given createRoom body.
+//   input:  server, creator header, createRoom JSON
+//   output: room_id
+//   sideEffects: POST /createRoom; asserts status 200
+// create:end
 async fn create(server: &TestServer, who: &Bearer, body: Value) -> String {
     let r = server
         .post("/_matrix/client/v3/createRoom")
@@ -60,6 +73,7 @@ async fn create(server: &TestServer, who: &Bearer, body: Value) -> String {
     r.json::<Value>()["room_id"].as_str().expect("room_id").to_string()
 }
 
+// CONTRACT: POST a JSON body to a CS-API path, optionally with a token; returns (status, json).
 async fn post(server: &TestServer, who: Option<&Bearer>, path: &str, body: Value) -> (u16, Value) {
     let mut req = server.post(&format!("/_matrix/client/v3{path}"));
     if let Some(b) = who {
@@ -69,6 +83,7 @@ async fn post(server: &TestServer, who: Option<&Bearer>, path: &str, body: Value
     (r.status_code().as_u16(), r.json::<Value>())
 }
 
+// CONTRACT: GET a CS-API path, optionally with a token; returns (status, json).
 async fn get(server: &TestServer, who: Option<&Bearer>, path: &str) -> (u16, Value) {
     let mut req = server.get(&format!("/_matrix/client/v3{path}"));
     if let Some(b) = who {
@@ -90,6 +105,13 @@ struct World {
     room: String,
 }
 
+// world:start
+//   purpose: Build the shared fixture: alice owns a private_chat room with one message, bob is
+//            invited and joined, mallory is a stranger.
+//   input:  none
+//   output: World
+//   sideEffects: registers three users, creates a room, sends one message; asserts each step is 200
+// world:end
 async fn world() -> World {
     let state = AppState::new();
     let server = TestServer::new(router(state.clone()));
@@ -113,6 +135,8 @@ async fn world() -> World {
     World { state, server, alice, bob, mallory, room }
 }
 
+// CONTRACT: The eight read routes (state variants, members, joined_members, messages) closed by the fix, for
+//    one room.
 fn read_paths(room: &str) -> Vec<String> {
     vec![
         format!("/rooms/{room}/state"),
@@ -126,6 +150,7 @@ fn read_paths(room: &str) -> Vec<String> {
     ]
 }
 
+// CONTRACT: Have alice set m.room.history_visibility of the fixture room; asserts 200.
 async fn set_visibility(w: &World, vis: &str) {
     let r = w
         .server
@@ -136,6 +161,9 @@ async fn set_visibility(w: &World, vis: &str) {
     assert_eq!(r.status_code(), 200, "{}", r.text());
 }
 
+// read_without_token_is_401_missing_token:start
+//   purpose: Every read route answers 401 M_MISSING_TOKEN when no token is sent.
+// read_without_token_is_401_missing_token:end
 #[tokio::test]
 async fn read_without_token_is_401_missing_token() {
     let w = world().await;
@@ -146,6 +174,9 @@ async fn read_without_token_is_401_missing_token() {
     }
 }
 
+// read_with_garbage_token_is_401_unknown_token:start
+//   purpose: Every read route answers 401 M_UNKNOWN_TOKEN for an unknown token.
+// read_with_garbage_token_is_401_unknown_token:end
 #[tokio::test]
 async fn read_with_garbage_token_is_401_unknown_token() {
     let w = world().await;
@@ -160,6 +191,10 @@ async fn read_with_garbage_token_is_401_unknown_token() {
     }
 }
 
+// read_by_stranger_is_403_and_leaks_nothing:start
+//   purpose: A stranger gets 403 M_FORBIDDEN on every read route and the body never carries the
+//            room content.
+// read_by_stranger_is_403_and_leaks_nothing:end
 #[tokio::test]
 async fn read_by_stranger_is_403_and_leaks_nothing() {
     let w = world().await;
@@ -171,6 +206,9 @@ async fn read_by_stranger_is_403_and_leaks_nothing() {
     }
 }
 
+// read_by_member_is_200:start
+//   purpose: A joined member reads every route with 200.
+// read_by_member_is_200:end
 #[tokio::test]
 async fn read_by_member_is_200() {
     let w = world().await;
@@ -194,6 +232,10 @@ async fn read_by_member_is_200() {
     assert_eq!(s, 200);
 }
 
+// read_by_invited_or_left_user_is_403:start
+//   purpose: An invited-only or left user is refused (documented simplification: joined or
+//            world_readable).
+// read_by_invited_or_left_user_is_403:end
 #[tokio::test]
 async fn read_by_invited_or_left_user_is_403() {
     let w = world().await;
@@ -214,6 +256,10 @@ async fn read_by_invited_or_left_user_is_403() {
     }
 }
 
+// world_readable_stranger_with_token_reads_without_token_still_401:start
+//   purpose: With history_visibility world_readable a stranger holding a token reads; without a
+//            token the answer is still 401.
+// world_readable_stranger_with_token_reads_without_token_still_401:end
 #[tokio::test]
 async fn world_readable_stranger_with_token_reads_without_token_still_401() {
     let w = world().await;
@@ -234,6 +280,9 @@ async fn world_readable_stranger_with_token_reads_without_token_still_401() {
     assert!(b.to_string().contains("room secret"));
 }
 
+// read_of_unknown_room_is_404_after_the_token_check:start
+//   purpose: Token check comes first (401), then an unknown room is 404 M_NOT_FOUND.
+// read_of_unknown_room_is_404_after_the_token_check:end
 #[tokio::test]
 async fn read_of_unknown_room_is_404_after_the_token_check() {
     let w = world().await;
@@ -245,10 +294,14 @@ async fn read_of_unknown_room_is_404_after_the_token_check() {
 
 // ---- join ----------------------------------------------------------------------------
 
+// CONTRACT: The two join routes (/rooms/{id}/join and /join/{id}) for one room.
 fn join_paths(room: &str) -> Vec<String> {
     vec![format!("/rooms/{room}/join"), format!("/join/{room}")]
 }
 
+// join_without_token_is_401_missing_token:start
+//   purpose: Both join routes answer 401 M_MISSING_TOKEN without a token.
+// join_without_token_is_401_missing_token:end
 #[tokio::test]
 async fn join_without_token_is_401_missing_token() {
     let w = world().await;
@@ -258,6 +311,9 @@ async fn join_without_token_is_401_missing_token() {
     }
 }
 
+// join_invite_room_needs_an_invite:start
+//   purpose: Joining an invite-only room is 403 for a stranger and succeeds after an invite.
+// join_invite_room_needs_an_invite:end
 #[tokio::test]
 async fn join_invite_room_needs_an_invite() {
     let w = world().await;
@@ -280,6 +336,9 @@ async fn join_invite_room_needs_an_invite() {
     }
 }
 
+// join_public_room_is_open:start
+//   purpose: A public room accepts a join from any authenticated user.
+// join_public_room_is_open:end
 #[tokio::test]
 async fn join_public_room_is_open() {
     let w = world().await;
@@ -291,6 +350,9 @@ async fn join_public_room_is_open() {
     }
 }
 
+// join_banned_user_is_403_even_in_a_public_room:start
+//   purpose: A banned user is refused on both join routes and cannot read, even in a public room.
+// join_banned_user_is_403_even_in_a_public_room:end
 #[tokio::test]
 async fn join_banned_user_is_403_even_in_a_public_room() {
     let w = world().await;
@@ -309,6 +371,9 @@ async fn join_banned_user_is_403_even_in_a_public_room() {
     assert_eq!(s, 403);
 }
 
+// join_knock_restricted_and_ruleless_rooms_need_an_invite:start
+//   purpose: knock, restricted, knock_restricted and unknown join rules all require an invite.
+// join_knock_restricted_and_ruleless_rooms_need_an_invite:end
 #[tokio::test]
 async fn join_knock_restricted_and_ruleless_rooms_need_an_invite() {
     let w = world().await;
@@ -339,6 +404,9 @@ async fn join_knock_restricted_and_ruleless_rooms_need_an_invite() {
     assert_eq!(s, 403, "{b}");
 }
 
+// already_joined_member_can_rejoin:start
+//   purpose: A member already joined can call join again and gets 200.
+// already_joined_member_can_rejoin:end
 #[tokio::test]
 async fn already_joined_member_can_rejoin() {
     let w = world().await;
@@ -348,6 +416,10 @@ async fn already_joined_member_can_rejoin() {
 
 // ---- routes that are public by spec stay open ----------------------------------------
 
+// spec_public_routes_stay_open_without_a_token:start
+//   purpose: Routes public by spec (versions, login, register/available, profile, media config,
+//            well-known) stay open without a token.
+// spec_public_routes_stay_open_without_a_token:end
 #[tokio::test]
 async fn spec_public_routes_stay_open_without_a_token() {
     let w = world().await;

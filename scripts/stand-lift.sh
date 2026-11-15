@@ -1,4 +1,13 @@
 #!/bin/sh
+# START_AI_HEADER
+# MODULE: scripts/stand-lift.sh
+# PURPOSE: Reproducible, idempotent lift of the matrix-hs stand: reads the env file, runs the gates
+#          (listen, zenoh endpoints, hubd bridge paths, port, cluster feature) and only then starts
+#          the binary.
+# DEPENDENCIES: sh, sockstat, realpath, the matrix-hs binary
+# PUBLIC_API: script (env: STAND_HOME, STAND_WAIT, STAND_FORBIDDEN_LISTEN_HOSTS)
+# END_AI_HEADER
+
 # ПОДЪЁМ СТЕНДА matrix-hs — воспроизводимая запись и идемпотентный запуск.
 #
 # Gates are a guard against operator mistakes, not against a malicious owner of the env file.
@@ -83,15 +92,23 @@ LISTEN_PORT=${MATRIX_HS_LISTEN##*:}
 
 # Wildcard test: empty, '*', or only the characters [ ] : . 0 (0, 0.0.0.0, ::,
 # [::], [0:0:0:0:0:0:0:0], ...).
+# CONTRACT: True for an empty, "*" or all-wildcard host ([ ] : . 0 only).
 is_wild() {
 	[ "$1" = '*' ] && return 0
 	[ -z "$(printf '%s' "$1" | tr -d '[]:.0')" ]
 }
+# CONTRACT: Lower-case a host and strip square brackets.
 hostnorm() { printf '%s' "$1" | tr -d '[]' | tr '[:upper:]' '[:lower:]'; }
 
 # MATRIX_HS_LISTEN gate: a wildcard host (with or without :port) and any host
 # in STAND_FORBIDDEN_LISTEN_HOSTS (space- or ':'-separated, a [v6] entry is
 # kept whole; env file or environment; nothing is hardcoded, default empty).
+# listen_gate:start
+#   purpose: Refuse a MATRIX_HS_LISTEN whose host is a wildcard or in STAND_FORBIDDEN_LISTEN_HOSTS.
+#   input:  $1: listen value
+#   output: returns 0 when allowed; prints the refusal on stderr and exits non-zero otherwise
+#   sideEffects: none
+# listen_gate:end
 listen_gate() {
 	case "$1" in
 		'['*']'*) _lh="${1%%]*}]" ;;
@@ -142,6 +159,13 @@ listen_gate "$MATRIX_HS_LISTEN" || exit 1
 # a malformed host:port. Same rules as rc.d/mrgd_node (deploy/bsdos).
 # ZENOH_* are OPTIONAL: under `set -u` a bare "$VAR" aborts the lift with
 # "parameter not set" when the env file omits them, hence ${VAR:-} throughout.
+# zenoh_gate:start
+#   purpose: Check every endpoint of a ZENOH listen or connect list: only allowed schemes and
+#            well-formed host:port.
+#   input:  $1 variable name, $2 listen|connect, $3 comma separated value
+#   output: returns 0 when all endpoints pass; names the offending endpoint on stderr otherwise
+#   sideEffects: none
+# zenoh_gate:end
 zenoh_gate() { # $1 variable name, $2 listen|connect, $3 comma-separated value
 	_zrest=$3
 	while :; do
@@ -222,13 +246,16 @@ unset _zmode
 # требует MATRIX_HS_DATA_DIR (или MATRIX_HS_HUBD_STATE_DIR), лежащий вне HUB_DIR,
 # QUEUES_DIR и их родителей: иначе «readonly» писал бы в хаб курсорами.
 # Без флага — прежний отказ целиком.
+# CONTRACT: realpath of $1 into _r; false when it cannot be resolved or is empty.
 hubd_rp() { _r=$(realpath -- "$1" 2>/dev/null) && [ -n "$_r" ]; }
+# CONTRACT: True when $1 equals $2 or lies inside it.
 hubd_within() { # $1 равен $2 или лежит внутри $2
 	[ "$2" = / ] && return 0
 	[ "$1" = "$2" ] && return 0
 	case "$1" in "$2"/*) return 0 ;; esac
 	return 1
 }
+# CONTRACT: Refuse a path equal to, inside, or containing a live hub path; skipped in readonly mode.
 hubd_vs_live() { # метка, realpath проверяемого пути
 	[ "${_ro:-0}" = 1 ] && return 0 # readonly: живой путь допустим, см. hubd_gate
 	while IFS= read -r _l; do
@@ -245,6 +272,13 @@ hubd_vs_live() { # метка, realpath проверяемого пути
 	$_lr
 	EOF
 }
+# hubd_gate:start
+#   purpose: Gate for the hubd bridge dirs: refuse live hub paths, except readonly mode which
+#            requires a state dir outside the hub.
+#   input:  env MATRIX_HS_HUBD_{QUEUES_DIR,HUB_DIR,READONLY,STATE_DIR}, MATRIX_HS_DATA_DIR
+#   output: returns 0 when allowed; refusal text on stderr otherwise
+#   sideEffects: reads realpaths
+# hubd_gate:end
 hubd_gate() {
 	_q=${MATRIX_HS_HUBD_QUEUES_DIR:-}
 	_h=${MATRIX_HS_HUBD_HUB_DIR:-}
@@ -317,6 +351,7 @@ hubd_gate || exit 1
 # таблицы, и `grep -q .` считает занятым свободный порт. На этом споткнулся
 # прогон на юник-сокетах.
 ADDR_TAKEN="[[:space:]](${LISTEN_HOST}|\\*|0\\.0\\.0\\.0):${LISTEN_PORT}[[:space:]]"
+# CONTRACT: True when the listen address is already bound (sockstat check).
 addr_taken() {
 	sockstat -4 -l -p "$LISTEN_PORT" 2>/dev/null | grep -qE "$ADDR_TAKEN"
 }

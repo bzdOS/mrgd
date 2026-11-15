@@ -84,6 +84,13 @@ mod memprobe;
 // build that does not carry the layer, which is the build that needs telling.
 mod cluster_env;
 
+// main:start
+//   purpose: Process entry: install memprobe or the SIGUSR2 guard, build AppState, optionally open
+//            the cluster layer and bridges, serve the router until a shutdown signal.
+//   input:  env (MATRIX_HS_*)
+//   output: Ok(()) after graceful shutdown, Err on startup failure
+//   sideEffects: binds the listen socket, spawns background tasks, reads and writes the data dir
+// main:end
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Allocator statistics on SIGUSR2, when MATRIX_HS_MEMPROBE_LOG is set.
@@ -152,6 +159,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
+// guard_sigusr2:start
+//   purpose: Keep SIGUSR2 from terminating the process when memprobe does not own it; log the first
+//            signal, count later ones.
+//   input:  reason: why memprobe is inactive
+//   output: none
+//   sideEffects: spawns a tokio listener task, or sets SIG_IGN when the listener cannot be
+//                registered
+// guard_sigusr2:end
 /// Keep SIGUSR2 from terminating the process when memprobe does not own it.
 /// The first signal logs one stderr line; later ones are counted silently.
 /// Falls back to SIG_IGN if the tokio listener cannot be registered.

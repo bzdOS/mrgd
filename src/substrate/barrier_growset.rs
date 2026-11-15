@@ -1524,6 +1524,8 @@ mod cluster_tests {
     // remote subscriber has propagated through the Zenoh scouting graph, and the PUT is
     // silently dropped (Zenoh pub/sub has no replay for late subscribers).
     // This mirrors the identical delay in zenoh_crdt_roomlog_convergence (crdt.rs §1583).
+    // CONTRACT: Two ZenohCrdtSink over a loopback mesh, with a 50 ms wait so subscribers have propagated
+    //    before the first publish.
     async fn open_pair() -> (Arc<ZenohCrdtSink>, Arc<ZenohCrdtSink>) {
         let [sess_a, sess_b] = crate::test_util::open_mesh().await;
         let sink_a = Arc::new(
@@ -1824,6 +1826,8 @@ mod startup_sync_tests {
     use crate::substrate::crdt::MemCrdtSink;
     use std::time::Duration;
 
+    // CONTRACT: ReconcileDriver and GrowSetClaimStore for a node over the given in-memory sink, with a 1 s
+    //    tick.
     fn driver(sink: MemCrdtSink, node: &str) -> (ReconcileDriver, GrowSetClaimStore) {
         let sink: Arc<dyn CrdtSink> = Arc::new(sink);
         let (store, view) = GrowSetClaimStore::new(sink.clone(), node.to_string());
@@ -1834,6 +1838,10 @@ mod startup_sync_tests {
         )
     }
 
+    // hello_ack_delivers_peer_claims_and_opens_gate:start
+    //   purpose: A restarted node learns the peer claim through hello/ack after the peers
+    //            anti-entropy burst is over, and only then opens the gate.
+    // hello_ack_delivers_peer_claims_and_opens_gate:end
     /// A restarted node (gate armed) learns the peer's claim through hello/ack even
     /// though the peer's anti-entropy burst is long over, and only then opens.
     #[test]
@@ -1877,6 +1885,10 @@ mod startup_sync_tests {
         ));
     }
 
+    // empty_peer_still_acks:start
+    //   purpose: A peer with no claims still acks, so an empty peer does not cost the full gate
+    //            timeout.
+    // empty_peer_still_acks:end
     /// A peer with no claims at all still acks, so an empty peer does not cost the
     /// full gate timeout.
     #[test]

@@ -67,6 +67,12 @@ pub enum HsError {
     GateClosed(u64),
 }
 
+// startup_gate_response:start
+//   purpose: Build the 503 body for a closed startup gate: M_LIMIT_EXCEEDED with retry_after_ms.
+//   input:  retry_after_ms
+//   output: axum Response (503)
+//   sideEffects: none
+// startup_gate_response:end
 /// 503 body for a closed startup gate. M_LIMIT_EXCEEDED + retry_after_ms is the
 /// errcode clients already know to retry on after a delay.
 pub fn startup_gate_response(retry_after_ms: u64) -> Response {
@@ -82,6 +88,13 @@ pub fn startup_gate_response(retry_after_ms: u64) -> Response {
 }
 
 impl IntoResponse for HsError {
+    // HsError::into_response:start
+    //   purpose: Map each HsError variant to its HTTP status and Matrix errcode; GateClosed goes
+    //            through startup_gate_response.
+    //   input:  self: HsError
+    //   output: axum Response with {errcode, error}
+    //   sideEffects: none
+    // HsError::into_response:end
     fn into_response(self) -> Response {
         if let HsError::GateClosed(ms) = &self {
             return startup_gate_response(*ms);

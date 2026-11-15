@@ -1615,6 +1615,13 @@ fn redactions_max_entries_from_env() -> usize {
 }
 
 impl Default for AppState {
+    // AppState::default:start
+    //   purpose: Build an AppState from the process env (server name, base URL, data dir, secrets,
+    //            signer).
+    //   input:  env MATRIX_HS_SERVER_NAME / PUBLIC_BASEURL / DATA_DIR / REGISTRATION_SHARED_SECRET
+    //   output: AppState
+    //   sideEffects: creates or loads the node signing key under the data dir
+    // AppState::default:end
     fn default() -> Self {
         let server_name =
             std::env::var("MATRIX_HS_SERVER_NAME").unwrap_or_else(|_| "localhost".to_string());
@@ -3760,6 +3767,14 @@ impl AppState {
         true
     }
 
+    // AppState::apply_remote_state_event:start
+    //   purpose: Apply a state event learned from a peer or the bridge by last-writer-wins on (ts,
+    //            event_id); observes the peer clock first.
+    //   input:  &self, ev: StateEvent
+    //   output: Ok(true) when room state changed, Ok(false) when the event lost or was a duplicate,
+    //           Err on lock failure
+    //   sideEffects: updates room_state and the HLC clock; may journal the event
+    // AppState::apply_remote_state_event:end
     pub fn apply_remote_state_event(&self, ev: StateEvent) -> Result<bool, String> {
         self.ensure_room_state(&ev.room_id);
         // Learn from the peer's clock before anything else, so our next write is

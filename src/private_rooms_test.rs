@@ -27,6 +27,7 @@ mod tests {
 
     type Bearer = (HeaderName, HeaderValue);
 
+    // CONTRACT: Two-step UIA registration returning an Authorization header (same flow as authz_test).
     async fn register(server: &TestServer, username: &str) -> Bearer {
         let ch: Value = server
             .post("/_matrix/client/v3/register")
@@ -49,6 +50,8 @@ mod tests {
         )
     }
 
+    // CONTRACT: Build an AppState with a TestServer and register the operator and stranger users used by the
+    //    tests.
     async fn setup() -> (Arc<AppState>, TestServer, String) {
         let state = AppState::new();
         let room = ensure_queue_room(&state, "sec");
@@ -66,6 +69,7 @@ mod tests {
         (state, server, room)
     }
 
+    // CONTRACT: Content JSON of the state event of a given type with an empty key in a room, if present.
     fn content(state: &Arc<AppState>, room: &str, ty: &str) -> Option<Value> {
         state.room_state.lock().unwrap().get(room).and_then(|v| {
             v.iter()
@@ -74,6 +78,9 @@ mod tests {
         })
     }
 
+    // seed_is_invite_and_joined_for_queue_and_hub_rooms:start
+    //   purpose: Queue and hub rooms are seeded join_rule=invite and history_visibility=joined.
+    // seed_is_invite_and_joined_for_queue_and_hub_rooms:end
     #[tokio::test]
     async fn seed_is_invite_and_joined_for_queue_and_hub_rooms() {
         let state = AppState::new();
@@ -93,6 +100,9 @@ mod tests {
         }
     }
 
+    // stranger_cannot_join_queue_room:start
+    //   purpose: A stranger gets 403 M_FORBIDDEN joining a queue room by id and by alias.
+    // stranger_cannot_join_queue_room:end
     #[tokio::test]
     async fn stranger_cannot_join_queue_room() {
         let (state, server, room) = setup().await;
@@ -118,6 +128,9 @@ mod tests {
         );
     }
 
+    // stranger_cannot_join_hub_room:start
+    //   purpose: A stranger gets 403 M_FORBIDDEN joining the hub room.
+    // stranger_cannot_join_hub_room:end
     #[tokio::test]
     async fn stranger_cannot_join_hub_room() {
         let state = AppState::new();
@@ -132,6 +145,10 @@ mod tests {
         assert_eq!(r.status_code(), 403, "{}", r.text());
     }
 
+    // stranger_cannot_read_queue_room_by_room_id:start
+    //   purpose: A stranger is refused /messages, /state, /members and /joined_members of a queue
+    //            room even knowing its room_id.
+    // stranger_cannot_read_queue_room_by_room_id:end
     #[tokio::test]
     async fn stranger_cannot_read_queue_room_by_room_id() {
         let (state, server, room) = setup().await;
@@ -157,6 +174,9 @@ mod tests {
         let _ = state;
     }
 
+    // sync_of_a_stranger_does_not_list_the_queue_room:start
+    //   purpose: /sync of a stranger does not list the queue room.
+    // sync_of_a_stranger_does_not_list_the_queue_room:end
     #[tokio::test]
     async fn sync_of_a_stranger_does_not_list_the_queue_room() {
         let (_state, server, room) = setup().await;
@@ -176,6 +196,10 @@ mod tests {
         assert!(!r.text().contains("fleet secret"));
     }
 
+    // invited_operator_joins_and_reads:start
+    //   purpose: An operator invited through MATRIX_HS_HUBD_OPERATORS joins and reads the queue
+    //            room, and the bridge still ingests into it.
+    // invited_operator_joins_and_reads:end
     #[tokio::test]
     async fn invited_operator_joins_and_reads() {
         let (state, server, room) = setup().await;
@@ -223,6 +247,9 @@ mod tests {
         assert_eq!(r.status_code(), 403, "a left operator needs a fresh invite");
     }
 
+    // operators_env_parser_keeps_only_mxids:start
+    //   purpose: operators_from_env keeps only entries shaped like an mxid.
+    // operators_env_parser_keeps_only_mxids:end
     #[test]
     fn operators_env_parser_keeps_only_mxids() {
         // Pure parse path, no env mutation (parallel tests): same filter via the fn.
@@ -235,6 +262,8 @@ mod tests {
     }
 
     // The room as an older build left it: ts-0 seed burst with public/shared.
+    // CONTRACT: Seed a queue room with the old rules (join_rule=public, history_visibility=shared); returns
+    //    its room id.
     fn seed_old_public_room(state: &Arc<AppState>, role: &str) -> String {
         for mut ev in queue_state_events(role) {
             if ev.event_type == "m.room.join_rules" {
@@ -248,6 +277,9 @@ mod tests {
         queue_room_id(role)
     }
 
+    // existing_public_room_is_switched_at_startup:start
+    //   purpose: harden_room switches an existing public/shared room to invite/joined.
+    // existing_public_room_is_switched_at_startup:end
     #[tokio::test]
     async fn existing_public_room_is_switched_at_startup() {
         let state = AppState::new();
@@ -290,6 +322,10 @@ mod tests {
         assert_eq!(r.status_code(), 403);
     }
 
+    // switch_is_identical_on_every_node:start
+    //   purpose: Two nodes hardening the same room produce identical state events, so a mixed fleet
+    //            converges.
+    // switch_is_identical_on_every_node:end
     #[tokio::test]
     async fn switch_is_identical_on_every_node() {
         let a = AppState::new();
@@ -327,6 +363,10 @@ mod tests {
         );
     }
 
+    // ordinary_rooms_follow_the_general_rules_and_joined_visibility_is_honoured:start
+    //   purpose: Ordinary rooms follow the general CS-API rules, and a stored history_visibility of
+    //            joined is honoured.
+    // ordinary_rooms_follow_the_general_rules_and_joined_visibility_is_honoured:end
     #[tokio::test]
     async fn ordinary_rooms_follow_the_general_rules_and_joined_visibility_is_honoured() {
         let state = AppState::new();

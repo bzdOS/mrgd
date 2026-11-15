@@ -1,3 +1,11 @@
+// START_AI_HEADER
+// MODULE: src/bin/growset_converge.rs
+// PURPOSE: Battle-volume convergence and quiescence proof for the grow-set anti-entropy on a
+//          loopback Zenoh mesh; exits 0 only if quiescent and converged within budget.
+// DEPENDENCIES: mrgd (cluster feature), zenoh, tokio, libc
+// PUBLIC_API: main (binary)
+// END_AI_HEADER
+
 // Battle-volume convergence + quiescence proof for the growset anti-entropy.
 //
 // WHAT THIS IS FOR
@@ -242,6 +250,8 @@ mod scenario {
             self.inner.publish(key, bytes)
         }
 
+        // CONTRACT: CrdtSink::drain of the metered sink: drain the inner sink and add the blob and byte
+        //    counts to the meter.
         fn drain(&self, key: &str) -> Result<Vec<Vec<u8>>, CrdtError> {
             let blobs = self.inner.drain(key)?;
             if let Ok(mut m) = self.meter.lock() {
@@ -254,6 +264,7 @@ mod scenario {
 
     // ── Process measures ───────────────────────────────────────────────────────
 
+    // CONTRACT: getrusage(RUSAGE_SELF) snapshot covering every thread; None on failure.
     /// getrusage(RUSAGE_SELF) snapshot; covers every thread, so the Zenoh
     /// background tasks are included (which is where the incident's CPU went).
     /// Portable: /proc is absent on FreeBSD.
@@ -264,6 +275,7 @@ mod scenario {
         (rc == 0).then_some(ru)
     }
 
+    // CONTRACT: utime+stime of this process in seconds; 0.0 when getrusage fails.
     /// utime+stime of this process in seconds.
     fn cpu_seconds() -> f64 {
         let Some(ru) = rusage() else {
@@ -273,6 +285,7 @@ mod scenario {
         tv(ru.ru_utime) + tv(ru.ru_stime)
     }
 
+    // CONTRACT: Peak resident set size in kB from ru_maxrss; 0 when getrusage fails.
     /// Peak resident set size in kB (ru_maxrss; kilobytes on both Linux and
     /// FreeBSD) — the metric the 9.5 GB incident was recorded in.
     fn vm_hwm_kb() -> u64 {

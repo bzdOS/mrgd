@@ -346,6 +346,13 @@ impl RequeryBackoff {
     }
 }
 
+// startup_no_peer_deadline_ms:start
+//   purpose: How long the startup loop waits for the first peer: the key-wait time when CONNECT is
+//            configured, else peer_wait_ms; 0 disables the wait.
+//   input:  connect_configured, peer_wait_ms, key_wait_ms
+//   output: deadline in ms
+//   sideEffects: none
+// startup_no_peer_deadline_ms:end
 /// How long the startup loop waits for the FIRST peer to show up.
 /// A node with an explicit MATRIX_HS_ZENOH_CONNECT has a peer by configuration, so
 /// "no peer after 3 s" is a slow link, not a single-node setup: it waits as long
@@ -743,6 +750,10 @@ mod tests {
         assert_eq!(t.tracked(), 1);
     }
 
+    // startup_waits_for_configured_peer_past_peer_wait:start
+    //   purpose: (A) With CONNECT configured the no-peer deadline is the key-wait one; without it,
+    //            or with 0, it is unchanged.
+    // startup_waits_for_configured_peer_past_peer_wait:end
     /// (A) With an explicit CONNECT the "no peer yet" deadline is the key-wait one.
     #[test]
     fn startup_waits_for_configured_peer_past_peer_wait() {

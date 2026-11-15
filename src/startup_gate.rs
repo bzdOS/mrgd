@@ -1,3 +1,12 @@
+// START_AI_HEADER
+// MODULE: src/startup_gate.rs
+// PURPOSE: Startup gate for grow-set writes: a node with a configured peer refuses username/alias
+//          claims until the catch-up pass finished and the peers claims arrived, or a deadline
+//          passed.
+// DEPENDENCIES: std
+// PUBLIC_API: gate_wanted, StartupGate, DEFAULT_GATE_MAX_MS, GATE_RETRY_AFTER_MS
+// END_AI_HEADER
+
 // startup_gate.rs
 //
 // A node that has a peer configured must not take grow-set writes (username
@@ -30,6 +39,13 @@ pub const DEFAULT_GATE_MAX_MS: u64 = 30_000;
 /// Retry hint returned to clients while the gate is closed.
 pub const GATE_RETRY_AFTER_MS: u64 = 1000;
 
+// gate_wanted:start
+//   purpose: Whether this node arms the startup gate: CONNECT set, or an anchored node list naming
+//            a node other than own_id.
+//   input:  connect, node_keys (MATRIX_HS_NODE_KEYS spec), own_id
+//   output: bool
+//   sideEffects: none
+// gate_wanted:end
 /// Whether this node arms the gate: a CONNECT endpoint is set, or the anchored
 /// node list (MATRIX_HS_NODE_KEYS) holds at least one node_id other than `own_id`.
 /// A listen-only node has no CONNECT but, when anchored, still knows peers exist.
@@ -59,6 +75,12 @@ pub struct StartupGate {
 }
 
 impl StartupGate {
+    // StartupGate::new:start
+    //   purpose: Create a closed gate that gives up waiting after max_wait.
+    //   input:  max_wait
+    //   output: Arc<StartupGate>
+    //   sideEffects: starts the gate clock
+    // StartupGate::new:end
     pub fn new(max_wait: Duration) -> Arc<Self> {
         Arc::new(StartupGate {
             catchup_done: AtomicBool::new(false),
@@ -70,6 +92,12 @@ impl StartupGate {
         })
     }
 
+    // StartupGate::max_wait_from_env:start
+    //   purpose: Read MATRIX_HS_GROWSET_GATE_MAX_MS, falling back to the default.
+    //   input:  env MATRIX_HS_GROWSET_GATE_MAX_MS
+    //   output: Duration
+    //   sideEffects: reads the process env
+    // StartupGate::max_wait_from_env:end
     /// MATRIX_HS_GROWSET_GATE_MAX_MS, falling back to the default.
     pub fn max_wait_from_env() -> Duration {
         let ms = std::env::var("MATRIX_HS_GROWSET_GATE_MAX_MS")
@@ -79,18 +107,43 @@ impl StartupGate {
         Duration::from_millis(ms)
     }
 
+    // StartupGate::note_catchup_done:start
+    //   purpose: Record that the startup catch-up pass finished.
+    //   input:  &self
+    //   output: none
+    //   sideEffects: sets an atomic flag
+    // StartupGate::note_catchup_done:end
     pub fn note_catchup_done(&self) {
         self.catchup_done.store(true, Ordering::SeqCst);
     }
 
+    // StartupGate::note_claims_synced:start
+    //   purpose: Record that the peer claims were received (ack from its ReconcileDriver).
+    //   input:  &self
+    //   output: none
+    //   sideEffects: sets an atomic flag
+    // StartupGate::note_claims_synced:end
     pub fn note_claims_synced(&self) {
         self.claims_synced.store(true, Ordering::SeqCst);
     }
 
+    // StartupGate::claims_synced:start
+    //   purpose: Whether the peer claims were received.
+    //   input:  &self
+    //   output: bool
+    //   sideEffects: none
+    // StartupGate::claims_synced:end
     pub fn claims_synced(&self) -> bool {
         self.claims_synced.load(Ordering::SeqCst)
     }
 
+    // StartupGate::check:start
+    //   purpose: Decide whether a grow-set write may proceed: open when both signals arrived or the
+    //            deadline passed.
+    //   input:  &self
+    //   output: Ok(()) when open, Err(retry_after_ms) while closed
+    //   sideEffects: logs one line on opening and one on timeout
+    // StartupGate::check:end
     /// Ok(()) when a grow-set write may proceed; Err(retry_after_ms) while the
     /// node is still catching up with its peer.
     pub fn check(&self) -> Result<(), u64> {
@@ -123,6 +176,9 @@ impl StartupGate {
 mod tests {
     use super::*;
 
+    // closed_until_both_signals:start
+    //   purpose: The gate stays closed until both catch-up and claims signals arrive.
+    // closed_until_both_signals:end
     #[test]
     fn closed_until_both_signals() {
         let g = StartupGate::new(Duration::from_secs(60));
@@ -136,6 +192,10 @@ mod tests {
     const KEY_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const KEY_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+    // gate_wanted_matrix:start
+    //   purpose: gate_wanted over CONNECT set/blank and anchored key lists: own-only, with peer,
+    //            empty, malformed.
+    // gate_wanted_matrix:end
     #[test]
     fn gate_wanted_matrix() {
         let both = format!("node-a={KEY_A},node-b={KEY_B}");
@@ -155,6 +215,9 @@ mod tests {
         assert!(!gate_wanted(None, Some("garbage"), "node-a"));
     }
 
+    // opens_on_timeout:start
+    //   purpose: A gate with a zero deadline is open at once.
+    // opens_on_timeout:end
     #[test]
     fn opens_on_timeout() {
         let g = StartupGate::new(Duration::from_millis(0));

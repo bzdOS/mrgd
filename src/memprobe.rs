@@ -84,6 +84,9 @@
 // crate keeps the delta to this one file and adds no dependency; a wrong or
 // absent mallctl would fail the asserts below loudly at first sample instead of
 // writing a plausible-looking row of zeroes.
+// DEPENDENCIES: libc (mallctl, signal)
+// PUBLIC_API: install, watch
+// END_AI_HEADER
 
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
@@ -245,6 +248,13 @@ fn sample(trigger: &str) {
     eprintln!("[memprobe] {line}");
 }
 
+// install:start
+//   purpose: Install the SIGUSR2 handler and sampler thread when MATRIX_HS_MEMPROBE_LOG names a
+//            writable file.
+//   input:  env MATRIX_HS_MEMPROBE_LOG
+//   output: None when the probe is active (owns SIGUSR2), Some(reason) when inactive
+//   sideEffects: opens the log file, installs a signal handler, spawns the memprobe thread
+// install:end
 /// Install the handler and the sampler thread. A no-op unless
 /// MATRIX_HS_MEMPROBE_LOG names a writable file; that variable is the only
 /// switch, so a deployment that does not set it runs exactly the code it ran

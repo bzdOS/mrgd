@@ -160,6 +160,7 @@ fn tls_server_hello(random: &[u8; 32]) -> Vec<u8> {
 }
 // tls_server_hello:end
 
+// CONTRACT: Read a TLS handshake record and return its 32-byte random; discards the failure class.
 /// Read a TLS Handshake record and extract the 32-byte `random` field.
 /// Works for both ClientHello (type 0x01) and ServerHello (type 0x02):
 /// the `random` field is always at body[6..38] (after hs header(4) + version(2)).
@@ -173,6 +174,13 @@ async fn tls_read_random<S: tokio::io::AsyncRead + Unpin>(
         .map_err(|(_, e)| e)
 }
 
+// tls_read_random_kind:start
+//   purpose: Read a TLS Handshake record and extract the random field (body[6..38]), classifying
+//            failures.
+//   input:  stream, expected handshake type (0x01/0x02), label for messages
+//   output: Ok(random) or Err((Eof | BadHello, error))
+//   sideEffects: reads 5 + record_len bytes from the stream
+// tls_read_random_kind:end
 /// Same as `tls_read_random` but classifies the failure (EOF vs malformed).
 async fn tls_read_random_kind<S: tokio::io::AsyncRead + Unpin>(
     s: &mut S,
@@ -714,6 +722,12 @@ where
         }
     }
 
+    // ObfsStream::accept_authenticated_inner:start
+    //   purpose: Server-side handshake plus first-frame authentication without a deadline.
+    //   input:  inner stream, static server key
+    //   output: Ok(ObfsStream) or Err((RejectReason, error))
+    //   sideEffects: reads and writes the stream
+    // ObfsStream::accept_authenticated_inner:end
     async fn accept_authenticated_inner(
         mut inner: S,
         server_static: &StaticServerKey,
@@ -821,6 +835,13 @@ where
         self.read_record_kind().await.map_err(|(_, e)| e)
     }
 
+    // ObfsStream::read_record_kind:start
+    //   purpose: Read and decrypt one AEAD record, classifying failures: Eof for I/O, Auth for AEAD
+    //            or length-frame verification.
+    //   input:  &mut self
+    //   output: Ok(Some(payload)), Ok(None) on clean EOF at a record boundary, Err((reason, error))
+    //   sideEffects: reads from the stream, advances the receive nonce
+    // ObfsStream::read_record_kind:end
     /// Like `read_record`, but classifies failures (`Eof` for I/O, `Auth` for
     /// AEAD/length-frame verification).
     async fn read_record_kind(&mut self) -> Result<Option<Vec<u8>>, (RejectReason, zenoh_result::Error)> {

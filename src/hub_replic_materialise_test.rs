@@ -16,6 +16,7 @@ mod materialise_tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    // CONTRACT: Fresh per-test temp dir with an empty .mxstate sub-directory.
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("mhs_mat_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -23,6 +24,7 @@ mod materialise_tests {
         d
     }
 
+    // CONTRACT: HubReplicConfig for node "me" rooted at the given dir, not readonly.
     fn cfg(dir: &PathBuf) -> HubReplicConfig {
         HubReplicConfig {
             hub_dir: dir.clone(),
@@ -33,6 +35,8 @@ mod materialise_tests {
         }
     }
 
+    // CONTRACT: Add one signed peer append event for journal.peer.jsonl at an explicit DAG position (prev,
+    //    depth, ts); returns its event id.
     /// Add one peer append event ("journal.peer.jsonl") with an explicit DAG position.
     fn add(state: &Arc<AppState>, body: &str, prev: &[&str], depth: u64, ts: u64) -> String {
         let content = serde_json::to_vec(&json!({
@@ -56,6 +60,7 @@ mod materialise_tests {
         id
     }
 
+    // CONTRACT: Contents of journal.peer.jsonl in the dir, empty string if missing.
     fn read(dir: &PathBuf) -> String {
         std::fs::read_to_string(dir.join("journal.peer.jsonl")).unwrap_or_default()
     }
