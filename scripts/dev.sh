@@ -126,7 +126,7 @@ cmd_privgate() {
     # Pattern assembled from pieces: this file must not match its own gate.
     _s=/
     pat="192\\.168|178\\.72|${_s}home${_s}|${_s}opt${_s}|${_s}srv${_s}"
-    pat="$pat|bsdos-x""86|plan""ck|fed""ora|mrgd-(he""ad|d""ev|le""ad)"
+    pat="$pat|bsd""os-x""86|plan""ck|fed""ora|mrgd-(he""ad|d""ev|le""ad)"
     # Added lines only, committed and uncommitted, tracked files.
     hits="$(git diff "$DEV_BASE_REF" -- . ':!vendor' | grep -E '^\+' | grep -vE '^\+\+\+' | grep -E "$pat" || true)"
     n=0
