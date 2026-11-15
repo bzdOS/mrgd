@@ -134,7 +134,7 @@ mod tests {
         server_a
             .post("/_matrix/client/v3/createRoom")
             .add_header(auth_a_name.clone(), auth_a_val.clone())
-            .json(&json!({ "room_alias_name": room_alias, "name": "State Cluster Room" }))
+            .json(&json!({ "room_alias_name": room_alias, "name": "State Cluster Room", "preset": "public_chat" }))
             .await
             .assert_status_ok();
 

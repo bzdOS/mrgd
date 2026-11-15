@@ -200,11 +200,12 @@ mod tests {
         server_a
             .post("/_matrix/client/v3/createRoom")
             .add_header(hdr(&tenant_a).0, hdr(&tenant_a).1)
-            .json(&json!({ "room_alias_name": "twopool" }))
+            .json(&json!({ "room_alias_name": "twopool", "preset": "public_chat" }))
             .await
             .assert_status_ok();
         let room_id = "!twopool:poola";
         state_b.ensure_room_state(room_id);
+        crate::test_util::wait_for_join_rules(&state_b, room_id).await;
         server_b
             .post(&format!("/_matrix/client/v3/rooms/{room_id}/join"))
             .add_header(hdr(&tenant_b).0, hdr(&tenant_b).1)

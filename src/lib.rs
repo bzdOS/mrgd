@@ -72,6 +72,33 @@ pub(crate) mod test_util {
         format!("{base}/run{}-{}", std::process::id(), n)
     }
 
+    // wait_for_join_rules:start
+    //   purpose: A node may only admit a joiner by the room's m.room.join_rules, and a
+    //            room with no rule is treated as invite-only (the spec default), so a
+    //            cluster test that joins on a second node has to let the room's state
+    //            replicate there first instead of joining an empty shell. Drains the
+    //            cluster the way /sync does and polls until the rule is present.
+    //   input:  the joining node's state, room_id
+    //   output: returns once m.room.join_rules is in that node's room_state; panics after ~10s
+    //   sideEffects: drains cluster deltas into the node's state
+    // wait_for_join_rules:end
+    pub(crate) async fn wait_for_join_rules(state: &std::sync::Arc<crate::AppState>, room_id: &str) {
+        for _ in 0..200 {
+            let _ = crate::routes::sync::drain_all_cluster(state).await;
+            let seen = state
+                .room_state
+                .lock()
+                .unwrap()
+                .get(room_id)
+                .is_some_and(|evs| evs.iter().any(|e| e.event_type == "m.room.join_rules"));
+            if seen {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("m.room.join_rules of {room_id} never replicated to this node");
+    }
+
     // open_mesh:start
     //   purpose: N Zenoh sessions that form a PRIVATE mesh: every session listens on
     //            its own ephemeral loopback port and connects to the ports of the

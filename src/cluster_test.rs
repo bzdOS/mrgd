@@ -157,7 +157,7 @@ mod tests {
         server_a
             .post("/_matrix/client/v3/createRoom")
             .add_header(auth_a_name.clone(), auth_a_val.clone())
-            .json(&json!({ "room_alias_name": room_alias }))
+            .json(&json!({ "room_alias_name": room_alias, "preset": "public_chat" }))
             .await
             .assert_status_ok();
 
@@ -167,9 +167,10 @@ mod tests {
         // bob must actually JOIN in node-b's own local room_state — /sync is
         // scoped to the caller's own joined rooms (routes/sync.rs::
         // build_join_rooms; previously it leaked every room to every caller
-        // regardless of membership). This server's join is fully permissive
-        // (no invite/join_rules gate), so bob can join node-b's local room_state
-        // directly without waiting on state replication from node-a.
+        // regardless of membership). The room is public_chat, but node-b can only
+        // see that once the room's state has replicated from node-a (a room with no
+        // m.room.join_rules is invite-only), so wait for the rule before joining.
+        crate::test_util::wait_for_join_rules(&state_b, &room_id).await;
         server_b
             .post(&format!("/_matrix/client/v3/rooms/{room_id}/join"))
             .add_header(auth_b_name.clone(), auth_b_val.clone())
@@ -1026,6 +1027,7 @@ mod tests {
             .add_header(auth_a_name.clone(), auth_a_val.clone())
             .json(&json!({
                 "room_alias_name": "edge-room",
+                "preset": "public_chat",
                 "visibility": "public"
             }))
             .await;
@@ -1044,6 +1046,7 @@ mod tests {
             .assert_status_ok();
 
         // Bob (on node-b) joins via node-b.
+        crate::test_util::wait_for_join_rules(&state_b, &room_id).await;
         server_b
             .post(&format!("/_matrix/client/v3/rooms/{room_id}/join"))
             .add_header(auth_b_name.clone(), auth_b_val.clone())
@@ -1051,6 +1054,7 @@ mod tests {
             .assert_status_ok();
 
         // Charlie (on node-c) joins via node-c.
+        crate::test_util::wait_for_join_rules(&state_c, &room_id).await;
         server_c
             .post(&format!("/_matrix/client/v3/rooms/{room_id}/join"))
             .add_header(auth_c_name.clone(), auth_c_val.clone())
@@ -2013,11 +2017,12 @@ mod tests {
         server_a
             .post("/_matrix/client/v3/createRoom")
             .add_header(an.clone(), av.clone())
-            .json(&json!({ "room_alias_name": room_alias }))
+            .json(&json!({ "room_alias_name": room_alias, "preset": "public_chat" }))
             .await
             .assert_status_ok();
         let room_id = format!("!{room_alias}:node-a");
         state_b.ensure_room_state(&room_id);
+        crate::test_util::wait_for_join_rules(&state_b, &room_id).await;
         server_b
             .post(&format!("/_matrix/client/v3/rooms/{room_id}/join"))
             .add_header(bn.clone(), bv.clone())
@@ -2157,11 +2162,12 @@ mod tests {
         server_a
             .post("/_matrix/client/v3/createRoom")
             .add_header(an.clone(), av.clone())
-            .json(&json!({ "room_alias_name": alias }))
+            .json(&json!({ "room_alias_name": alias, "preset": "public_chat" }))
             .await
             .assert_status_ok();
         let room_id = format!("!{alias}:node-a");
         state_b.ensure_room_state(&room_id);
+        crate::test_util::wait_for_join_rules(&state_b, &room_id).await;
         server_b
             .post(&format!("/_matrix/client/v3/rooms/{room_id}/join"))
             .add_header(bn.clone(), bv.clone())
@@ -2437,7 +2443,7 @@ mod tests {
         let create: Value = server_a
             .post("/_matrix/client/v3/createRoom")
             .add_header(auth_a_name.clone(), auth_a_val.clone())
-            .json(&json!({ "name": "peer-known-room" }))
+            .json(&json!({ "name": "peer-known-room", "preset": "public_chat" }))
             .await
             .json();
         let room_id = create["room_id"]
@@ -2487,6 +2493,21 @@ mod tests {
              would pass without the cluster branch"
         );
 
+        // Joining needs the room's join_rules, and this node has none for it yet: a rule
+        // it cannot see is not a licence, so the join is refused (not 404 — the room IS
+        // known) until the state has replicated.
+        let early = server_b
+            .post(&format!("/_matrix/client/v3/rooms/{room_id}/join"))
+            .add_header(auth_b_name.clone(), auth_b_val.clone())
+            .await;
+        assert_eq!(
+            early.status_code(),
+            403,
+            "no join_rules known locally: must not be treated as open: {:?}",
+            early.text()
+        );
+        // Once the (public_chat) state has replicated, the cluster-known room is joinable.
+        crate::test_util::wait_for_join_rules(&state_b, &room_id).await;
         let resp = server_b
             .post(&format!("/_matrix/client/v3/rooms/{room_id}/join"))
             .add_header(auth_b_name.clone(), auth_b_val.clone())
@@ -2494,7 +2515,7 @@ mod tests {
         assert_eq!(
             resp.status_code(),
             200,
-            "a room this node knows only from the cluster must stay joinable: {:?}",
+            "a room this node knows from the cluster must be joinable once its state arrived: {:?}",
             resp.text()
         );
         let joined: Value = resp.json();

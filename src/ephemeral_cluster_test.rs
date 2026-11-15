@@ -113,7 +113,7 @@ mod tests {
         server_a
             .post("/_matrix/client/v3/createRoom")
             .add_header(auth_a_name.clone(), auth_a_val.clone())
-            .json(&json!({ "room_alias_name": room_alias }))
+            .json(&json!({ "room_alias_name": room_alias, "preset": "public_chat" }))
             .await
             .assert_status_ok();
 
@@ -124,9 +124,10 @@ mod tests {
         // is scoped to the caller's own joined rooms (routes/sync.rs::
         // build_join_rooms), so without this bob's later /sync on node-b would see
         // no rooms at all regardless of what typing/receipt state converges.
-        // This server's join is fully permissive (no invite/join_rules gate), so
-        // bob can join node-b's local (empty-but-for-this) room_state directly —
-        // no need to wait on state replication from node-a for this test's purpose.
+        // The room is public_chat, but node-b can only see that once the room's
+        // state has replicated from node-a (a room with no m.room.join_rules is
+        // invite-only), so wait for the rule before joining.
+        crate::test_util::wait_for_join_rules(&state_b, &room_id).await;
         server_b
             .post(&format!("/_matrix/client/v3/rooms/{room_id}/join"))
             .add_header(auth_b_name.clone(), auth_b_val.clone())
