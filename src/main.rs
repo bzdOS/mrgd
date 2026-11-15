@@ -461,7 +461,15 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
         // Startup gate: only a node with an explicitly configured peer. It holds
         // grow-set writes (register, alias claims) until the first catch-up with the
         // peer is done and the peer's claims arrived, or MATRIX_HS_GROWSET_GATE_MAX_MS.
-        let startup_gate = if connect.as_deref().is_some_and(|c| !c.trim().is_empty()) {
+        // A listen-only node (no CONNECT) is gated too when MATRIX_HS_NODE_KEYS is
+        // anchored and names a node other than this one: its peers dial in after a
+        // restart, and until their claims arrive it must not accept a taken name.
+        let node_keys_env = std::env::var("MATRIX_HS_NODE_KEYS").ok();
+        let startup_gate = if mrgd::startup_gate::gate_wanted(
+            connect.as_deref(),
+            node_keys_env.as_deref(),
+            &server_name,
+        ) {
             let g = mrgd::startup_gate::StartupGate::new(
                 mrgd::startup_gate::StartupGate::max_wait_from_env(),
             );

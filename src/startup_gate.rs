@@ -15,7 +15,10 @@
 //     the peer is unreachable or runs an older build, behaviour reverts to the
 //     ungated one and a log line says so.
 // A node without a configured peer has no gate at all (AppState.startup_gate
-// is None).
+// is None). "Configured peer" means CONNECT, or an anchored node list
+// (MATRIX_HS_NODE_KEYS) naming a node other than ourselves: a node that only
+// LISTENS (the stand clients register on) knows its peers from that list, and
+// they will dial in after its restart. See gate_wanted().
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -26,6 +29,25 @@ pub const DEFAULT_GATE_MAX_MS: u64 = 30_000;
 
 /// Retry hint returned to clients while the gate is closed.
 pub const GATE_RETRY_AFTER_MS: u64 = 1000;
+
+/// Whether this node arms the gate: a CONNECT endpoint is set, or the anchored
+/// node list (MATRIX_HS_NODE_KEYS) holds at least one node_id other than `own_id`.
+/// A listen-only node has no CONNECT but, when anchored, still knows peers exist.
+/// A malformed or empty list yields no peers (the anchor itself fails closed).
+pub fn gate_wanted(connect: Option<&str>, node_keys: Option<&str>, own_id: &str) -> bool {
+    if connect.is_some_and(|c| !c.trim().is_empty()) {
+        return true;
+    }
+    match node_keys {
+        Some(spec) if !spec.trim().is_empty() => {
+            match crate::substrate::node_auth::parse_node_keys(spec) {
+                Ok(keys) => keys.keys().any(|k| k.as_str() != own_id),
+                Err(_) => false,
+            }
+        }
+        _ => false,
+    }
+}
 
 pub struct StartupGate {
     catchup_done: AtomicBool,
@@ -109,6 +131,28 @@ mod tests {
         assert!(g.check().is_err());
         g.note_claims_synced();
         assert!(g.check().is_ok());
+    }
+
+    const KEY_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const KEY_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn gate_wanted_matrix() {
+        let both = format!("node-a={KEY_A},node-b={KEY_B}");
+        let only_own = format!("node-a={KEY_A}");
+        // CONNECT set: gate, whatever the key list says.
+        assert!(gate_wanted(Some("tcp/127.0.0.1:7449"), None, "node-a"));
+        assert!(gate_wanted(Some("tcp/127.0.0.1:7449"), Some(&only_own), "node-a"));
+        // Blank CONNECT counts as unset.
+        assert!(!gate_wanted(Some("  "), None, "node-a"));
+        // LISTEN-only + anchored with a peer: gate.
+        assert!(gate_wanted(None, Some(&both), "node-a"));
+        // LISTEN-only + anchored, only ourselves: no peer known, no gate.
+        assert!(!gate_wanted(None, Some(&only_own), "node-a"));
+        // No NODE_KEYS (TOFU), empty, or malformed list: no gate.
+        assert!(!gate_wanted(None, None, "node-a"));
+        assert!(!gate_wanted(None, Some(""), "node-a"));
+        assert!(!gate_wanted(None, Some("garbage"), "node-a"));
     }
 
     #[test]
