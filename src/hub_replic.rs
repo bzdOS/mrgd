@@ -142,7 +142,7 @@ pub fn hub_state_events() -> Vec<StateEvent> {
             }),
         ),
         mk("m.room.join_rules", "", json!({ "join_rule": "invite" })),
-        mk("m.room.history_visibility", "", json!({ "history_visibility": "shared" })),
+        mk("m.room.history_visibility", "", json!({ "history_visibility": "joined" })),
     ]
 }
 
@@ -179,6 +179,9 @@ pub fn ensure_hub_room(state: &Arc<AppState>) -> String {
         }
         eprintln!("[matrix-hs] hub-replic: seeded hub room {room_id}");
     }
+    // Same upgrade path as the queue rooms: private, idempotent.
+    crate::hubd_bridge::harden_room(state, &room_id);
+    crate::hubd_bridge::invite_operators(state, &room_id, &crate::hubd_bridge::operators_from_env());
 
     if let Ok(mut aliases) = state.aliases.lock() {
         aliases

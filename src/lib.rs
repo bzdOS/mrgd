@@ -263,6 +263,8 @@ mod ephemeral_test;
 #[cfg(test)]
 mod hubd_bridge_test;
 #[cfg(test)]
+mod private_rooms_test;
+#[cfg(test)]
 mod hubd_readonly_test;
 #[cfg(all(test, feature = "cluster"))]
 mod hub_replic_test;

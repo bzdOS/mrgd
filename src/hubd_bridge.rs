@@ -45,10 +45,12 @@
 //
 //          Power levels in that burst are load-bearing: the synthetic creator holds
 //          100 so every node's seed passes AppState::may_set_state whatever order it
-//          arrives in, and everyone else sits at 0 under state_default 50 so a human
-//          who joins can talk but cannot reshape a machine-managed room. (Their own
-//          m.room.member is allowed by may_set_state's self-membership carve-out —
-//          that is what lets them join at all.)
+//          arrives in, and everyone else sits at 0 under state_default 50 so an
+//          invited human can talk but cannot reshape a machine-managed room.
+//          The rooms are private: join_rule=invite, history_visibility=joined, and
+//          the CS-API enforces both for these room ids (routes/room_state.rs
+//          require_join_allowed / require_read_access). Operators are invited via
+//          MATRIX_HS_HUBD_OPERATORS.
 //
 //          ── Cursors ──────────────────────────────────────────────────────────
 //          INGEST keeps a byte offset per own-file under <queues_dir>/../.mxstate/,
@@ -468,11 +470,13 @@ pub fn queue_state_events(role: &str) -> Vec<StateEvent> {
             BRIDGE_USER,
             json!({ "membership": "join", "displayname": "hubd" }),
         ),
-        mk("m.room.join_rules", "", json!({ "join_rule": "public" })),
+        // Private by construction: a queue holds the fleet's work. Not public/shared —
+        // that let any registered user of the node join and read it.
+        mk("m.room.join_rules", "", json!({ "join_rule": "invite" })),
         mk(
             "m.room.history_visibility",
             "",
-            json!({ "history_visibility": "shared" }),
+            json!({ "history_visibility": "joined" }),
         ),
         mk("m.room.name", "", json!({ "name": format!("hubd: {role}") })),
         mk(
@@ -724,6 +728,125 @@ pub fn block_from_event(content: &Value, sender: &str, ts: u64) -> Block {
 // Impure — room seeding, ingest, materialise
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// PRIVATE_TS / private_event_id / harden_room / invite_operators:start
+//   purpose: Make a machine-managed room (queue room or hub room) private on a
+//            node that already holds it with the old public/shared rules.
+//            The seed burst (ts 0) only runs for a room with no m.room.create, so
+//            an existing room would keep join_rule=public forever. harden_room
+//            sends join_rules=invite and history_visibility=joined from BRIDGE_USER
+//            (power 100, so it passes may_set_state) with ts 1 — above the seed's 0,
+//            so it wins the LWW compare — and a fixed sha256 id, so every node
+//            emits the same event and a mixed fleet still converges. Idempotent:
+//            nothing is sent while the room already holds the wanted content.
+//            Members who joined while the room was public are NOT removed here
+//            (see the warning it logs); that is an operator decision.
+//            invite_operators: MATRIX_HS_HUBD_OPERATORS (comma separated MXIDs) are
+//            invited by BRIDGE_USER once, if they have no membership event yet, so
+//            a local operator can reach a room over the CS-API. Nobody else can
+//            invite: the bridge user has no token and strangers cannot join.
+//   input:  state, room_id (and the operator list)
+//   output: true iff the room state changed
+//   sideEffects: apply_remote_state_event on the room; a log line when it changes
+// PRIVATE_TS / private_event_id / harden_room / invite_operators:end
+const PRIVATE_TS: u64 = 1;
+
+fn private_event_id(event_type: &str, room_id: &str, state_key: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(b"hubd-private-v1\0");
+    h.update(event_type.as_bytes());
+    h.update([0u8]);
+    h.update(room_id.as_bytes());
+    h.update([0u8]);
+    h.update(state_key.as_bytes());
+    format!("${}", URL_SAFE_NO_PAD.encode(h.finalize()))
+}
+
+pub(crate) fn harden_room(state: &Arc<AppState>, room_id: &str) -> bool {
+    let want = [
+        ("m.room.join_rules", json!({ "join_rule": "invite" })),
+        ("m.room.history_visibility", json!({ "history_visibility": "joined" })),
+    ];
+    let mut changed = false;
+    for (ty, content) in want {
+        let cur = state.room_state.lock().ok().and_then(|rs| {
+            rs.get(room_id).and_then(|v| {
+                v.iter()
+                    .find(|e| e.event_type == ty && e.state_key.is_empty())
+                    .map(|e| e.content.clone())
+            })
+        });
+        if cur.as_ref() == Some(&content) {
+            continue;
+        }
+        let ev = StateEvent {
+            event_type: ty.to_string(),
+            state_key: String::new(),
+            sender: BRIDGE_USER.to_string(),
+            content,
+            event_id: private_event_id(ty, room_id, ""),
+            room_id: room_id.to_string(),
+            origin_server_ts: PRIVATE_TS,
+        };
+        match state.apply_remote_state_event(ev) {
+            Ok(true) => changed = true,
+            Ok(false) => {}
+            Err(e) => eprintln!("[matrix-hs] hubd-bridge: harden {room_id} {ty}: {e}"),
+        }
+    }
+    if changed {
+        let others: Vec<String> = state
+            .joined_members(room_id)
+            .into_iter()
+            .filter(|u| u != BRIDGE_USER)
+            .collect();
+        eprintln!(
+            "[matrix-hs] hubd-bridge: {room_id} switched to join_rule=invite, \
+             history_visibility=joined; already joined (NOT removed): {others:?}"
+        );
+    }
+    changed
+}
+
+pub fn operators_from_env() -> Vec<String> {
+    std::env::var("MATRIX_HS_HUBD_OPERATORS")
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| s.starts_with('@') && s.contains(':'))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn invite_operators(state: &Arc<AppState>, room_id: &str, operators: &[String]) {
+    for user in operators {
+        let known = state
+            .room_state
+            .lock()
+            .map(|rs| {
+                rs.get(room_id)
+                    .map(|v| v.iter().any(|e| e.event_type == "m.room.member" && &e.state_key == user))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true);
+        if known {
+            continue;
+        }
+        let ev = StateEvent {
+            event_type: "m.room.member".to_string(),
+            state_key: user.clone(),
+            sender: BRIDGE_USER.to_string(),
+            content: json!({ "membership": "invite" }),
+            event_id: private_event_id("m.room.member", room_id, user),
+            room_id: room_id.to_string(),
+            origin_server_ts: PRIVATE_TS,
+        };
+        if let Err(e) = state.apply_remote_state_event(ev) {
+            eprintln!("[matrix-hs] hubd-bridge: invite operator {user} to {room_id}: {e}");
+        }
+    }
+}
+
 // ensure_queue_room:start
 //   purpose: Seed a role's well-known room if it is not already seeded, and register
 //            a local alias so a human can /join #hubd-queue-<slug>:<server>.
@@ -760,6 +883,9 @@ pub fn ensure_queue_room(state: &Arc<AppState>, role: &str) -> String {
         }
         eprintln!("[matrix-hs] hubd-bridge: seeded queue room {room_id} for role '{role}'");
     }
+    // A room seeded by an older build is public/shared; make it private (idempotent).
+    harden_room(state, &room_id);
+    invite_operators(state, &room_id, &operators_from_env());
 
     if let Ok(mut aliases) = state.aliases.lock() {
         let alias = format!(

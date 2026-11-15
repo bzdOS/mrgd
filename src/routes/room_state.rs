@@ -266,6 +266,11 @@ pub async fn post_join_room(
 //                or room-membership-based join, so only a pending invite lets anyone in
 //                (the invite path is valid for those rules in the spec too);
 //              - any other value: refused.
+//            The machine-managed rooms (hubd queue rooms and the hub room, which hold the
+//            fleet's work) are invite-only regardless of the stored join_rules, so a room
+//            seeded public by an older build stays closed until the startup hardening
+//            (hubd_bridge::harden_room) has switched it, and are readable only by joined
+//            members even if a stored history_visibility says otherwise.
 //            READ (GET state, state/{type}[/{key}], members, joined_members, messages)
 //            needs a valid token (401 M_MISSING_TOKEN / M_UNKNOWN_TOKEN), then an
 //            existing room (404), then either history_visibility == "world_readable" or
@@ -279,6 +284,11 @@ pub async fn post_join_room(
 //   output: Ok(user) / Ok(()) or MissingToken / UnknownToken / RoomNotFound / Forbidden
 //   sideEffects: none
 // room_state_content / require_join_allowed / require_read_access:end
+fn is_managed_room(room_id: &str) -> bool {
+    crate::hubd_bridge::role_from_room_id(room_id).is_some()
+        || room_id == crate::hub_replic::HUB_ROOM_ID
+}
+
 fn room_state_content(state: &Arc<AppState>, room_id: &str, event_type: &str) -> Option<Value> {
     let rs = state.room_state.lock().ok()?;
     rs.get(room_id)?
@@ -302,9 +312,13 @@ fn require_join_allowed(
         Some("join") => return Ok(()),
         _ => {}
     }
-    let rule = room_state_content(state, room_id, "m.room.join_rules")
-        .and_then(|c| c.get("join_rule").and_then(Value::as_str).map(str::to_string))
-        .unwrap_or_else(|| "invite".to_string());
+    let rule = if is_managed_room(room_id) {
+        "invite".to_string()
+    } else {
+        room_state_content(state, room_id, "m.room.join_rules")
+            .and_then(|c| c.get("join_rule").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_else(|| "invite".to_string())
+    };
     let invited = membership.as_deref() == Some("invite");
     let allowed = match rule.as_str() {
         "public" => true,
@@ -332,7 +346,7 @@ fn require_read_access(
     let world_readable = room_state_content(state, room_id, "m.room.history_visibility")
         .and_then(|c| c.get("history_visibility").and_then(Value::as_str).map(str::to_string))
         .is_some_and(|v| v == "world_readable");
-    if world_readable {
+    if world_readable && !is_managed_room(room_id) {
         return Ok(());
     }
     match current_membership(state, room_id, &user)?.as_deref() {
