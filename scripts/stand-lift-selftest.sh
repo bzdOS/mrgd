@@ -8,6 +8,8 @@
 #   b  повторный запуск                -> no-op (гейт 1), rc=0
 #   c  ZENOH_LISTEN=tcp/0.0.0.0:...    -> отказ гейта 5, rc=1
 #   d  ZENOH_LISTEN=obfs/... и бинарь без кластерного слоя -> отказ гейта 4
+#   s1 живой + READONLY=1 -> разрешён; s2/s3 живой без флага (или не '1') -> отказ;
+#   s4/s5 READONLY=1, но курсоры в хабе / нет каталога -> отказ
 #   e  HUBD_QUEUES_DIR в env, список живых путей пуст -> отказ моста (fail-safe), rc=1
 #   j  HUBD-пути = копия хаба (tmp)    -> разрешено, поднят, rc=0
 #   k  HUB_DIR = живой                 -> отказ, rc=1
@@ -164,6 +166,42 @@ MATRIX_HS_HUBD_HUB_DIR=$COPY
 MATRIX_HS_HUBD_QUEUES_DIR=$COPY/queues"
 run j 0 'ПОДНЯТ'
 _pid=$(cat "$PIDFILE"); kill "$_pid" 2>/dev/null || :; sleep 1; rm -f "$PIDFILE"
+
+# READONLY=1: живой путь разрешён (мост только читает, курсоры в data-каталоге).
+write_env "STAND_LIVE_HUB_PATHS=$LIVE
+MATRIX_HS_HUBD_HUB_DIR=$LIVE
+MATRIX_HS_HUBD_QUEUES_DIR=$LIVE/queues
+MATRIX_HS_HUBD_READONLY=1"
+run s1 0 'ПОДНЯТ'
+_pid=$(cat "$PIDFILE"); kill "$_pid" 2>/dev/null || :; sleep 1; rm -f "$PIDFILE"
+# те же пути БЕЗ флага (и с '0'/'true' — флаг только ровно '1') — прежний отказ
+write_env "STAND_LIVE_HUB_PATHS=$LIVE
+MATRIX_HS_HUBD_HUB_DIR=$LIVE
+MATRIX_HS_HUBD_QUEUES_DIR=$LIVE/queues"
+run s2 1 'равен живому'
+refused_before_start
+write_env "STAND_LIVE_HUB_PATHS=$LIVE
+MATRIX_HS_HUBD_HUB_DIR=$LIVE
+MATRIX_HS_HUBD_QUEUES_DIR=$LIVE/queues
+MATRIX_HS_HUBD_READONLY=true"
+run s3 1 'равен живому'
+refused_before_start
+# READONLY=1, но курсоры пришлись бы внутрь хаба / в его родителя — отказ
+write_env "STAND_LIVE_HUB_PATHS=$LIVE
+MATRIX_HS_HUBD_HUB_DIR=$LIVE
+MATRIX_HS_HUBD_QUEUES_DIR=$LIVE/queues
+MATRIX_HS_HUBD_READONLY=1
+MATRIX_HS_HUBD_STATE_DIR=$T/live"
+run s4 1 'каталог курсоров'
+refused_before_start
+# READONLY=1 без каталога курсоров — отказ
+write_env "STAND_LIVE_HUB_PATHS=$LIVE
+MATRIX_HS_HUBD_HUB_DIR=$LIVE
+MATRIX_HS_HUBD_QUEUES_DIR=$LIVE/queues
+MATRIX_HS_HUBD_READONLY=1
+MATRIX_HS_DATA_DIR=$T/no-such-data"
+run s5 1 'требует существующий'
+refused_before_start
 
 write_env "MATRIX_HS_ZENOH_CONNECT=tcp/127.0.0.1:7998"
 run f 1 'without explicit MATRIX_HS_ZENOH_LISTEN'

@@ -235,6 +235,8 @@ mod ephemeral_member_gate_test;
 mod ephemeral_test;
 #[cfg(test)]
 mod hubd_bridge_test;
+#[cfg(test)]
+mod hubd_readonly_test;
 #[cfg(all(test, feature = "cluster"))]
 mod hub_replic_test;
 #[cfg(test)]

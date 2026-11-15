@@ -29,6 +29,7 @@ mod materialise_tests {
             node: "me".to_string(),
             poll_ms: 250,
             state_dir: dir.join(".mxstate"),
+            readonly: false,
         }
     }
 

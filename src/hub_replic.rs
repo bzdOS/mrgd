@@ -201,6 +201,7 @@ pub fn ensure_hub_room(state: &Arc<AppState>) -> String {
 //   output: Option<HubReplicConfig> (None = off)
 //   sideEffects: none
 // HubReplicConfig:end
+#[derive(Clone, Debug)]
 pub struct HubReplicConfig {
     pub hub_dir: PathBuf,
     pub node: String,
@@ -208,6 +209,10 @@ pub struct HubReplicConfig {
     /// Cursor/offset state lives beside the bridge's (.mxstate sibling trick):
     /// <hub_dir>/.mxstate/ — gitignored by the hub, never travels.
     pub state_dir: PathBuf,
+    /// MATRIX_HS_HUBD_READONLY=1: ingest (read hub files, publish to the room) works
+    /// as before; materialise (every write into hub_dir) is off; `state_dir` is in the
+    /// node data dir, not under hub_dir.
+    pub readonly: bool,
 }
 
 impl HubReplicConfig {
@@ -221,7 +226,15 @@ impl HubReplicConfig {
     //   sideEffects: none
     // HubReplicConfig::from_env:end
     pub fn from_env() -> Option<Self> {
-        let hub_dir = std::env::var("MATRIX_HS_HUBD_HUB_DIR").ok()?;
+        Self::from_lookup(&|k| std::env::var(k).ok())
+    }
+
+    // HubReplicConfig::from_lookup:start
+    //   purpose: from_env over an arbitrary key lookup (tests). Readonly with an
+    //            unusable cursor location disables the replicator (fail closed).
+    // HubReplicConfig::from_lookup:end
+    pub fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> Option<Self> {
+        let hub_dir = get("MATRIX_HS_HUBD_HUB_DIR")?;
         if hub_dir.trim().is_empty() {
             return None;
         }
@@ -245,12 +258,30 @@ impl HubReplicConfig {
             .take(40)
             .collect::<String>();
         let node = if node.is_empty() { "node".to_string() } else { node };
-        let poll_ms = std::env::var("MATRIX_HS_HUBD_POLL_MS")
-            .ok()
+        let poll_ms = get("MATRIX_HS_HUBD_POLL_MS")
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(1000);
-        let state_dir = hub_dir.join(".mxstate");
-        Some(Self { hub_dir, node, poll_ms, state_dir })
+        let readonly = crate::hubd_bridge::readonly_requested(get);
+        let state_dir = if readonly {
+            let mut forbidden: Vec<PathBuf> = vec![hub_dir.clone()];
+            if let Some(p) = hub_dir.parent() {
+                forbidden.push(p.to_path_buf());
+            }
+            if let Some(q) = get("MATRIX_HS_HUBD_QUEUES_DIR").filter(|s| !s.trim().is_empty()) {
+                forbidden.push(PathBuf::from(q));
+            }
+            let refs: Vec<&Path> = forbidden.iter().map(|p| p.as_path()).collect();
+            match crate::hubd_bridge::readonly_state_dir(get, "hub", &refs) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("[matrix-hs] hub-replic: MATRIX_HS_HUBD_READONLY=1 but {e}; replicator disabled");
+                    return None;
+                }
+            }
+        } else {
+            hub_dir.join(".mxstate")
+        };
+        Some(Self { hub_dir, node, poll_ms, state_dir, readonly })
     }
 }
 
@@ -683,6 +714,10 @@ fn room_events(state: &Arc<AppState>) -> Vec<Value> {
 //   sideEffects: writes hub files, cursor, card memory
 // materialise:end
 async fn materialise(state: &Arc<AppState>, cfg: &HubReplicConfig, mem: &mut CardMem) {
+    // Readonly: every write below lands in hub_dir. Fail closed for any caller.
+    if cfg.readonly {
+        return;
+    }
     let events = room_events(state);
     if events.is_empty() {
         return;
@@ -835,10 +870,11 @@ pub fn spawn(state: Arc<AppState>) -> bool {
 // spawn_with:end
 pub fn spawn_with(state: Arc<AppState>, cfg: HubReplicConfig) -> bool {
     eprintln!(
-        "[matrix-hs] hub-replic: hub {} as node '{}' (poll {} ms)",
+        "[matrix-hs] hub-replic: hub {} as node '{}' (poll {} ms){}",
         cfg.hub_dir.display(),
         cfg.node,
-        cfg.poll_ms
+        cfg.poll_ms,
+        if cfg.readonly { " READONLY (hub is never written; cursors in the data dir)" } else { "" }
     );
     tokio::spawn(async move {
         // Subscribe to the hub room BEFORE anything else. The room's sink is
@@ -859,7 +895,9 @@ pub fn spawn_with(state: Arc<AppState>, cfg: HubReplicConfig) -> bool {
             #[cfg(feature = "cluster")]
             crate::hubd_bridge::drain_cluster(&state).await;
             let room = ensure_hub_room(&state);
-            materialise(&state, &cfg, &mut mem).await;
+            if !cfg.readonly {
+                materialise(&state, &cfg, &mut mem).await;
+            }
             ingest_cards(&state, &room, &cfg, &mut mem).await;
             ingest_append_files(&state, &room, &cfg).await;
             tokio::time::sleep(std::time::Duration::from_millis(cfg.poll_ms)).await;

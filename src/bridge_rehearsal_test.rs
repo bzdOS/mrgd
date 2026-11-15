@@ -71,6 +71,8 @@ mod tests {
             state_dir: state_dir.to_path_buf(),
             node: node.to_string(),
             poll_ms: 100,
+            readonly: false,
+            send_cmd: None,
         }
     }
 

@@ -44,6 +44,8 @@ mod tests {
             state_dir: root.join(".mxstate"),
             node: node.to_string(),
             poll_ms: 1000,
+            readonly: false,
+            send_cmd: None,
         }
     }
 

@@ -96,6 +96,7 @@ mod tests {
                 node: "poola".to_string(),
                 poll_ms: 250,
                 state_dir: dir_a.join(".mxstate"),
+                readonly: false,
             },
         );
         hub_replic::spawn_with(
@@ -105,6 +106,7 @@ mod tests {
                 node: "beta".to_string(),
                 poll_ms: 250,
                 state_dir: dir_b.join(".mxstate"),
+                readonly: false,
             },
         );
 

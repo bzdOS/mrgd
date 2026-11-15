@@ -132,6 +132,89 @@ pub struct BridgeConfig {
     /// This host's hubd node name — the `<node>` segment of the file we ingest.
     pub node: String,
     pub poll_ms: u64,
+    /// MATRIX_HS_HUBD_READONLY=1: the bridge never writes, creates or locks anything
+    /// inside the hub (HUB_DIR / QUEUES_DIR / their parents). Ingest still reads and
+    /// mirrors into rooms; materialise is off; `state_dir` lives in the node data dir.
+    pub readonly: bool,
+    /// MATRIX_HS_HUBD_SEND_CMD, split on whitespace into program + leading args (no
+    /// shell). Readonly mode's only way into the hub: `<cmd...> <role> <text> --from <who>`.
+    pub send_cmd: Option<Vec<String>>,
+}
+
+/// Env switch for the read-only bridge. Exactly "1" — anything else is off, and the
+/// launch gates (stand-lift, rc) test the very same literal.
+pub const ENV_READONLY: &str = "MATRIX_HS_HUBD_READONLY";
+/// External command that delivers a room message into the hub in readonly mode.
+pub const ENV_SEND_CMD: &str = "MATRIX_HS_HUBD_SEND_CMD";
+
+pub fn readonly_requested(get: &dyn Fn(&str) -> Option<String>) -> bool {
+    get(ENV_READONLY).is_some_and(|v| v.trim() == "1")
+}
+
+// resolve_lenient:start
+//   purpose: Absolute-ish form of a path that may not exist yet: canonicalise the
+//            deepest existing ancestor (so symlinks into the hub are seen) and append
+//            the missing tail.
+// resolve_lenient:end
+fn resolve_lenient(p: &Path) -> PathBuf {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p.to_path_buf();
+    loop {
+        if let Ok(c) = std::fs::canonicalize(&cur) {
+            let mut out = c;
+            for t in tail.iter().rev() {
+                out.push(t);
+            }
+            return out;
+        }
+        match (cur.file_name().map(|f| f.to_os_string()), cur.parent()) {
+            (Some(f), Some(par)) => {
+                tail.push(f);
+                cur = par.to_path_buf();
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
+// readonly_state_dir:start
+//   purpose: Where a readonly bridge keeps its cursors: <MATRIX_HS_HUBD_STATE_DIR or
+//            MATRIX_HS_DATA_DIR/hubd-state>/<sub>. Refuses (Err) when no such dir is
+//            configured, or when it would sit inside any of `forbidden` (hub dir,
+//            queues dir, their parent) — a cursor written there IS a write to the hub.
+//   input:  env lookup, sub-directory name, forbidden hub paths
+//   output: state dir path or the refusal reason
+//   sideEffects: none (does not create the directory)
+// readonly_state_dir:end
+pub fn readonly_state_dir(
+    get: &dyn Fn(&str) -> Option<String>,
+    sub: &str,
+    forbidden: &[&Path],
+) -> Result<PathBuf, String> {
+    let base = match get("MATRIX_HS_HUBD_STATE_DIR").filter(|s| !s.trim().is_empty()) {
+        Some(d) => PathBuf::from(d),
+        None => match get("MATRIX_HS_DATA_DIR").filter(|s| !s.trim().is_empty()) {
+            Some(d) => PathBuf::from(d).join("hubd-state"),
+            None => {
+                return Err(
+                    "readonly needs MATRIX_HS_DATA_DIR (or MATRIX_HS_HUBD_STATE_DIR) for its cursors".into(),
+                )
+            }
+        },
+    };
+    let dir = base.join(sub);
+    let rdir = resolve_lenient(&dir);
+    for f in forbidden {
+        let rf = resolve_lenient(f);
+        if rdir.starts_with(&rf) {
+            return Err(format!(
+                "cursor dir {} lies inside the hub path {} — readonly must not write there",
+                dir.display(),
+                f.display()
+            ));
+        }
+    }
+    Ok(dir)
 }
 
 impl BridgeConfig {
@@ -143,14 +226,48 @@ impl BridgeConfig {
     //   sideEffects: reads /etc/hostname when no node name is configured
     // BridgeConfig::from_env:end
     pub fn from_env() -> Option<Self> {
-        let queues_dir = PathBuf::from(std::env::var("MATRIX_HS_HUBD_QUEUES_DIR").ok()?);
-        let state_dir = queues_dir
-            .parent()
-            .map(|p| p.join(".mxstate"))
-            .unwrap_or_else(|| PathBuf::from(".mxstate"));
-        let node = std::env::var("MATRIX_HS_HUBD_NODE")
-            .or_else(|_| std::env::var("HUBD_QUEUE_NODE_ID"))
-            .ok()
+        Self::from_lookup(&|k| std::env::var(k).ok())
+    }
+
+    // BridgeConfig::from_lookup:start
+    //   purpose: from_env over an arbitrary key lookup (tests: no process-env races).
+    //            Readonly with an unusable cursor location disables the bridge
+    //            (fail closed) instead of falling back to a cursor inside the hub.
+    // BridgeConfig::from_lookup:end
+    pub fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> Option<Self> {
+        let queues_dir = PathBuf::from(get("MATRIX_HS_HUBD_QUEUES_DIR")?);
+        let readonly = readonly_requested(get);
+        let state_dir = if readonly {
+            let mut forbidden: Vec<PathBuf> = vec![queues_dir.clone()];
+            if let Some(p) = queues_dir.parent() {
+                forbidden.push(p.to_path_buf());
+            }
+            if let Some(h) = get("MATRIX_HS_HUBD_HUB_DIR").filter(|s| !s.trim().is_empty()) {
+                let h = PathBuf::from(h);
+                if let Some(p) = h.parent() {
+                    forbidden.push(p.to_path_buf());
+                }
+                forbidden.push(h);
+            }
+            let refs: Vec<&Path> = forbidden.iter().map(|p| p.as_path()).collect();
+            match readonly_state_dir(get, "queue", &refs) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("[matrix-hs] hubd-bridge: {ENV_READONLY}=1 but {e}; bridge disabled");
+                    return None;
+                }
+            }
+        } else {
+            queues_dir
+                .parent()
+                .map(|p| p.join(".mxstate"))
+                .unwrap_or_else(|| PathBuf::from(".mxstate"))
+        };
+        let send_cmd = get(ENV_SEND_CMD)
+            .map(|v| v.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+            .filter(|v| !v.is_empty());
+        let node = get("MATRIX_HS_HUBD_NODE")
+            .or_else(|| get("HUBD_QUEUE_NODE_ID"))
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| {
                 std::fs::read_to_string("/etc/hostname")
@@ -159,8 +276,7 @@ impl BridgeConfig {
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "node".to_string())
             });
-        let poll_ms = std::env::var("MATRIX_HS_HUBD_POLL_MS")
-            .ok()
+        let poll_ms = get("MATRIX_HS_HUBD_POLL_MS")
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_POLL_MS);
         Some(BridgeConfig {
@@ -171,6 +287,8 @@ impl BridgeConfig {
             // file invisible to every reader.
             node: sanitize_node(&node),
             poll_ms,
+            readonly,
+            send_cmd,
         })
     }
 }
@@ -938,6 +1056,11 @@ pub(crate) fn materialize_role(
     role: &str,
     counts: &mut HashMap<PathBuf, (u64, usize)>,
 ) -> usize {
+    // Readonly: no write of any kind into the hub. Fail closed here as well as in the
+    // driver, so no caller can reach the appends below.
+    if cfg.readonly {
+        return 0;
+    }
     let room_id = queue_room_id(role);
 
     // Collect per-origin blocks under the rooms lock, then release it before any I/O.
@@ -1032,6 +1155,156 @@ fn append(path: &Path, text: &str) -> std::io::Result<u64> {
     Ok(f.metadata()?.len())
 }
 
+// send_role:start
+//   purpose: Readonly mode's return path. A room message typed by a Matrix client
+//            on THIS node (origin "mx-<this node>", signed by this node) is handed
+//            to the external command (`hub queue send <role> <text> --from <who>`),
+//            never written to a queue file.
+//            Not sent, by construction:
+//              - anything carrying net.hubd.queue (it came out of a hub file via
+//                ingest, or is a peer hub's block) — this is the eco-loop guard: a
+//                mirrored hub block can never go back into the hub;
+//              - anything from @hubd:* or signed by another node.
+//            Exactly-once: ids of sent events live in <state_dir>/sent-<role>.ids.
+//            The id is recorded BEFORE the command runs, so a crash or a failing
+//            command never produces a second delivery (a failed one is logged and
+//            NOT retried). The first pass over a role only records what is already
+//            in the room (baseline) — history is never replayed into a live hub.
+//            No command configured: nothing is sent, one warning is logged.
+//   input:  state, cfg, role, sent — per-role id cache (empty on a fresh process)
+//   output: number of messages handed to the command
+//   sideEffects: writes only <state_dir>; spawns the command (no shell, no stdin)
+// send_role:end
+static SEND_CMD_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub(crate) fn send_role(
+    state: &Arc<AppState>,
+    cfg: &BridgeConfig,
+    role: &str,
+    sent: &mut HashMap<String, HashSet<String>>,
+) -> usize {
+    let Some(cmd) = cfg.send_cmd.as_ref() else {
+        if !SEND_CMD_WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            eprintln!(
+                "[matrix-hs] hubd-bridge: WARNING {ENV_READONLY}=1 and {ENV_SEND_CMD} is not set — messages from rooms are NOT delivered to the hub"
+            );
+        }
+        return 0;
+    };
+    let room_id = queue_room_id(role);
+    let mut eligible: Vec<(String, String, String)> = Vec::new(); // (event_id, from, body)
+    {
+        let Ok(rooms) = state.rooms.lock() else {
+            return 0;
+        };
+        let Some(log) = rooms.get(&room_id) else {
+            return 0;
+        };
+        for pdu in log.ordered() {
+            if pdu.kind != "m.room.message" || pdu.sender.starts_with("@hubd:") {
+                continue;
+            }
+            if pdu.signer_node != state.server_name.as_str() {
+                continue;
+            }
+            let Ok(content) = serde_json::from_slice::<Value>(&pdu.content) else {
+                continue;
+            };
+            if content.get(CONTENT_KEY).is_some() {
+                continue; // from a hub file — never back into the hub
+            }
+            if !origin_of(&content, &pdu.signer_node).starts_with("mx-") {
+                continue;
+            }
+            let body = content
+                .get("body")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if body.trim().is_empty() {
+                continue;
+            }
+            let from = crate::state::localpart(&pdu.sender);
+            let from = if from.is_empty() { "matrix" } else { from };
+            eligible.push((pdu.event_id.clone(), from.to_string(), body.to_string()));
+        }
+    }
+
+    let cursor = cfg.state_dir.join(format!("sent-{}.ids", role_slug(role)));
+    if !sent.contains_key(role) {
+        match std::fs::read_to_string(&cursor) {
+            Ok(t) => {
+                sent.insert(role.to_string(), t.lines().map(str::to_string).collect());
+            }
+            Err(_) => {
+                // First pass for this role: baseline = what is already there.
+                let ids: HashSet<String> = eligible.iter().map(|e| e.0.clone()).collect();
+                let text: String = eligible.iter().map(|e| format!("{}\n", e.0)).collect();
+                if std::fs::create_dir_all(&cfg.state_dir)
+                    .and_then(|_| std::fs::write(&cursor, text))
+                    .is_err()
+                {
+                    eprintln!("[matrix-hs] hubd-bridge: cannot write send cursor {}; sending nothing", cursor.display());
+                    return 0;
+                }
+                sent.insert(role.to_string(), ids);
+                return 0;
+            }
+        }
+    }
+    let done = sent.get_mut(role).expect("inserted above");
+
+    let mut n = 0usize;
+    for (id, from, body) in eligible {
+        if done.contains(&id) {
+            continue;
+        }
+        // Record first: at-most-once beats at-least-once for a live hub.
+        if append(&cursor, &format!("{id}\n")).is_err() {
+            eprintln!("[matrix-hs] hubd-bridge: cannot record send cursor {}; stopping", cursor.display());
+            return n;
+        }
+        done.insert(id.clone());
+        match run_send_cmd(cmd, role, &body, &from) {
+            Ok(()) => n += 1,
+            Err(e) => eprintln!(
+                "[matrix-hs] hubd-bridge: send to hub failed for {id} ({e}); not retried"
+            ),
+        }
+    }
+    if n > 0 {
+        eprintln!("[matrix-hs] hubd-bridge: sent {n} message(s) for role '{role}' to the hub");
+    }
+    n
+}
+
+fn run_send_cmd(cmd: &[String], role: &str, body: &str, from: &str) -> Result<(), String> {
+    let mut c = std::process::Command::new(&cmd[0]);
+    c.args(&cmd[1..])
+        .arg(role)
+        .arg(body)
+        .arg("--from")
+        .arg(from)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = c.spawn().map_err(|e| format!("spawn {}: {e}", cmd[0]))?;
+    let t0 = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) if st.success() => return Ok(()),
+            Ok(Some(st)) => return Err(format!("exit {st}")),
+            Ok(None) if t0.elapsed() > SEND_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("timeout".into());
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
 // spawn:start
 //   purpose: Start the bridge loop if MATRIX_HS_HUBD_QUEUES_DIR is set; otherwise do
 //            nothing at all, exactly like an absent MATRIX_HS_SCRIPTS_DIR.
@@ -1043,21 +1316,34 @@ pub fn spawn(state: Arc<AppState>) -> bool {
     let Some(cfg) = BridgeConfig::from_env() else {
         return false;
     };
+    spawn_with(state, cfg)
+}
+
+// spawn_with:start
+//   purpose: spawn() over an explicit config — test / programmatic entry point.
+// spawn_with:end
+pub fn spawn_with(state: Arc<AppState>, cfg: BridgeConfig) -> bool {
     eprintln!(
-        "[matrix-hs] hubd-bridge: watching {} as node '{}' (poll {} ms)",
+        "[matrix-hs] hubd-bridge: watching {} as node '{}' (poll {} ms){}",
         cfg.queues_dir.display(),
         cfg.node,
-        cfg.poll_ms
+        cfg.poll_ms,
+        if cfg.readonly { " READONLY (hub is never written; cursors in the data dir)" } else { "" }
     );
     tokio::spawn(async move {
         let mut counts: HashMap<PathBuf, (u64, usize)> = HashMap::new();
         let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut sent: HashMap<String, HashSet<String>> = HashMap::new();
         loop {
             drain_cluster(&state).await;
             for role in discover_roles(&state, &cfg) {
                 ensure_queue_room(&state, &role);
                 ingest_role(&state, &cfg, &role, &mut seen).await;
-                materialize_role(&state, &cfg, &role, &mut counts);
+                if cfg.readonly {
+                    send_role(&state, &cfg, &role, &mut sent);
+                } else {
+                    materialize_role(&state, &cfg, &role, &mut counts);
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(cfg.poll_ms)).await;
         }

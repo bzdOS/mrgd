@@ -141,6 +141,11 @@ unset _zmode
 #   - QUEUES_DIR при заданном HUB_DIR обязан лежать внутри HUB_DIR;
 #   - у моста state-каталог = <родитель QUEUES_DIR>/.mxstate (hubd_bridge.rs),
 #     поэтому родитель QUEUES_DIR проверяется как запись тем же правилом.
+# ИСКЛЮЧЕНИЕ — MATRIX_HS_HUBD_READONLY=1 (ровно '1'): мост только читает хаб,
+# курсоры живут в data-каталоге узла, поэтому живой путь РАЗРЕШЁН. Взамен гейт
+# требует MATRIX_HS_DATA_DIR (или MATRIX_HS_HUBD_STATE_DIR), лежащий вне HUB_DIR,
+# QUEUES_DIR и их родителей: иначе «readonly» писал бы в хаб курсорами.
+# Без флага — прежний отказ целиком.
 hubd_rp() { _r=$(realpath -- "$1" 2>/dev/null) && [ -n "$_r" ]; }
 hubd_within() { # $1 равен $2 или лежит внутри $2
 	[ "$2" = / ] && return 0
@@ -149,6 +154,7 @@ hubd_within() { # $1 равен $2 или лежит внутри $2
 	return 1
 }
 hubd_vs_live() { # метка, realpath проверяемого пути
+	[ "${_ro:-0}" = 1 ] && return 0 # readonly: живой путь допустим, см. hubd_gate
 	while IFS= read -r _l; do
 		[ -n "$_l" ] || continue
 		if hubd_within "$2" "$_l"; then
@@ -167,14 +173,17 @@ hubd_gate() {
 	_q=${MATRIX_HS_HUBD_QUEUES_DIR:-}
 	_h=${MATRIX_HS_HUBD_HUB_DIR:-}
 	[ -n "$_q$_h" ] || return 0
+	_ro=0
+	[ "${MATRIX_HS_HUBD_READONLY:-}" = 1 ] && _ro=1
 	_live=${STAND_LIVE_HUB_PATHS:-}
-	if [ -z "$(printf '%s' "$_live" | tr -d ':[:space:]')" ]; then
+	if [ "$_ro" != 1 ] && [ -z "$(printf '%s' "$_live" | tr -d ':[:space:]')" ]; then
 		echo "stand-lift: мост hubd: STAND_LIVE_HUB_PATHS пуст — копию от живого хаба не отличить, отказ (fail-safe)." >&2
 		return 1
 	fi
 	_lr=
 	while IFS= read -r _p; do
 		[ -n "$_p" ] || continue
+		[ "$_ro" = 1 ] && continue
 		if ! hubd_rp "$_p"; then
 			echo "stand-lift: мост hubd: живой путь '$_p' из STAND_LIVE_HUB_PATHS не существует — не проверить, отказ." >&2
 			return 1
@@ -200,6 +209,23 @@ hubd_gate() {
 			echo "stand-lift: мост hubd: QUEUES_DIR ($_qr) не лежит внутри HUB_DIR ($_hr) — отказ." >&2
 			return 1
 		fi
+	fi
+	if [ "$_ro" = 1 ]; then
+		_sd=${MATRIX_HS_HUBD_STATE_DIR:-${MATRIX_HS_DATA_DIR:-}}
+		if [ -z "$_sd" ] || ! hubd_rp "$_sd"; then
+			echo "stand-lift: мост hubd: READONLY=1 требует существующий MATRIX_HS_DATA_DIR (или MATRIX_HS_HUBD_STATE_DIR) для курсоров — отказ." >&2
+			return 1
+		fi
+		_sdr=$_r
+		for _w in "$_hr" "$_qr"; do
+			[ -n "$_w" ] || continue
+			for _x in "$_w" "$(dirname "$_w")"; do
+				if hubd_within "$_sdr" "$_x"; then
+					echo "stand-lift: мост hubd: каталог курсоров ($_sdr) лежит внутри хаба или его родителя ($_x) — readonly писал бы в хаб, отказ." >&2
+					return 1
+				fi
+			done
+		done
 	fi
 	return 0
 }
