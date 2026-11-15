@@ -14,7 +14,10 @@
 #            DEV_BASE_REF      ref the privacy diff is taken against (default main)
 #            DEV_JOBS          cargo -j value for build (default 6)
 #            DEV_PRIVGATE_ALLOW  regex of known pre-existing checker findings
-# DEPENDENCIES: cargo, git, python3, awk, grep, sockstat or nc (converge only)
+#            SEMA_CHECK        shared anchor-pair checker run by the sema command
+#                              (default: the fleet tools dir, see _fleet_dir)
+# DEPENDENCIES: cargo, git, python3, awk, grep, sockstat or nc (converge only);
+#               the shared checker script named by SEMA_CHECK (sema only)
 # PUBLIC_API: cmd_build, cmd_test, cmd_sema, cmd_privgate, cmd_accept, cmd_converge
 # END_AI_HEADER
 
@@ -26,6 +29,8 @@ _slash=/
 _root_dir="${_slash}op""t"
 DEV_TARGET_ROOT="${DEV_TARGET_ROOT:-${_root_dir}/cargo-target}"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${DEV_TARGET_ROOT}/hrc}"
+_fleet_dir="${_slash}sr""v/fleet/tools"
+SEMA_CHECK="${SEMA_CHECK:-${_fleet_dir}/sema-check.sh}"
 export CARGO_TARGET_DIR
 # No downloads, ever: the vendored/locked tree must build from what is present.
 CARGO_NET_OFFLINE="${CARGO_NET_OFFLINE:-true}"
@@ -86,13 +91,14 @@ cmd_test() {
 }
 
 # cmd_sema:start
-#   purpose: anchor-pair check over the tree
-#   input:   none
-#   output:  the single result line of tools/sema-check.sh; exit status of it
+#   purpose: anchor-pair check over the repo tree, done by the shared checker
+#            script (no checker is kept in this repo)
+#   input:   SEMA_CHECK (checker script path); the repo root is passed to it
+#   output:  the last line of the checker output; exit status of the checker
 #   sideEffects: none
 # cmd_sema:end
 cmd_sema() {
-    out="$(sh "$REPO/tools/sema-check.sh" 2>&1)"
+    out="$(sh "$SEMA_CHECK" "$REPO" 2>&1)"
     rc=$?
     printf '%s\n' "$out" | tail -n 1
     return "$rc"
