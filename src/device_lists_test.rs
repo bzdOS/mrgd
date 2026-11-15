@@ -99,7 +99,7 @@ mod tests {
         let create_resp: Value = server
             .post("/_matrix/client/v3/createRoom")
             .add_header(alice_hn.clone(), alice_hv.clone())
-            .json(&json!({ "room_alias_name": "device-lists-room" }))
+            .json(&json!({ "room_alias_name": "device-lists-room", "preset": "public_chat" }))
             .await
             .json();
         let room_id = create_resp["room_id"]
@@ -215,7 +215,7 @@ mod tests {
         let create_resp: Value = server
             .post("/_matrix/client/v3/createRoom")
             .add_header(alice_hn.clone(), alice_hv.clone())
-            .json(&json!({ "room_alias_name": "device-lists-room-2" }))
+            .json(&json!({ "room_alias_name": "device-lists-room-2", "preset": "public_chat" }))
             .await
             .json();
         let room_id = create_resp["room_id"]

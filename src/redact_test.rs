@@ -58,7 +58,7 @@ mod tests {
         let resp = server
             .post("/_matrix/client/v3/createRoom")
             .add_header(auth.0.clone(), auth.1.clone())
-            .json(&json!({ "room_alias_name": alias }))
+            .json(&json!({ "room_alias_name": alias, "preset": "public_chat" }))
             .await;
         resp.assert_status_ok();
         let body: Value = resp.json();

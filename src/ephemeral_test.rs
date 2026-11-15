@@ -104,7 +104,7 @@ mod tests {
         let resp = server
             .post("/_matrix/client/v3/createRoom")
             .add_header(auth_header.0.clone(), auth_header.1.clone())
-            .json(&json!({ "room_alias_name": alias }))
+            .json(&json!({ "room_alias_name": alias, "preset": "public_chat" }))
             .await;
         resp.assert_status_ok();
         let body: Value = resp.json();
@@ -112,9 +112,8 @@ mod tests {
     }
 
     // join_room:start
-    //   purpose: Join a room as the given caller (this server's join is fully
-    //            permissive — no invite/join_rules gate — so any authenticated
-    //            user can call this directly). /sync is now scoped to the
+    //   purpose: Join a room as the given caller (the rooms these tests create
+    //            are public_chat, so join_rules lets any authenticated user in). /sync is now scoped to the
     //            caller's own joined rooms (see routes/sync.rs::build_join_rooms
     //            — previously it leaked every room to every caller regardless
     //            of membership), so bob must actually join before his /sync

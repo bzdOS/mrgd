@@ -257,7 +257,7 @@ mod tests {
         let resp = server
             .post("/_matrix/client/v3/createRoom")
             .add_header(alice_name.clone(), alice_val.clone())
-            .json(&json!({ "name": "Push Test Room", "room_alias_name": "push-test-room" }))
+            .json(&json!({ "name": "Push Test Room", "room_alias_name": "push-test-room", "preset": "public_chat" }))
             .await;
         resp.assert_status_ok();
         let room_id = resp.json::<Value>()["room_id"]

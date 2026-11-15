@@ -83,6 +83,30 @@ fn extract_token_user(headers: &HeaderMap, secret: &[u8], server_name: &str) -> 
         .and_then(|tok| resolve_user_id_from_token(tok, secret, server_name))
 }
 
+// require_token_user:start
+//   purpose: The token gate of every authenticated room route: Err(MissingToken) ->
+//            401 M_MISSING_TOKEN when the request carries no Bearer token at all,
+//            Err(UnknownToken) -> 401 M_UNKNOWN_TOKEN when it carries one that does not
+//            verify, Ok(user_id) otherwise.
+//   input:  headers, state
+//   output: Result<String, HsError>
+//   sideEffects: none
+// require_token_user:end
+pub(crate) fn require_token_user(
+    headers: &HeaderMap,
+    state: &Arc<AppState>,
+) -> Result<String, HsError> {
+    let has_bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.starts_with("Bearer ") && s.len() > "Bearer ".len());
+    if !has_bearer {
+        return Err(HsError::MissingToken("missing access token".to_string()));
+    }
+    extract_token_user(headers, &state.token_secret, &state.server_name)
+        .ok_or_else(|| HsError::UnknownToken("missing or invalid token".to_string()))
+}
+
 // add_member_state_event:start
 //   purpose: Add (or update) an m.room.member state event in room_state.
 //            Also appends to room_timeline for incremental sync.
@@ -183,14 +207,14 @@ pub async fn post_join_room_or_alias(
     headers: HeaderMap,
     _body: Option<Json<Value>>,
 ) -> Result<Json<Value>, HsError> {
-    let user_id = extract_token_user(&headers, &state.token_secret, &state.server_name)
-        .ok_or_else(|| HsError::UnknownToken("missing or invalid token".to_string()))?;
+    let user_id = require_token_user(&headers, &state)?;
     let room_id = resolve_room_id(&state, &room_id_or_alias)?;
     // Same rule as the room-id path: a resolvable alias is not a licence
     // to invent the room behind it.
     if !room_is_known(&state, &room_id) {
         return Err(HsError::RoomNotFound(room_id));
     }
+    require_join_allowed(&state, &room_id, &user_id)?;
     state.ensure_room_state(&room_id);
     #[cfg_attr(not(feature = "cluster"), allow(unused_variables))]
     let ev = add_member_state_event(&state, &room_id, &user_id, "join", &user_id, None)?;
@@ -212,8 +236,7 @@ pub async fn post_join_room(
     headers: HeaderMap,
     _body: Option<Json<Value>>,
 ) -> Result<Json<Value>, HsError> {
-    let user_id = extract_token_user(&headers, &state.token_secret, &state.server_name)
-        .ok_or_else(|| HsError::UnknownToken("missing or invalid token".to_string()))?;
+    let user_id = require_token_user(&headers, &state)?;
     // The spec answer for a room this node has never heard of is 404
     // M_NOT_FOUND. The ensure_room_state() below used to create it instead, so a
     // join for a typo or a not-yet-arrived room id silently produced an
@@ -221,12 +244,101 @@ pub async fn post_join_room(
     if !room_is_known(&state, &room_id) {
         return Err(HsError::RoomNotFound(room_id));
     }
+    require_join_allowed(&state, &room_id, &user_id)?;
     state.ensure_room_state(&room_id);
     #[cfg_attr(not(feature = "cluster"), allow(unused_variables))]
     let ev = add_member_state_event(&state, &room_id, &user_id, "join", &user_id, None)?;
     #[cfg(feature = "cluster")]
     publish_state_event(&state, &ev).await?;
     Ok(Json(json!({ "room_id": room_id })))
+}
+
+// room_state_content / require_join_allowed / require_read_access:start
+//   purpose: Authorisation for entering and reading a room, per the Matrix CS-API.
+//            JOIN (POST /join/{..}, /rooms/{id}/join) follows the room's current
+//            m.room.join_rules; the stored rule is what counts, and a room without
+//            one is treated as "invite" (the spec default), never as open:
+//              - a banned user is refused whatever the rule;
+//              - a user who is already joined passes (idempotent re-join);
+//              - "public": allowed;
+//              - "invite": allowed only with a pending invite;
+//              - "knock" / "restricted" / "knock_restricted": this server has no knock
+//                or room-membership-based join, so only a pending invite lets anyone in
+//                (the invite path is valid for those rules in the spec too);
+//              - any other value: refused.
+//            READ (GET state, state/{type}[/{key}], members, joined_members, messages)
+//            needs a valid token (401 M_MISSING_TOKEN / M_UNKNOWN_TOKEN), then an
+//            existing room (404), then either history_visibility == "world_readable" or
+//            a current membership of "join" (403 M_FORBIDDEN otherwise).
+//            Simplification against the spec: invited and left users are treated as
+//            strangers for reads. The spec lets an invited user see the room from the
+//            invite on (history_visibility "invited"/"shared") and a user who left read
+//            up to the moment they left; this server keeps no per-user visibility
+//            horizon, so those two cases are refused rather than guessed at.
+//   input:  state, headers / user, room_id (alias-resolved)
+//   output: Ok(user) / Ok(()) or MissingToken / UnknownToken / RoomNotFound / Forbidden
+//   sideEffects: none
+// room_state_content / require_join_allowed / require_read_access:end
+fn room_state_content(state: &Arc<AppState>, room_id: &str, event_type: &str) -> Option<Value> {
+    let rs = state.room_state.lock().ok()?;
+    rs.get(room_id)?
+        .iter()
+        .find(|e| e.event_type == event_type && e.state_key.is_empty())
+        .map(|e| e.content.clone())
+}
+
+fn require_join_allowed(
+    state: &Arc<AppState>,
+    room_id: &str,
+    user_id: &str,
+) -> Result<(), HsError> {
+    let membership = current_membership(state, room_id, user_id)?;
+    match membership.as_deref() {
+        Some("ban") => {
+            return Err(HsError::Forbidden(format!(
+                "{user_id} is banned from {room_id}"
+            )))
+        }
+        Some("join") => return Ok(()),
+        _ => {}
+    }
+    let rule = room_state_content(state, room_id, "m.room.join_rules")
+        .and_then(|c| c.get("join_rule").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| "invite".to_string());
+    let invited = membership.as_deref() == Some("invite");
+    let allowed = match rule.as_str() {
+        "public" => true,
+        "invite" | "knock" | "restricted" | "knock_restricted" => invited,
+        _ => false,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(HsError::Forbidden(format!(
+            "{room_id} is not open to {user_id} (join_rule {rule}, no invite)"
+        )))
+    }
+}
+
+fn require_read_access(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    room_id: &str,
+) -> Result<(), HsError> {
+    let user = require_token_user(headers, state)?;
+    if !room_is_known(state, room_id) {
+        return Err(HsError::RoomNotFound(room_id.to_string()));
+    }
+    let world_readable = room_state_content(state, room_id, "m.room.history_visibility")
+        .and_then(|c| c.get("history_visibility").and_then(Value::as_str).map(str::to_string))
+        .is_some_and(|v| v == "world_readable");
+    if world_readable {
+        return Ok(());
+    }
+    match current_membership(state, room_id, &user)?.as_deref() {
+        Some("join") => Ok(()),
+        _ => Err(HsError::Forbidden(format!("{user} may not read {room_id}"))),
+    }
 }
 
 // current_membership:start
@@ -677,8 +789,10 @@ pub async fn get_directory_room(
 pub async fn get_room_state(
     State(state): State<Arc<AppState>>,
     Path(room_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, HsError> {
     let room_id = state.resolve_room_id(&room_id);
+    require_read_access(&state, &headers, &room_id)?;
     let rs = state
         .room_state
         .lock()
@@ -702,8 +816,10 @@ pub async fn get_room_state(
 pub async fn get_room_state_event(
     State(state): State<Arc<AppState>>,
     Path((room_id, event_type, state_key)): Path<(String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, HsError> {
     let room_id = state.resolve_room_id(&room_id);
+    require_read_access(&state, &headers, &room_id)?;
     let rs = state
         .room_state
         .lock()
@@ -738,8 +854,9 @@ pub async fn get_room_state_event(
 pub async fn get_room_state_event_empty_key(
     state: State<Arc<AppState>>,
     Path((room_id, event_type)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, HsError> {
-    get_room_state_event(state, Path((room_id, event_type, String::new()))).await
+    get_room_state_event(state, Path((room_id, event_type, String::new())), headers).await
 }
 
 // get_room_members:start
@@ -752,8 +869,10 @@ pub async fn get_room_state_event_empty_key(
 pub async fn get_room_members(
     State(state): State<Arc<AppState>>,
     Path(room_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, HsError> {
     let room_id = state.resolve_room_id(&room_id);
+    require_read_access(&state, &headers, &room_id)?;
     let rs = state
         .room_state
         .lock()
@@ -786,8 +905,10 @@ pub async fn get_room_members(
 pub async fn get_joined_members(
     State(state): State<Arc<AppState>>,
     Path(room_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, HsError> {
     let room_id = state.resolve_room_id(&room_id);
+    require_read_access(&state, &headers, &room_id)?;
     let rs = state
         .room_state
         .lock()
@@ -865,8 +986,10 @@ pub async fn get_room_messages(
     State(state): State<Arc<AppState>>,
     Path(room_id): Path<String>,
     Query(params): Query<MessagesParams>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, HsError> {
     let room_id = state.resolve_room_id(&room_id);
+    require_read_access(&state, &headers, &room_id)?;
     // Check room exists.
     {
         let rooms = state

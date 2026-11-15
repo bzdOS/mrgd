@@ -72,9 +72,15 @@ mod tests {
     //   output: Option<Value> — the member event's "content" object
     //   sideEffects: none
     // member_event:end
-    async fn member_content(server: &TestServer, room_id: &str, user_id: &str) -> Option<Value> {
+    async fn member_content(
+        server: &TestServer,
+        reader: &axum::http::HeaderValue,
+        room_id: &str,
+        user_id: &str,
+    ) -> Option<Value> {
         let resp = server
             .get(&format!("/_matrix/client/v3/rooms/{room_id}/members"))
+            .add_header(axum::http::HeaderName::from_static("authorization"), reader.clone())
             .await;
         resp.assert_status_ok();
         let body: Value = resp.json();
@@ -115,7 +121,7 @@ mod tests {
             .json(&json!({ "user_id": bob_id }))
             .await
             .assert_status_ok();
-        let content = member_content(&server, &room_id, &bob_id)
+        let content = member_content(&server, &a_hv, &room_id, &bob_id)
             .await
             .unwrap_or_else(|| panic!("expected bob member event after invite"));
         assert_eq!(
@@ -133,7 +139,7 @@ mod tests {
             )
             .await
             .assert_status_ok();
-        let content = member_content(&server, &room_id, &bob_id)
+        let content = member_content(&server, &a_hv, &room_id, &bob_id)
             .await
             .unwrap_or_else(|| panic!("expected bob member event after join"));
         assert_eq!(
@@ -149,7 +155,7 @@ mod tests {
             .json(&json!({ "user_id": bob_id, "reason": "testing kick" }))
             .await
             .assert_status_ok();
-        let content = member_content(&server, &room_id, &bob_id)
+        let content = member_content(&server, &a_hv, &room_id, &bob_id)
             .await
             .unwrap_or_else(|| panic!("expected bob member event after kick"));
         assert_eq!(
@@ -182,7 +188,7 @@ mod tests {
             .json(&json!({ "user_id": bob_id, "reason": "testing ban" }))
             .await
             .assert_status_ok();
-        let content = member_content(&server, &room_id, &bob_id)
+        let content = member_content(&server, &a_hv, &room_id, &bob_id)
             .await
             .unwrap_or_else(|| panic!("expected bob member event after ban"));
         assert_eq!(
@@ -284,7 +290,7 @@ mod tests {
             .assert_status(axum::http::StatusCode::FORBIDDEN);
 
         // alice's membership must still be untouched throughout.
-        let content = member_content(&server, &room_id, &alice_id)
+        let content = member_content(&server, &a_hv, &room_id, &alice_id)
             .await
             .unwrap_or_else(|| panic!("expected alice's own member event"));
         assert_eq!(content["membership"].as_str(), Some("join"));
@@ -340,7 +346,7 @@ mod tests {
             .json(&json!({ "user_id": bob_id }))
             .await
             .assert_status_ok();
-        let content = member_content(&server, &room_id, &bob_id)
+        let content = member_content(&server, &a_hv, &room_id, &bob_id)
             .await
             .unwrap_or_else(|| panic!("expected bob member event after unban"));
         assert_eq!(
@@ -366,7 +372,10 @@ mod tests {
         let create: Value = server
             .post("/_matrix/client/v3/createRoom")
             .add_header(a_hn.clone(), a_hv.clone())
-            .json(&json!({}))
+            .json(&json!({ "initial_state": [{
+                "type": "m.room.history_visibility", "state_key": "",
+                "content": { "history_visibility": "world_readable" }
+            }] }))
             .await
             .json();
         let room_id = create["room_id"].as_str().expect("room_id").to_string();
@@ -384,7 +393,7 @@ mod tests {
             .add_header(a_hn.clone(), a_hv.clone())
             .await
             .assert_status_ok();
-        let content = member_content(&server, &room_id, &alice_id)
+        let content = member_content(&server, &a_hv, &room_id, &alice_id)
             .await
             .unwrap_or_else(|| panic!("expected alice member event after leave"));
         assert_eq!(

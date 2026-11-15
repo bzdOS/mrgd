@@ -50,6 +50,12 @@ pub enum HsError {
     #[error("unknown token: {0}")]
     UnknownToken(String),
 
+    /// No Authorization header at all. Maps to M_MISSING_TOKEN (HTTP 401), which is
+    /// what the spec asks for when a token was required and none was sent; a token
+    /// that was sent but is bad stays UnknownToken.
+    #[error("missing token: {0}")]
+    MissingToken(String),
+
     /// Upload body exceeded the server's configured media size limit.
     /// Maps to Matrix errcode M_TOO_LARGE (HTTP 413).
     #[error("payload too large: {0}")]
@@ -92,6 +98,7 @@ impl IntoResponse for HsError {
             HsError::Forbidden(m) => (StatusCode::FORBIDDEN, "M_FORBIDDEN", m.clone()),
             HsError::RoomInUse(m) => (StatusCode::BAD_REQUEST, "M_ROOM_IN_USE", m.clone()),
             HsError::UnknownToken(m) => (StatusCode::UNAUTHORIZED, "M_UNKNOWN_TOKEN", m.clone()),
+            HsError::MissingToken(m) => (StatusCode::UNAUTHORIZED, "M_MISSING_TOKEN", m.clone()),
             HsError::TooLarge(m) => (StatusCode::PAYLOAD_TOO_LARGE, "M_TOO_LARGE", m.clone()),
             HsError::GateClosed(_) => unreachable!("handled above"),
         };

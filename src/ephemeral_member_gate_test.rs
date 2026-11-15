@@ -272,7 +272,7 @@ mod tests {
         let created: Value = server
             .post("/_matrix/client/v3/createRoom")
             .add_header(owner.0.clone(), owner.1.clone())
-            .json(&json!({}))
+            .json(&json!({ "preset": "public_chat" }))
             .await
             .json();
         let room = created["room_id"]

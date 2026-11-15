@@ -646,3 +646,6 @@ fn cs_api_routes() -> Router<Arc<AppState>> {
             put(routes::account_data::put_room_tag).delete(routes::account_data::delete_room_tag),
         )
 }
+
+#[cfg(test)]
+mod authz_test;

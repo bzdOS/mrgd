@@ -105,7 +105,10 @@ mod tests {
             "/_matrix/client/v3/rooms/{}/state/m.room.encryption",
             urlencoding_path(&room_id)
         );
-        let state_resp = server.get(&state_url).await;
+        let state_resp = server
+            .get(&state_url)
+            .add_header(hn.clone(), hv.clone())
+            .await;
         state_resp.assert_status_ok();
         let content: Value = state_resp.json();
         assert_eq!(
