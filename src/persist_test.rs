@@ -1940,6 +1940,81 @@ mod persist_tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    // stalled_room_gc_does_not_starve_the_http_workers:start
+    //   purpose: collect_room_log_to rewrites the room journal (prune), the pdumeta
+    //            sidecar and the GC marker, synchronously, on every send into a room
+    //            that sits at its cap. Held at the prune step by the compaction hook
+    //            (standing in for a slow fdatasync/rename on a busy disk), it must not
+    //            keep the runtime's only worker: a trivial task spawned meanwhile,
+    //            standing for /versions, has to run promptly. Reproduced live on a copy
+    //            of the stand data: 30 concurrent senders, workers parked in
+    //            persist_room_gc/prune_room_journal, HTTP dead.
+    //   input:  none
+    //   output: none (asserts the canary latency stays under 700 ms)
+    //   sideEffects: temp data dir; builds its own 1-worker multi-thread runtime
+    // stalled_room_gc_does_not_starve_the_http_workers:end
+    #[test]
+    fn stalled_room_gc_does_not_starve_the_http_workers() {
+        use crate::substrate::matrix_events::Pdu;
+        let data_dir = make_temp_dir();
+        let state = AppState::with_data_dir(data_dir.to_path_buf());
+        let room_id = "!gc_stall:localhost";
+        let mut prev: Vec<String> = Vec::new();
+        {
+            let mut rooms = state.rooms.lock().unwrap();
+            let log = rooms.entry(room_id.to_string()).or_default();
+            for depth in 0..6u64 {
+                let pdu = Pdu::signed(
+                    room_id.to_string(),
+                    "@u:localhost".to_string(),
+                    "m.room.message".to_string(),
+                    br#"{"msgtype":"m.text","body":"x"}"#.to_vec(),
+                    prev.clone(),
+                    depth,
+                    depth + 1,
+                    &state.signer,
+                );
+                prev = vec![pdu.event_id.clone()];
+                state.persist_room_event(room_id, &json!({"event_id": pdu.event_id, "room_id": room_id}));
+                log.add(pdu);
+            }
+        }
+        let journal = data_dir
+            .join("rooms")
+            .join(format!("{}.jsonl", crate::persist::sanitize_filename(room_id)));
+        let stalled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = stalled.clone();
+        crate::persist::COMPACTION_HOOKS.lock().unwrap().push((
+            journal,
+            Box::new(move || {
+                n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+            }),
+        ));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let waited = rt.block_on(async {
+            let s1 = state.clone();
+            let gc = tokio::spawn(async move { s1.collect_room_log_to(room_id, 2) });
+            while stalled.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let t = std::time::Instant::now();
+            tokio::spawn(async {}).await.expect("canary");
+            let waited = t.elapsed();
+            assert!(gc.await.expect("gc task") > 0, "the collection must have run");
+            waited
+        });
+        assert!(
+            waited < std::time::Duration::from_millis(700),
+            "a stalled room GC starved the runtime workers: canary took {waited:?}"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
 }
 
     // doc_markers_balanced:start

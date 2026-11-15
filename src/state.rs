@@ -3427,7 +3427,9 @@ impl AppState {
     //            safely. Production calls it through collect_room_log.
     //   input:  room_id; cap — how many events to keep (0 disables collection)
     //   output: number of events collected
-    //   sideEffects: as collect_room_log
+    //   sideEffects: as collect_room_log; the journal/pdumeta/marker rewrite runs
+    //                under persist::off_executor, so on a multi-thread runtime it
+    //                occupies a blocking thread, not an HTTP worker
     // AppState::collect_room_log_to:end
     pub fn collect_room_log_to(&self, room_id: &str, cap: usize) -> usize {
         if cap == 0 {
@@ -3457,10 +3459,18 @@ impl AppState {
         // Persist the decision and shrink the journal to match. Memory is bounded by
         // the watermark alone; disk needs the journal rewritten, and a restart needs
         // the marker or replay would undo the whole thing.
+        //
+        // The three calls rewrite whole files (journal, pdumeta) with fsync and rename,
+        // and in a room that sits at its cap this runs after EVERY send. They are
+        // plain blocking fs work called from an axum handler, so they go through
+        // off_executor: otherwise N concurrent senders park N tokio workers in the
+        // filesystem and the node stops answering HTTP altogether.
         if let Some(dir) = self.persist.data_dir.clone() {
-            crate::persist::persist_room_gc(&dir, room_id, cut);
-            crate::persist::prune_room_journal(&dir, room_id, &survivors);
-            crate::persist::compact_room_pdumeta(&dir, room_id, &survivors);
+            crate::persist::off_executor(|| {
+                crate::persist::persist_room_gc(&dir, room_id, cut);
+                crate::persist::prune_room_journal(&dir, room_id, &survivors);
+                crate::persist::compact_room_pdumeta(&dir, room_id, &survivors);
+            });
         }
         dropped
     }

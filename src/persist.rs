@@ -206,7 +206,7 @@ fn append_line(path: &Path, value: &Value) {
 //   input:  f — the blocking closure
 //   output: R — whatever f returns
 //   sideEffects: whatever f does; may spawn a replacement runtime worker thread
-fn off_executor<R>(f: impl FnOnce() -> R) -> R {
+pub(crate) fn off_executor<R>(f: impl FnOnce() -> R) -> R {
     match tokio::runtime::Handle::try_current() {
         Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(f)
