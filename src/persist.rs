@@ -183,8 +183,46 @@ impl PersistCtx {
 //            On any error: print to stderr and return (best-effort, never panic).
 //   input:  path — file path to open or create; value — JSON value to serialise as one line
 //   output: none (errors logged to stderr, not propagated)
-//   sideEffects: opens/creates file (cached), appends one line, calls fsync
+//   sideEffects: opens/creates file (cached), appends one line, calls fsync;
+//                on a multi-thread tokio runtime the whole call runs under
+//                block_in_place (see off_executor), so a stalled fsync parks one
+//                thread and not one of the workers that serve HTTP
 fn append_line(path: &Path, value: &Value) {
+    off_executor(|| append_line_blocking(path, value))
+}
+// append_line:end
+
+// off_executor:start
+//   purpose: Run blocking disk work without costing the async runtime a worker.
+//            persist_* are plain fns called straight from axum handlers, i.e. on
+//            tokio workers. append_line holds one process-wide mutex across
+//            write+fdatasync, so when a single fsync stalls on a busy disk every
+//            handler that journals queues on that mutex and parks its worker; once
+//            all workers are parked nothing serves HTTP (not even /versions) while
+//            the process sits at 0% CPU in uwait. block_in_place hands the worker's
+//            queue to a replacement thread for the duration of the call.
+//   context: block_in_place panics on a current-thread runtime and is meaningless
+//            outside a runtime, so those cases (unit tests, tools) run inline.
+//   input:  f — the blocking closure
+//   output: R — whatever f returns
+//   sideEffects: whatever f does; may spawn a replacement runtime worker thread
+fn off_executor<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+// off_executor:end
+
+// append_line_blocking:start
+//   purpose: The synchronous body of append_line: encode, take the append lock,
+//            write, flush, and fsync per the durability policy below.
+//   input:  path — journal file; value — JSON value to write as one line
+//   output: none (errors logged to stderr, not propagated)
+//   sideEffects: opens/creates file (cached), appends one line, calls fsync
+fn append_line_blocking(path: &Path, value: &Value) {
     #[cfg(test)]
     append_test_hook(path);
     let line = match serde_json::to_string(value) {
@@ -232,7 +270,7 @@ fn append_line(path: &Path, value: &Value) {
         eprintln!("matrix-hs persist: append_line {}: {e}", path.display());
     }
 }
-// append_line:end
+// append_line_blocking:end
 
 // fsync_interval_ms:start
 //   purpose: Read MATRIX_HS_PERSIST_FSYNC_INTERVAL_MS once per process.

@@ -1887,6 +1887,59 @@ mod persist_tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    // slow_fsync_does_not_starve_the_http_workers:start
+    //   purpose: A journal append that stalls (a busy disk makes fdatasync take
+    //            seconds) must not take the async runtime's workers with it. One
+    //            handler journals on a 1-worker runtime while the append is held for
+    //            1.5 s by the append hook (standing in for the slow fsync); a
+    //            trivial task spawned meanwhile, which stands for /versions, must
+    //            still run promptly. Without block_in_place around the append the
+    //            only worker sits in the append and the canary waits out the stall — the
+    //            2026-11-15 incident: HTTP dead, 0% CPU, threads in uwait/bo_wwait.
+    //   input:  none
+    //   output: none (asserts the canary latency stays under 700 ms)
+    //   sideEffects: temp data dir; builds its own 1-worker multi-thread runtime
+    // slow_fsync_does_not_starve_the_http_workers:end
+    #[test]
+    fn slow_fsync_does_not_starve_the_http_workers() {
+        let data_dir = make_temp_dir();
+        let state = AppState::with_data_dir(data_dir.to_path_buf());
+        let stalled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = stalled.clone();
+        crate::persist::APPEND_HOOKS.lock().unwrap().push((
+            data_dir.join("accounts.jsonl"),
+            Box::new(move || {
+                n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+            }),
+        ));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let waited = rt.block_on(async {
+            let s1 = state.clone();
+            let a = tokio::spawn(async move { s1.persist_user("u_stall", "h", "d") });
+            // Wait until the append is inside its stall, so the canary is spawned
+            // strictly after the worker is (or is not) occupied. Poll with a plain
+            // thread sleep: tokio timers are driven by the very worker that is stalled.
+            while stalled.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let t = std::time::Instant::now();
+            tokio::spawn(async {}).await.expect("canary");
+            let waited = t.elapsed();
+            a.await.expect("append a");
+            waited
+        });
+        assert!(
+            waited < std::time::Duration::from_millis(700),
+            "a stalled journal append starved the runtime workers: canary took {waited:?}"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
 }
 
     // doc_markers_balanced:start
