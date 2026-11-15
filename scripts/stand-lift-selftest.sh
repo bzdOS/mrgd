@@ -8,7 +8,16 @@
 #   b  повторный запуск                -> no-op (гейт 1), rc=0
 #   c  ZENOH_LISTEN=tcp/0.0.0.0:...    -> отказ гейта 5, rc=1
 #   d  ZENOH_LISTEN=obfs/... и бинарь без кластерного слоя -> отказ гейта 4
-#   e  HUBD_QUEUES_DIR в env           -> отказ моста, rc=1
+#   e  HUBD_QUEUES_DIR в env, список живых путей пуст -> отказ моста (fail-safe), rc=1
+#   j  HUBD-пути = копия хаба (tmp)    -> разрешено, поднят, rc=0
+#   k  HUB_DIR = живой                 -> отказ, rc=1
+#   l  HUB_DIR = симлинк на живой      -> отказ (realpath), rc=1
+#   m  QUEUES_DIR внутри живого        -> отказ (m2: через симлинк), rc=1
+#   n  список живых пуст, HUB_DIR задан -> отказ (fail-safe), rc=1
+#   o  живой лежит внутри HUB_DIR      -> отказ, rc=1
+#   p  QUEUES_DIR вне HUB_DIR          -> отказ, rc=1
+#   q/r HUB_DIR / живой путь не существует -> отказ, rc=1
+# «Живой» в этих случаях — tmp-каталог из STAND_LIVE_HUB_PATHS.
 #   f  ZENOH_CONNECT без LISTEN, peer  -> отказ гейта 5 (неявный wildcard), rc=1
 #   g  ZENOH_LISTEN=obfs/0.0.0.0:...   -> отказ гейта 5 (wildcard, любой протокол)
 #   h  ZENOH_LISTEN=udp/[::]:...       -> то же
@@ -105,6 +114,56 @@ fi
 
 write_env "MATRIX_HS_HUBD_QUEUES_DIR=$H/q"
 run e 1 'мост hubd'
+
+# Гейт моста: «живой» хаб здесь — tmp-каталог, переданный через
+# STAND_LIVE_HUB_PATHS; копия — другой tmp-каталог. Живых путей хоста нет.
+LIVE="$T/live/hub"; COPY="$T/copy/hub"
+mkdir -p "$LIVE/queues" "$COPY/queues" "$T/x/other"
+ln -s "$LIVE" "$T/lnk"
+write_env "STAND_LIVE_HUB_PATHS=$LIVE
+MATRIX_HS_HUBD_HUB_DIR=$T/lnk"
+run l 1 'равен живому'
+refused_before_start
+write_env "STAND_LIVE_HUB_PATHS=$LIVE
+MATRIX_HS_HUBD_HUB_DIR=$LIVE"
+run k 1 'равен живому'
+refused_before_start
+write_env "STAND_LIVE_HUB_PATHS=$LIVE
+MATRIX_HS_HUBD_HUB_DIR=$COPY
+MATRIX_HS_HUBD_QUEUES_DIR=$LIVE/queues"
+run m 1 'равен живому'
+refused_before_start
+write_env "STAND_LIVE_HUB_PATHS=$LIVE
+MATRIX_HS_HUBD_QUEUES_DIR=$T/lnk/queues"
+run m2 1 'равен живому'
+refused_before_start
+write_env "STAND_LIVE_HUB_PATHS=$LIVE
+MATRIX_HS_HUBD_HUB_DIR=$T/live"
+run o 1 'лежит внутри'
+refused_before_start
+write_env "STAND_LIVE_HUB_PATHS=
+MATRIX_HS_HUBD_HUB_DIR=$COPY"
+run n 1 'fail-safe'
+refused_before_start
+write_env "STAND_LIVE_HUB_PATHS=$LIVE
+MATRIX_HS_HUBD_HUB_DIR=$COPY
+MATRIX_HS_HUBD_QUEUES_DIR=$T/x/other"
+run p 1 'не лежит внутри HUB_DIR'
+refused_before_start
+write_env "STAND_LIVE_HUB_PATHS=$LIVE
+MATRIX_HS_HUBD_HUB_DIR=$T/no-such"
+run q 1 'не существует'
+refused_before_start
+write_env "STAND_LIVE_HUB_PATHS=$T/no-such-live
+MATRIX_HS_HUBD_HUB_DIR=$COPY"
+run r 1 'не существует'
+refused_before_start
+# копия хаба разрешена: гейт пропускает, узел поднимается (loopback, tmp)
+write_env "STAND_LIVE_HUB_PATHS=$LIVE
+MATRIX_HS_HUBD_HUB_DIR=$COPY
+MATRIX_HS_HUBD_QUEUES_DIR=$COPY/queues"
+run j 0 'ПОДНЯТ'
+_pid=$(cat "$PIDFILE"); kill "$_pid" 2>/dev/null || :; sleep 1; rm -f "$PIDFILE"
 
 write_env "MATRIX_HS_ZENOH_CONNECT=tcp/127.0.0.1:7998"
 run f 1 'without explicit MATRIX_HS_ZENOH_LISTEN'

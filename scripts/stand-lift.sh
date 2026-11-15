@@ -131,12 +131,79 @@ if [ -n "${MATRIX_HS_ZENOH_CONNECT:-}" ] && [ -z "${MATRIX_HS_ZENOH_LISTEN:-}" ]
 fi
 unset _zmode
 
-# Живой hubd не трогаем: если кто-то дописал очереди в env, подъём стенда их
-# оживит. Стоит ДО exec.
-if [ -n "${MATRIX_HS_HUBD_QUEUES_DIR:-}${MATRIX_HS_HUBD_HUB_DIR:-}" ]; then
-	echo "stand-lift: в env появились HUBD-каталоги — мост hubd включать нельзя." >&2
-	exit 1
-fi
+# Живой хаб не трогаем, но мост можно включить на КОПИИ хаба. Запрещены только
+# ЖИВЫЕ пути: список в STAND_LIVE_HUB_PATHS (через ':'; из env-файла узла или из
+# окружения; конкретные пути в публикуемый скрипт не зашиты). Всё сравнивается
+# по realpath, так что симлинк на живой хаб тоже отказ. Список пуст — fail-safe:
+# любой заданный HUBD-путь отказ. Стоит ДО exec.
+#   - HUB_DIR / QUEUES_DIR обязаны существовать (иначе realpath нечего считать);
+#   - путь равен живому, лежит внутри живого или живой лежит внутри него — отказ;
+#   - QUEUES_DIR при заданном HUB_DIR обязан лежать внутри HUB_DIR;
+#   - у моста state-каталог = <родитель QUEUES_DIR>/.mxstate (hubd_bridge.rs),
+#     поэтому родитель QUEUES_DIR проверяется как запись тем же правилом.
+hubd_rp() { _r=$(realpath -- "$1" 2>/dev/null) && [ -n "$_r" ]; }
+hubd_within() { # $1 равен $2 или лежит внутри $2
+	[ "$2" = / ] && return 0
+	[ "$1" = "$2" ] && return 0
+	case "$1" in "$2"/*) return 0 ;; esac
+	return 1
+}
+hubd_vs_live() { # метка, realpath проверяемого пути
+	while IFS= read -r _l; do
+		[ -n "$_l" ] || continue
+		if hubd_within "$2" "$_l"; then
+			echo "stand-lift: мост hubd: $1 ($2) равен живому хабу или лежит внутри него ($_l) — отказ." >&2
+			return 1
+		fi
+		if hubd_within "$_l" "$2"; then
+			echo "stand-lift: мост hubd: живой хаб ($_l) лежит внутри $1 ($2) — отказ." >&2
+			return 1
+		fi
+	done <<-EOF
+	$_lr
+	EOF
+}
+hubd_gate() {
+	_q=${MATRIX_HS_HUBD_QUEUES_DIR:-}
+	_h=${MATRIX_HS_HUBD_HUB_DIR:-}
+	[ -n "$_q$_h" ] || return 0
+	_live=${STAND_LIVE_HUB_PATHS:-}
+	if [ -z "$(printf '%s' "$_live" | tr -d ':[:space:]')" ]; then
+		echo "stand-lift: мост hubd: STAND_LIVE_HUB_PATHS пуст — копию от живого хаба не отличить, отказ (fail-safe)." >&2
+		return 1
+	fi
+	_lr=
+	while IFS= read -r _p; do
+		[ -n "$_p" ] || continue
+		if ! hubd_rp "$_p"; then
+			echo "stand-lift: мост hubd: живой путь '$_p' из STAND_LIVE_HUB_PATHS не существует — не проверить, отказ." >&2
+			return 1
+		fi
+		_lr="$_lr$_r
+"
+	done <<-EOF
+	$(printf '%s' "$_live" | tr ':' '\n')
+	EOF
+	_hr=
+	_qr=
+	if [ -n "$_h" ]; then
+		hubd_rp "$_h" || { echo "stand-lift: мост hubd: MATRIX_HS_HUBD_HUB_DIR '$_h' не существует — отказ." >&2; return 1; }
+		_hr=$_r
+		hubd_vs_live HUB_DIR "$_hr" || return 1
+	fi
+	if [ -n "$_q" ]; then
+		hubd_rp "$_q" || { echo "stand-lift: мост hubd: MATRIX_HS_HUBD_QUEUES_DIR '$_q' не существует — отказ." >&2; return 1; }
+		_qr=$_r
+		hubd_vs_live QUEUES_DIR "$_qr" || return 1
+		hubd_vs_live "родитель QUEUES_DIR (там .mxstate)" "$(dirname "$_qr")" || return 1
+		if [ -n "$_hr" ] && ! hubd_within "$_qr" "$_hr"; then
+			echo "stand-lift: мост hubd: QUEUES_DIR ($_qr) не лежит внутри HUB_DIR ($_hr) — отказ." >&2
+			return 1
+		fi
+	fi
+	return 0
+}
+hubd_gate || exit 1
 
 # Занят ли ИМЕННО наш адрес. Адрес-слепой grep по ':<порт>' считал конфликтом
 # любого соседа на том же порту, а это разные сокеты: процесс на loopback не
