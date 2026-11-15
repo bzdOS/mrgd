@@ -379,6 +379,21 @@ fn swap_journal_file_carry(
     if let Some(off) = consumed {
         use std::io::{Read, Seek, SeekFrom};
         let mut live = File::open(final_path)?;
+        // An offset that is not at a line boundary of the live file (the file was
+        // rewritten by another compaction since the offset was taken, or is shorter
+        // now) cannot be trusted: carrying from it would splice half a line. Then
+        // there is nothing known to carry.
+        let live_len = live.metadata()?.len();
+        let at_boundary = off == 0 || {
+            live.seek(SeekFrom::Start(off - 1))?;
+            let mut b = [0u8; 1];
+            off <= live_len && live.read_exact(&mut b).is_ok() && b[0] == b'\n'
+        };
+        if !at_boundary {
+            fs::rename(tmp_path, final_path)?;
+            files.remove(final_path);
+            return Ok(());
+        }
         live.seek(SeekFrom::Start(off))?;
         let mut tail = Vec::new();
         live.read_to_end(&mut tail)?;
@@ -410,6 +425,40 @@ fn swap_journal_file_carry(
 //   output: none (errors printed to stderr, not propagated)
 //   sideEffects: may create/rename files inside <dir>/rooms/
 pub fn compact_room(dir: &Path, room_id: &str, events: &[Value]) {
+    compact_room_at(dir, room_id, events, journal_len(dir, room_id));
+}
+// compact_room:end
+
+// journal_len:start
+//   purpose: Current byte length of a room journal (0 when absent). A caller that
+//            builds a compaction snapshot records this together with the snapshot
+//            (under the lock that orders the snapshot against writers) and hands it
+//            to compact_room_at, which keeps every journal line past that offset.
+//   input:  dir; room_id
+//   output: byte length
+//   sideEffects: none
+// journal_len:end
+pub fn journal_len(dir: &Path, room_id: &str) -> u64 {
+    let p = dir.join("rooms").join(format!("{}.jsonl", sanitize_filename(room_id)));
+    fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
+// compact_room_at:start
+//   purpose: compact_room for a snapshot taken earlier. `snapshot_len` is the
+//            journal's byte length at the moment `events` was taken. The journal
+//            rewrite is built from the snapshot alone, so every line appended after
+//            that moment (an event inserted after the snapshot, including one made
+//            in the gap before this call, or while the temp was written) is absent
+//            from it; the swap carries over all bytes past `snapshot_len` under the
+//            append lock instead of letting the rename discard them. Carried lines
+//            may repeat an event already in the snapshot (journal line landed after
+//            the snapshot but its timeline insert did not): harmless, the next
+//            compaction and replay dedup by event_id.
+//   input:  dir; room_id; events — snapshot; snapshot_len — see above
+//   output: none (errors to stderr, journal untouched)
+//   sideEffects: may create/rename files inside <dir>/rooms/
+// compact_room_at:end
+pub fn compact_room_at(dir: &Path, room_id: &str, events: &[Value], snapshot_len: u64) {
     if events.is_empty() {
         return;
     }
@@ -448,7 +497,7 @@ pub fn compact_room(dir: &Path, room_id: &str, events: &[Value]) {
     // newlines is cheap next to write+fsync+rename; if the count does not match
     // (dups present, or malformed lines read_room_journal_events skipped), we
     // fall through to the real rewrite — the safe direction.
-    if count_newlines(&final_path) == Some(lines.len()) {
+    if count_newlines(&final_path) == Some(lines.len()) && journal_len(dir, room_id) == snapshot_len {
         return;
     }
 
@@ -462,9 +511,13 @@ pub fn compact_room(dir: &Path, room_id: &str, events: &[Value]) {
         tmp.sync_data()?;
         drop(tmp);
 
+        #[cfg(test)]
+        compaction_test_hook(&final_path);
+
         // Atomically swap AND drop the stale cached handle in one critical
-        // section (see swap_journal_file for why they must be atomic together).
-        swap_journal_file(&tmp_path, &final_path)?;
+        // section (see swap_journal_file for why they must be atomic together),
+        // carrying over every line appended after the snapshot.
+        swap_journal_file_carry(&tmp_path, &final_path, Some(snapshot_len))?;
         Ok(())
     })();
 
@@ -474,7 +527,6 @@ pub fn compact_room(dir: &Path, room_id: &str, events: &[Value]) {
         let _ = fs::remove_file(&tmp_path);
     }
 }
-// compact_room:end
 
 // count_newlines:start
 //   purpose: Count '\n' bytes in a file (= its line count for well-formed
@@ -842,6 +894,11 @@ pub fn compact_to_device_journal(dir: &Path, keep_msg_ids: &HashSet<String>) {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn read_room_journal_events_for_test(path: &Path) -> Vec<Value> {
+    read_room_journal_events(path)
+}
+
 // read_room_journal_events:start
 //   purpose: Read every event line from a room journal file directly off disk, in
 //            file order. Deliberately independent of AppState / room_timeline: the
@@ -935,6 +992,7 @@ pub fn compact_all(dir: &Path) {
             continue;
         }
 
+        let read_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let events = read_room_journal_events(&path);
         let room_id = match events
             .first()
@@ -945,7 +1003,7 @@ pub fn compact_all(dir: &Path) {
             None => continue, // empty or malformed journal — nothing to compact
         };
 
-        compact_room(dir, &room_id, &events);
+        compact_room_at(dir, &room_id, &events, read_len);
         // internal-task: keep the pdumeta sidecar in sync — dedup, keep only ids still present
         // in the (full, uncapped) journal just read.
         let ids_kept: HashSet<String> = events

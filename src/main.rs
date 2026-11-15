@@ -63,7 +63,7 @@
 
 use mrgd::persist::{compact_all, replay_from_dir};
 #[cfg(feature = "cluster")]
-use mrgd::persist::{compact_room, compact_room_pdumeta};
+use mrgd::persist::compact_room_pdumeta;
 #[cfg(feature = "cluster")]
 use mrgd::state::{ClusterConfig, ClusterState};
 use mrgd::{router, AppState};
@@ -1575,8 +1575,13 @@ fn merge_catchup_delta(
     if let Some(dir) = data_dir {
         let events: Vec<serde_json::Value> =
             timeline_vec.iter().map(|(_, ev)| ev.clone()).collect();
+        // Journal length at the moment of the snapshot (timeline lock still held:
+        // a local send inserts into the timeline BEFORE it journals, so any event
+        // missing from `events` journals past this offset). compact_room_at keeps
+        // everything past it.
+        let snapshot_len = mrgd::persist::journal_len(dir, room_id);
         drop(rt); // release lock before compact_room
-        compact_room(dir, room_id, &events);
+        mrgd::persist::compact_room_at(dir, room_id, &events, snapshot_len);
         // internal-task: keep the pdumeta sidecar in sync with the compacted timeline.
         let ids_kept: std::collections::HashSet<String> = events
             .iter()

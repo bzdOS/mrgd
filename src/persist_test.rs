@@ -1772,6 +1772,72 @@ mod persist_tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    // compact_room_keeps_events_appended_after_snapshot:start
+    //   purpose: Regression for the compact_room window. compact_room rewrites the
+    //            journal from an in-memory snapshot taken earlier; a journal line
+    //            appended after the snapshot (or while the temp was being written)
+    //            was replaced away by the rename, so after a restart the event
+    //            was gone (permanently, for a not-yet-replicated local event).
+    //            Part 1: hook inside the snapshot-read -> rename window.
+    //            Part 2: append between snapshot and call (compact_room_at with the
+    //            length recorded at snapshot time, as the catch-up merge does).
+    //            Each checks the live file AND a replay.
+    // compact_room_keeps_events_appended_after_snapshot:end
+    #[test]
+    fn compact_room_keeps_events_appended_after_snapshot() {
+        let data_dir = make_temp_dir();
+        let state = AppState::with_data_dir(data_dir.to_path_buf());
+        let room_id = "!croom_race_probe:localhost";
+        let ev = |id: &str, ts: i64| {
+            json!({ "event_id": id, "room_id": room_id, "type": "m.room.message",
+                    "sender": "@u:localhost", "origin_server_ts": ts, "content": {} })
+        };
+        let journal_path = data_dir
+            .join("rooms")
+            .join(format!("{}.jsonl", crate::persist::sanitize_filename(room_id)));
+        let ids_of = |p: &Path| -> Vec<String> {
+            std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .filter_map(|v| v.get("event_id").and_then(|e| e.as_str()).map(str::to_string))
+                .collect()
+        };
+        // $a is journalled twice so compaction really rewrites (no skip-when-clean).
+        for (id, ts) in [("$a", 1), ("$a", 1), ("$b", 2)] {
+            state.persist_room_event(room_id, &ev(id, ts));
+        }
+        let snapshot = vec![ev("$a", 1), ev("$b", 2)];
+
+        // Part 1: append inside the window between temp-written and rename.
+        let (st, r) = (state.clone(), room_id.to_string());
+        crate::persist::COMPACTION_HOOKS.lock().unwrap().push((
+            journal_path.clone(),
+            Box::new(move || {
+                st.persist_room_event(&r, &json!({"event_id":"$late","room_id":r,"type":"m.room.message","sender":"@u:localhost","origin_server_ts":9,"content":{}}));
+            }),
+        ));
+        crate::persist::compact_room(&data_dir, room_id, &snapshot);
+        let j = ids_of(&journal_path);
+        assert!(j.iter().any(|i| i == "$late"), "event appended mid-compaction was lost: {j:?}");
+        assert_eq!(j.iter().filter(|i| *i == "$a").count(), 1, "dup of $a must be compacted: {j:?}");
+        let replayed = crate::persist::read_room_journal_events_for_test(&journal_path);
+        assert!(replayed.iter().any(|e| e["event_id"] == "$late"), "replay lost $late: {replayed:?}");
+
+        // Part 2: a send lands after the snapshot was taken but before compaction starts.
+        state.persist_room_event(room_id, &ev("$a", 1)); // dup again, forces rewrite
+        let snapshot2 = vec![ev("$a", 1), ev("$b", 2), ev("$late", 9)];
+        let snap_len = crate::persist::journal_len(&data_dir, room_id);
+        state.persist_room_event(room_id, &ev("$after", 11));
+        crate::persist::compact_room_at(&data_dir, room_id, &snapshot2, snap_len);
+        let j = ids_of(&journal_path);
+        assert!(j.iter().any(|i| i == "$after"), "event appended after snapshot was lost: {j:?}");
+        for id in ["$a", "$b", "$late"] {
+            assert_eq!(j.iter().filter(|i| *i == id).count(), 1, "{id} count in {j:?}");
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
 }
 
     // doc_markers_balanced:start
