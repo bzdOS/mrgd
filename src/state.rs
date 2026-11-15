@@ -1581,6 +1581,17 @@ fn timeline_max_events_from_env() -> usize {
         .unwrap_or(0)
 }
 
+// roomlog_gc_slack:start
+//   purpose: How many events past the roomlog cap a room may grow before
+//            collect_room_log runs a collection (10% of the cap, at least 1).
+//   input:  cap — roomlog_max_events (> 0)
+//   output: usize — the slack in events
+//   sideEffects: none
+// roomlog_gc_slack:end
+pub(crate) fn roomlog_gc_slack(cap: usize) -> usize {
+    (cap / 10).max(1)
+}
+
 // roomlog_max_events_from_env:start
 //   purpose: Read the RoomLog GC cap from MATRIX_HS_ROOMLOG_MAX_EVENTS. 0 (default)
 //            means unlimited. Kept separate from the timeline cap because they bound
@@ -3412,12 +3423,26 @@ impl AppState {
     //            IRREVERSIBLE and CLUSTER-WIDE: the watermark propagates on the next
     //            delta and every peer adopts it. This is deletion, not trimming — a
     //            client can no longer page back past it anywhere in the cluster.
+    //
+    //            Hysteresis: a run starts only once the log is more than
+    //            roomlog_gc_slack(cap) events past the cap. A room sitting exactly at
+    //            its cap used to collect ONE event per send, and every collection
+    //            rewrites the journal and pdumeta files (write, fdatasync, rename), so
+    //            each send cost a full-file rewrite; concurrent senders queued behind
+    //            that work until no tokio worker was left to answer HTTP (2026-11-15,
+    //            stand data copy, d43dbee). Now the rewrite happens once per ~10% of
+    //            the cap and takes the log back down to the cap.
     //   input:  room_id
-    //   output: number of events collected (0 if the cap is off or not reached)
+    //   output: number of events collected (0 if the cap is off or not yet exceeded
+    //           by more than the slack)
     //   sideEffects: removes PDUs from the room's RoomLog; raises its watermark
     // AppState::collect_room_log:end
     pub fn collect_room_log(&self, room_id: &str) -> usize {
-        self.collect_room_log_to(room_id, self.roomlog_max_events)
+        let cap = self.roomlog_max_events;
+        if cap > 0 && self.room_log_depth(room_id) <= cap + roomlog_gc_slack(cap) {
+            return 0;
+        }
+        self.collect_room_log_to(room_id, cap)
     }
 
     // AppState::collect_room_log_to:start

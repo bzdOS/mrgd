@@ -2015,6 +2015,50 @@ mod persist_tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    // room_gc_runs_once_per_slack_not_once_per_send:start
+    //   purpose: collect_room_log must not collect one event per send for a room that
+    //            sits at its cap: each collection rewrites the journal files, so that
+    //            is a full-file rewrite per message (the load that froze the stand's
+    //            HTTP under concurrent senders). With cap 20 the log may reach
+    //            cap + roomlog_gc_slack(20) = 22 events untouched; the next insert
+    //            collects it back down to the cap.
+    //   input:  none
+    //   output: none (asserts on room_log_depth and the collected count)
+    //   sideEffects: none (no data dir, in-memory state)
+    // room_gc_runs_once_per_slack_not_once_per_send:end
+    #[test]
+    fn room_gc_runs_once_per_slack_not_once_per_send() {
+        use crate::substrate::matrix_events::Pdu;
+        let state = AppState::with_server_name_and_caps("localhost".to_string(), 0, 20, 0);
+        let room_id = "!gc_slack:localhost";
+        let mut prev: Vec<String> = Vec::new();
+        let mut insert = |depth: u64| {
+            let pdu = Pdu::signed(
+                room_id.to_string(),
+                "@u:localhost".to_string(),
+                "m.room.message".to_string(),
+                br#"{"msgtype":"m.text","body":"x"}"#.to_vec(),
+                prev.clone(),
+                depth,
+                depth + 1,
+                &state.signer,
+            );
+            prev = vec![pdu.event_id.clone()];
+            state.rooms.lock().unwrap().entry(room_id.to_string()).or_default().add(pdu);
+            state.collect_room_log(room_id)
+        };
+        for depth in 0..22u64 {
+            assert_eq!(insert(depth), 0, "no collection while within cap + slack (depth {depth})");
+        }
+        assert_eq!(state.room_log_depth(room_id), 22, "the log keeps cap + slack events");
+        assert!(insert(22) > 0, "past cap + slack the next insert must collect");
+        assert!(
+            state.room_log_depth(room_id) <= 20,
+            "a collection takes the log back down to the cap, got {}",
+            state.room_log_depth(room_id)
+        );
+    }
+
 }
 
     // doc_markers_balanced:start
