@@ -150,6 +150,14 @@ pub async fn post_create_room(
     // On None barrier_store (single-node), skip to local alias insert below.
     let alias_provisional_flag: bool;
 
+    if body.room_alias_name.is_some() {
+        if let Some(gate) = state.startup_gate.as_ref() {
+            if let Err(retry_ms) = gate.check() {
+                return Err(HsError::GateClosed(retry_ms));
+            }
+        }
+    }
+
     if let (Some(ref alias_name), Some(ref store)) = (
         body.room_alias_name.as_deref(),
         state.barrier_store.as_ref(),

@@ -724,4 +724,83 @@ mod tests {
             "got {body}"
         );
     }
+
+    async fn reg_alice(server: &TestServer) -> axum_test::TestResponse {
+        let c: Value = server
+            .post("/_matrix/client/v3/register")
+            .json(&json!({ "username": "alice", "password": "pw" }))
+            .await
+            .json();
+        let sess = c["session"].as_str().expect("session").to_string();
+        server
+            .post("/_matrix/client/v3/register")
+            .json(&json!({
+                "username": "alice",
+                "password": "pw",
+                "auth": { "type": "m.login.dummy", "session": sess }
+            }))
+            .await
+    }
+
+    // test:gate_closed_returns_503_then_user_in_use:start
+    //   purpose: (B) A node with a configured peer must not accept a username the peer
+    //            already holds while its first catch-up is not done. Gate closed ->
+    //            503 M_LIMIT_EXCEEDED with retry_after_ms and NO account created;
+    //            gate open -> the same request gets M_USER_IN_USE (store knows the claim).
+    // test:gate_closed_returns_503_then_user_in_use:end
+    #[tokio::test]
+    async fn gate_closed_returns_503_then_user_in_use() {
+        use crate::substrate::barrier::ClaimStore as _;
+        let mem_store = Arc::new(MemClaimStore::new());
+        // "alice" is held by the peer; only the node's view of it arrives late.
+        let gate = crate::startup_gate::StartupGate::new(std::time::Duration::from_secs(600));
+        let state = AppState::new();
+        let state = AppState::with_barrier_store(
+            state,
+            mem_store.clone() as Arc<dyn crate::substrate::barrier::ClaimStore + Send + Sync>,
+        );
+        let state = AppState::with_startup_gate(state, gate.clone());
+        let server = TestServer::new(router(state.clone()));
+
+        let resp = reg_alice(&server).await;
+        resp.assert_status(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = resp.json();
+        assert_eq!(body["errcode"].as_str(), Some("M_LIMIT_EXCEEDED"), "got {body}");
+        assert!(body["retry_after_ms"].as_u64().is_some(), "got {body}");
+        assert!(
+            state.users.lock().unwrap().get("alice").is_none(),
+            "a gated registration must not create the account"
+        );
+
+        // Peer claims arrive, catch-up done: gate opens, the peer's name is taken.
+        mem_store
+            .cas_claim("mx:username:alice", "@alice:localhost")
+            .expect("peer claim");
+        gate.note_catchup_done();
+        gate.note_claims_synced();
+        let resp = reg_alice(&server).await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body: Value = resp.json();
+        assert_eq!(body["errcode"].as_str(), Some("M_USER_IN_USE"), "got {body}");
+    }
+
+    // A single node (no gate) is unaffected.
+    #[tokio::test]
+    async fn no_gate_no_503() {
+        let (server, _store) = barrier_test_server();
+        let c: Value = server
+            .post("/_matrix/client/v3/register")
+            .json(&json!({ "username": "bob", "password": "pw" }))
+            .await
+            .json();
+        let sess = c["session"].as_str().expect("session").to_string();
+        server
+            .post("/_matrix/client/v3/register")
+            .json(&json!({
+                "username": "bob", "password": "pw",
+                "auth": { "type": "m.login.dummy", "session": sess }
+            }))
+            .await
+            .assert_status_ok();
+    }
 }

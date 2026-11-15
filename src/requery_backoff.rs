@@ -346,6 +346,23 @@ impl RequeryBackoff {
     }
 }
 
+/// How long the startup loop waits for the FIRST peer to show up.
+/// A node with an explicit MATRIX_HS_ZENOH_CONNECT has a peer by configuration, so
+/// "no peer after 3 s" is a slow link, not a single-node setup: it waits as long
+/// as it would wait for the peer's key (`key_wait_ms`). Without CONNECT the short
+/// `peer_wait_ms` stays. `peer_wait_ms == 0` still disables the wait.
+pub fn startup_no_peer_deadline_ms(
+    connect_configured: bool,
+    peer_wait_ms: u64,
+    key_wait_ms: u64,
+) -> u64 {
+    if connect_configured && peer_wait_ms > 0 {
+        peer_wait_ms.max(key_wait_ms)
+    } else {
+        peer_wait_ms
+    }
+}
+
 // requery_backoff_test:start
 #[cfg(test)]
 mod tests {
@@ -724,6 +741,18 @@ mod tests {
         assert_eq!(t.tracked(), 2);
         t.forget("!b:localhost");
         assert_eq!(t.tracked(), 1);
+    }
+
+    /// (A) With an explicit CONNECT the "no peer yet" deadline is the key-wait one.
+    #[test]
+    fn startup_waits_for_configured_peer_past_peer_wait() {
+        assert_eq!(startup_no_peer_deadline_ms(true, 3000, 12000), 12000);
+        // No CONNECT: single-node setups still notice the absence after 3 s.
+        assert_eq!(startup_no_peer_deadline_ms(false, 3000, 12000), 3000);
+        // 0 keeps meaning "do not wait".
+        assert_eq!(startup_no_peer_deadline_ms(true, 0, 12000), 0);
+        // An operator who raised the peer wait above the key wait keeps it.
+        assert_eq!(startup_no_peer_deadline_ms(true, 20000, 12000), 20000);
     }
 }
 // requery_backoff_test:end

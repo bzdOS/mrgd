@@ -1455,6 +1455,12 @@ pub struct AppState {
     /// Set via AppState::with_barrier_store() or injected in cluster startup (main.rs).
     pub barrier_store: Option<Arc<dyn ClaimStore + Send + Sync>>,
 
+    /// Some(gate) on a cluster node with a configured peer: grow-set writes
+    /// (register, room alias claim) answer 503 until the first catch-up with the
+    /// peer, including its claims, has completed or the gate deadline passed.
+    /// None (single node, tests) -> no gate. See startup_gate.rs.
+    pub startup_gate: Option<Arc<crate::startup_gate::StartupGate>>,
+
     /// Username rename map: orig_localpart → new full user_id "@<new>:<server>".
     /// Populated by apply_username_loss() when the ReconcileDriver elects this node's
     /// account as the loser.  whoami and login consult this map to return the new
@@ -1635,6 +1641,7 @@ impl Default for AppState {
             uia_seq: AtomicU64::new(0),
             persist: PersistCtx::new(data_dir),
             barrier_store: None,
+            startup_gate: None,
             renamed: Mutex::new(HashMap::new()),
             e2ee: E2ee::default(),
             to_device: ToDevice::default(),
@@ -1733,6 +1740,7 @@ impl AppState {
             uia_seq: AtomicU64::new(0),
             persist: PersistCtx::new(None),
             barrier_store: None,
+            startup_gate: None,
             renamed: Mutex::new(HashMap::new()),
             e2ee: E2ee::default(),
             to_device: ToDevice::default(),
@@ -1786,6 +1794,7 @@ impl AppState {
             uia_seq: AtomicU64::new(0),
             persist: PersistCtx::new(Some(data_dir)),
             barrier_store: None,
+            startup_gate: None,
             renamed: Mutex::new(HashMap::new()),
             e2ee: E2ee::default(),
             to_device: ToDevice::default(),
@@ -1849,6 +1858,7 @@ impl AppState {
             uia_seq: AtomicU64::new(0),
             persist: PersistCtx::new(data_dir),
             barrier_store: None,
+            startup_gate: None,
             renamed: Mutex::new(HashMap::new()),
             e2ee: E2ee::default(),
             to_device: ToDevice::default(),
@@ -1897,6 +1907,19 @@ impl AppState {
         Arc::get_mut(&mut state)
             .expect("with_barrier_store: Arc refcount > 1 — call before sharing the Arc")
             .barrier_store = Some(store);
+        state
+    }
+
+    // AppState::with_startup_gate:start
+    //   purpose: Builder-style setter, same contract as with_barrier_store.
+    // AppState::with_startup_gate:end
+    pub fn with_startup_gate(
+        mut state: Arc<Self>,
+        gate: Arc<crate::startup_gate::StartupGate>,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut state)
+            .expect("with_startup_gate: Arc refcount > 1 — call before sharing the Arc")
+            .startup_gate = Some(gate);
         state
     }
 

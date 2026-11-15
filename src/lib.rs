@@ -27,6 +27,7 @@ pub mod requery_backoff;
 pub mod routes;
 pub mod scripting;
 pub mod substrate;
+pub mod startup_gate;
 pub mod state;
 pub mod sweep_alloc;
 

@@ -465,7 +465,16 @@ pub struct ReconcileDriver {
     /// Behind a Mutex because tick() runs on &self (spawn loop + sync tests).
     /// A poisoned mutex degrades to always-republish (liveness over silence).
     policy: Mutex<AntiEntropyPolicy>,
+    /// Startup gate (cluster node with a configured peer). While the peer's
+    /// claims have not been received, every tick sends a hello; the first ack
+    /// from another node marks them synced. None -> no hello is sent.
+    sync_gate: Option<Arc<crate::startup_gate::StartupGate>>,
 }
+
+/// Sink key on which a node that has just started asks its peers for their claims.
+const HELLO_KEY: &str = "claims-hello";
+/// Sink key on which a peer answers a hello, after it re-published its claims.
+const ACK_KEY: &str = "claims-ack";
 
 impl ReconcileDriver {
     // ReconcileDriver::new:start
@@ -495,6 +504,49 @@ impl ReconcileDriver {
             tick,
             claims_key: "claims",
             policy,
+            sync_gate: None,
+        }
+    }
+
+    // ReconcileDriver::with_sync_gate:start
+    //   purpose: Attach the startup gate. Pub/sub has no replay and the anti-entropy
+    //            burst is quiet once a peer has seen our claims, so a restarted node
+    //            would otherwise never learn the peer's claims. With a gate the node
+    //            asks (hello, every tick until answered) and the peer replies with a
+    //            full re-publish followed by an ack; the ack is the "peer claims
+    //            received" signal. Answering hello/ack is always on, gate or not.
+    // ReconcileDriver::with_sync_gate:end
+    pub fn with_sync_gate(mut self, gate: Arc<crate::startup_gate::StartupGate>) -> Self {
+        self.sync_gate = Some(gate);
+        self
+    }
+
+    // handle_sync_msgs:start
+    //   purpose: Answer peers' hellos (re-publish own claims, then ack) and consume
+    //            acks addressed to the whole mesh. An ack from another node means the
+    //            claims it re-published are already in the inbox (same session, same
+    //            ordering), so drain them once more and then mark the gate synced.
+    // handle_sync_msgs:end
+    fn handle_sync_msgs(&self, notified_losers: &mut std::collections::HashSet<(String, String)>) {
+        let own = self.node_id.as_bytes();
+        if let Ok(blobs) = self.sink.drain(HELLO_KEY) {
+            if blobs.iter().any(|b| b.as_slice() != own) {
+                self.republish_own_claims();
+                if let Err(e) = self.sink.publish(ACK_KEY, own.to_vec()) {
+                    eprintln!("[barrier_growset] ack publish warning: {e}");
+                }
+            }
+        }
+        if let Ok(blobs) = self.sink.drain(ACK_KEY) {
+            if blobs.iter().any(|b| b.as_slice() != own) {
+                self.drain_and_reconcile(notified_losers);
+                if let Some(g) = &self.sync_gate {
+                    if !g.claims_synced() {
+                        eprintln!("[barrier_growset] peer claims received (ack)");
+                    }
+                    g.note_claims_synced();
+                }
+            }
         }
     }
 
@@ -548,6 +600,13 @@ impl ReconcileDriver {
         // the burst runs out and this tick publishes nothing at all.
         // Zenoh pub/sub has no replay; the bounded burst (not an endless
         // flood) is what lets late-starting peers catch up.
+        if let Some(g) = &self.sync_gate {
+            if !g.claims_synced() {
+                if let Err(e) = self.sink.publish(HELLO_KEY, self.node_id.clone().into_bytes()) {
+                    eprintln!("[barrier_growset] hello publish warning: {e}");
+                }
+            }
+        }
         if tick_count.is_multiple_of(REPUBLISH_EVERY_TICKS) {
             let own_hash = match self.synced.lock() {
                 Ok(view) => hash_own_records(&view, &self.node_id),
@@ -578,6 +637,7 @@ impl ReconcileDriver {
         if let Ok(mut p) = self.policy.lock() {
             p.note_remote(new_records, &remote_node_ids);
         }
+        self.handle_sync_msgs(notified_losers);
     }
 
     // republish_own_claims:start
@@ -1751,5 +1811,87 @@ mod cluster_tests {
             lost.winner_claimant, winner_a,
             "LostClaim.winner_claimant must match reconcile() winner"
         );
+    }
+}
+
+// ── Startup sync (hello/ack) tests ───────────────────────────────────────────
+
+#[cfg(test)]
+mod startup_sync_tests {
+    use super::*;
+    use crate::startup_gate::StartupGate;
+    use crate::substrate::barrier::ClaimStore;
+    use crate::substrate::crdt::MemCrdtSink;
+    use std::time::Duration;
+
+    fn driver(sink: MemCrdtSink, node: &str) -> (ReconcileDriver, GrowSetClaimStore) {
+        let sink: Arc<dyn CrdtSink> = Arc::new(sink);
+        let (store, view) = GrowSetClaimStore::new(sink.clone(), node.to_string());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            ReconcileDriver::new(sink, view, node.to_string(), tx, Duration::from_secs(1)),
+            store,
+        )
+    }
+
+    /// A restarted node (gate armed) learns the peer's claim through hello/ack even
+    /// though the peer's anti-entropy burst is long over, and only then opens.
+    #[test]
+    fn hello_ack_delivers_peer_claims_and_opens_gate() {
+        let (sa, sb) = MemCrdtSink::pair();
+        let (da, store_a) = driver(sa, "node-a");
+        let (db, store_b) = driver(sb, "node-b");
+        let gate = StartupGate::new(Duration::from_secs(60));
+        gate.note_catchup_done();
+        let da = da.with_sync_gate(gate.clone());
+
+        // B already holds a claim; its burst is irrelevant (only ticks 1.. below).
+        // Inserted straight into B's view: it was published long ago and A missed it.
+        store_b.synced_view().lock().unwrap().insert(
+            "mx:username:dave".to_string(),
+            vec![ClaimRecord {
+                username: "mx:username:dave".into(),
+                claimant: "@dave:x".into(),
+                ts: 1,
+                node_id: "node-b".into(),
+            }],
+        );
+        let mut la = std::collections::HashSet::new();
+        let mut lb = std::collections::HashSet::new();
+
+        // Peer silent: the gate stays closed.
+        da.tick(1, &mut la);
+        assert!(gate.check().is_err(), "no ack yet: gate must stay closed");
+        // The pending claim is not in A's view yet.
+        assert!(store_a.synced_view().lock().unwrap().get("mx:username:dave").is_none());
+
+        db.tick(1, &mut lb); // answers hello: republish + ack
+        da.tick(2, &mut la); // consumes claims + ack
+        assert!(gate.check().is_ok(), "ack received: gate must open");
+        let seen = store_a.synced_view().lock().unwrap().get("mx:username:dave").cloned();
+        assert!(seen.is_some(), "peer claim must be in the synced view before the gate opens");
+        // And now the fast reject works instead of a local claim.
+        assert!(matches!(
+            store_a.cas_claim("mx:username:dave", "@dave:x").unwrap(),
+            CasResult::AlreadySet { .. }
+        ));
+    }
+
+    /// A peer with no claims at all still acks, so an empty peer does not cost the
+    /// full gate timeout.
+    #[test]
+    fn empty_peer_still_acks() {
+        let (sa, sb) = MemCrdtSink::pair();
+        let (da, _sa) = driver(sa, "node-a");
+        let (db, _sb) = driver(sb, "node-b");
+        let gate = StartupGate::new(Duration::from_secs(60));
+        gate.note_catchup_done();
+        let da = da.with_sync_gate(gate.clone());
+        let mut la = std::collections::HashSet::new();
+        let mut lb = std::collections::HashSet::new();
+        da.tick(1, &mut la);
+        db.tick(1, &mut lb);
+        da.tick(2, &mut la);
+        assert!(gate.check().is_ok());
     }
 }

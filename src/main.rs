@@ -458,13 +458,31 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
         let (loser_tx, mut loser_rx) =
             tokio::sync::mpsc::unbounded_channel::<mrgd::substrate::barrier_growset::LostClaim>();
 
-        let driver = ReconcileDriver::new(
+        // Startup gate: only a node with an explicitly configured peer. It holds
+        // grow-set writes (register, alias claims) until the first catch-up with the
+        // peer is done and the peer's claims arrived, or MATRIX_HS_GROWSET_GATE_MAX_MS.
+        let startup_gate = if connect.as_deref().is_some_and(|c| !c.trim().is_empty()) {
+            let g = mrgd::startup_gate::StartupGate::new(
+                mrgd::startup_gate::StartupGate::max_wait_from_env(),
+            );
+            println!(
+                "cluster mode: grow-set gate armed (max {} ms) until peer catch-up and claims sync",
+                mrgd::startup_gate::StartupGate::max_wait_from_env().as_millis()
+            );
+            Some(g)
+        } else {
+            None
+        };
+        let mut driver = ReconcileDriver::new(
             barrier_sink,
             synced_view,
             node_id.clone(),
             loser_tx,
             Duration::from_secs(1),
         );
+        if let Some(g) = startup_gate.as_ref() {
+            driver = driver.with_sync_gate(g.clone());
+        }
         // Leak the driver join-handle for process lifetime.
         Box::leak(Box::new(driver.spawn()));
 
@@ -500,6 +518,10 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
             server_name: server_name.clone(),
         });
         let state = AppState::with_barrier_store(state, barrier_store);
+        let state = match startup_gate.as_ref() {
+            Some(g) => AppState::with_startup_gate(state, g.clone()),
+            None => state,
+        };
 
         // Publish this node's own (node_id=server_name, pubkey) once immediately, then
         // periodically re-publish (anti-entropy — Zenoh pub/sub has no replay, so a
@@ -880,6 +902,14 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(12000);
+        // An explicit CONNECT means a peer exists by configuration: a link that comes
+        // up after 3 s is a slow link, and starting empty makes join answer 404 until
+        // the background pass. Wait for it as long as for the key.
+        let no_peer_wait_ms = mrgd::requery_backoff::startup_no_peer_deadline_ms(
+            connect.as_deref().is_some_and(|c| !c.trim().is_empty()),
+            peer_wait_ms,
+            key_wait_ms,
+        );
         if peer_wait_ms > 0 {
             let started = tokio::time::Instant::now();
             let mut peers_seen = false;
@@ -900,9 +930,9 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                     break;
                 }
                 let waited = started.elapsed().as_millis() as u64;
-                if !peers_seen && waited >= peer_wait_ms {
+                if !peers_seen && waited >= no_peer_wait_ms {
                     println!(
-                        "cluster mode: no Zenoh peers after {peer_wait_ms} ms — \
+                        "cluster mode: no Zenoh peers after {no_peer_wait_ms} ms — \
                          nothing to catch up from"
                     );
                     break;
@@ -937,6 +967,9 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                 "cluster mode: catch-up complete for {} rooms",
                 converged.len()
             );
+        }
+        if let Some(g) = startup_gate.as_ref() {
+            g.note_catchup_done();
         }
 
         // ── Mid-life re-query ─────────────────────────────────────────────────
@@ -975,6 +1008,7 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(6000);
             let poll = Duration::from_secs(5);
+            let server_name_bg = server_name.clone();
             let bg_task = tokio::spawn(async move {
                 let mut seen_peers: std::collections::HashSet<_> =
                     session_bg.info().peers_zid().await.collect();
@@ -1044,7 +1078,22 @@ async fn build_state() -> Result<std::sync::Arc<AppState>, Box<dyn std::error::E
             // A peer that just appeared may not have announced its
             // signing key yet (5 s republish interval). Querying before
             // it does would reject every PDU it sends back.
-            tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+            // Wait for the key, not for the clock: settle_ms is a ceiling. If a
+            // peer key is already held (re-appearing peer) only the short pause for
+            // queryable declarations remains.
+            let t0 = tokio::time::Instant::now();
+            loop {
+                let have_peer_key = state_bg
+                    .key_store
+                    .snapshot()
+                    .keys()
+                    .any(|k| k.as_str() != server_name_bg.as_str());
+                if have_peer_key || t0.elapsed().as_millis() as u64 >= settle_ms {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
         stats.reset();

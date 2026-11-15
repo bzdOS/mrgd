@@ -54,10 +54,32 @@ pub enum HsError {
     /// Maps to Matrix errcode M_TOO_LARGE (HTTP 413).
     #[error("payload too large: {0}")]
     TooLarge(String),
+
+    /// Grow-set writes are paused until the first catch-up with the peer is done
+    /// (startup_gate.rs). Maps to 503 M_LIMIT_EXCEEDED with retry_after_ms.
+    #[error("starting up, catching up with peer; retry in {0} ms")]
+    GateClosed(u64),
+}
+
+/// 503 body for a closed startup gate. M_LIMIT_EXCEEDED + retry_after_ms is the
+/// errcode clients already know to retry on after a delay.
+pub fn startup_gate_response(retry_after_ms: u64) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "server is starting up and catching up with its peer; retry shortly",
+            "retry_after_ms": retry_after_ms,
+        })),
+    )
+        .into_response()
 }
 
 impl IntoResponse for HsError {
     fn into_response(self) -> Response {
+        if let HsError::GateClosed(ms) = &self {
+            return startup_gate_response(*ms);
+        }
         let (status, errcode, msg) = match &self {
             HsError::RoomNotFound(r) => (
                 StatusCode::NOT_FOUND,
@@ -71,6 +93,7 @@ impl IntoResponse for HsError {
             HsError::RoomInUse(m) => (StatusCode::BAD_REQUEST, "M_ROOM_IN_USE", m.clone()),
             HsError::UnknownToken(m) => (StatusCode::UNAUTHORIZED, "M_UNKNOWN_TOKEN", m.clone()),
             HsError::TooLarge(m) => (StatusCode::PAYLOAD_TOO_LARGE, "M_TOO_LARGE", m.clone()),
+            HsError::GateClosed(_) => unreachable!("handled above"),
         };
         (status, Json(json!({ "errcode": errcode, "error": msg }))).into_response()
     }

@@ -368,6 +368,14 @@ pub async fn post_register(
         }
     }
 
+    // Grow-set gate: a node with a configured peer does not take a username claim
+    // before it has heard the peer's claims (see startup_gate.rs).
+    if let Some(gate) = state.startup_gate.as_ref() {
+        if let Err(retry_ms) = gate.check() {
+            return crate::error::startup_gate_response(retry_ms);
+        }
+    }
+
     // AS-created accounts have no password any client could present — their
     // only authentication is the AS token (see auth::unusable_password_hash).
     let password_hash = if as_authorized {
