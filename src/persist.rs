@@ -185,6 +185,8 @@ impl PersistCtx {
 //   output: none (errors logged to stderr, not propagated)
 //   sideEffects: opens/creates file (cached), appends one line, calls fsync
 fn append_line(path: &Path, value: &Value) {
+    #[cfg(test)]
+    append_test_hook(path);
     let line = match serde_json::to_string(value) {
         Ok(mut s) => {
             s.push('\n');
@@ -332,6 +334,26 @@ pub(crate) static COMPACTION_HOOKS: std::sync::Mutex<Vec<(PathBuf, CompactionHoo
 fn compaction_test_hook(path: &Path) {
     let hook = {
         let mut g = COMPACTION_HOOKS.lock().unwrap();
+        g.iter().position(|(p, _)| p == path).map(|i| g.remove(i).1)
+    };
+    if let Some(h) = hook {
+        h();
+    }
+}
+
+// append_test_hook:start
+//   purpose: Test-only seam fired just before a journal line is appended, keyed by
+//            the journal path, once. Lets a test observe what is already visible
+//            (e.g. the in-memory timeline) at the instant the journal line lands,
+//            to pin the write-order invariant compaction relies on.
+// append_test_hook:end
+#[cfg(test)]
+pub(crate) static APPEND_HOOKS: std::sync::Mutex<Vec<(PathBuf, CompactionHook)>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn append_test_hook(path: &Path) {
+    let hook = {
+        let mut g = APPEND_HOOKS.lock().unwrap();
         g.iter().position(|(p, _)| p == path).map(|i| g.remove(i).1)
     };
     if let Some(h) = hook {

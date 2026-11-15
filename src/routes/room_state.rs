@@ -159,8 +159,11 @@ pub(crate) fn add_member_state_event(
     {
         let ev_json = state_event_to_json(&new_ev);
         // Persist the member state event to the room journal (best-effort).
+        // Timeline BEFORE journal: compact_room_at keeps only journal lines past the
+        // offset taken with its timeline snapshot, so an event must be visible in the
+        // timeline no later than its journal line.
+        state.append_room_timeline(room_id, ev_json.clone());
         state.persist_room_event(room_id, &ev_json);
-        state.append_room_timeline(room_id, ev_json);
     }
 
     state.notify.notify_waiters();
@@ -1011,8 +1014,9 @@ pub async fn put_room_state_event(
     {
         let ev_json = state_event_to_json(&new_ev);
         // Persist the state event to the room journal (best-effort).
+        // Timeline BEFORE journal (see the member-event site above).
+        state.append_room_timeline(&room_id, ev_json.clone());
         state.persist_room_event(&room_id, &ev_json);
-        state.append_room_timeline(&room_id, ev_json);
     }
 
     state.notify.notify_waiters();

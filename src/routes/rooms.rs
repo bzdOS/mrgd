@@ -390,8 +390,9 @@ pub async fn post_create_room(
                       // via the centralized helper) and persist it.
             for ev in &published {
                 let ev_json = state_event_to_json(ev);
+                // Timeline BEFORE journal: see compact_room_at.
+                state.append_room_timeline(&room_id, ev_json.clone());
                 state.persist_room_event(&room_id, &ev_json);
-                state.append_room_timeline(&room_id, ev_json);
             }
             published
         } else {

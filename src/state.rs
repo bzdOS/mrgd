@@ -3790,8 +3790,10 @@ impl AppState {
         };
 
         {
+            // Timeline BEFORE journal: compact_room_at keeps only journal lines past
+            // the offset recorded with its timeline snapshot.
+            self.append_room_timeline(&ev.room_id, winner_json.clone());
             self.persist_room_event(&ev.room_id, &winner_json);
-            self.append_room_timeline(&ev.room_id, winner_json);
         }
 
         Ok(true)

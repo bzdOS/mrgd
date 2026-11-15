@@ -1838,6 +1838,55 @@ mod persist_tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    // state_event_is_in_timeline_before_its_journal_line:start
+    //   purpose: compact_room_at's snapshot_len is only sound if an event is in the
+    //            timeline (the snapshot source) no later than its journal line:
+    //            otherwise a snapshot+offset taken between the two has the line
+    //            before the offset but the event missing from the snapshot, and the
+    //            rewrite drops it. apply_remote_state_event used to journal first.
+    //            The append hook observes the timeline at the instant the line lands.
+    // state_event_is_in_timeline_before_its_journal_line:end
+    #[test]
+    fn state_event_is_in_timeline_before_its_journal_line() {
+        let data_dir = make_temp_dir();
+        let state = AppState::with_data_dir(data_dir.to_path_buf());
+        let room_id = "!order_probe:localhost";
+        let journal_path = data_dir
+            .join("rooms")
+            .join(format!("{}.jsonl", crate::persist::sanitize_filename(room_id)));
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (st, flag) = (state.clone(), seen.clone());
+        crate::persist::APPEND_HOOKS.lock().unwrap().push((
+            journal_path.clone(),
+            Box::new(move || {
+                let in_tl = st
+                    .room_timeline
+                    .lock()
+                    .unwrap()
+                    .get("!order_probe:localhost")
+                    .is_some_and(|v| v.iter().any(|(_, e)| e["event_id"] == "$st1"));
+                flag.store(in_tl, std::sync::atomic::Ordering::SeqCst);
+            }),
+        ));
+        let applied = state
+            .apply_remote_state_event(crate::state::StateEvent {
+                event_type: "m.room.topic".to_string(),
+                state_key: String::new(),
+                sender: "@u:localhost".to_string(),
+                content: json!({"topic": "t"}),
+                event_id: "$st1".to_string(),
+                room_id: room_id.to_string(),
+                origin_server_ts: 5,
+            })
+            .expect("apply");
+        assert!(applied, "event must win LWW on an empty room");
+        assert!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            "journal line was written before the event reached the timeline"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
 }
 
     // doc_markers_balanced:start
