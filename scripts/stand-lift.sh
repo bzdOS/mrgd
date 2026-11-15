@@ -1,6 +1,8 @@
 #!/bin/sh
 # ПОДЪЁМ СТЕНДА matrix-hs — воспроизводимая запись и идемпотентный запуск.
 #
+# Gates are a guard against operator mistakes, not against a malicious owner of the env file.
+#
 # СКРИПТ ЗАМЕНЯЕТ ИНЛАЙН-КОМАНДУ, которой стенд поднимали вручную: файла
 # запуска не осталось (состав старта жил только в памяти оператора), а
 # перезапуски гостя повторяются, поэтому подъём должен быть одной командой и
@@ -79,46 +81,120 @@ set +a
 LISTEN_HOST=${MATRIX_HS_LISTEN%:*}
 LISTEN_PORT=${MATRIX_HS_LISTEN##*:}
 
-case "$LISTEN_HOST" in
-	0.0.0.0|'[::]'|'[::]') echo "stand-lift: MATRIX_HS_LISTEN='$MATRIX_HS_LISTEN' — наружу слушать нельзя." >&2; exit 1 ;;
-esac
+# Wildcard test: empty, '*', or only the characters [ ] : . 0 (0, 0.0.0.0, ::,
+# [::], [0:0:0:0:0:0:0:0], ...).
+is_wild() {
+	[ "$1" = '*' ] && return 0
+	[ -z "$(printf '%s' "$1" | tr -d '[]:.0')" ]
+}
+hostnorm() { printf '%s' "$1" | tr -d '[]' | tr '[:upper:]' '[:lower:]'; }
 
-# ── Гейт 5: Zenoh must not be plaintext tcp/ on a public interface ─────────
-# Fleet rule (.env.example): "never plaintext Zenoh on a public interface."
-# A tcp/ endpoint on 0.0.0.0, a public IP, or a hostname is a bug — refuse
-# the lift so the process never starts that way. Only tcp/ on loopback
-# (127.0.0.1, ::1, localhost) or an obfs/tls carrier is accepted.
-# ZENOH_* are OPTIONAL: under `set -u` a bare "$VAR" aborts the lift with
-# "parameter not set" when the env file omits them, hence ${VAR:-} throughout.
-for _zen in "${MATRIX_HS_ZENOH_LISTEN:-}" "${MATRIX_HS_ZENOH_CONNECT:-}"; do
-	[ -z "$_zen" ] && continue
-	for _ep in $(echo "$_zen" | tr ',' ' '); do
-		case "$_ep" in
-			tcp/127.0.0.1:*|tcp/localhost:*|tcp/\[::1]:*|tcp/::1:*) ;;
-			tcp/*)
-				_h=${_ep#tcp/}
-				_h=${_h%%:*}
-				echo "stand-lift: plaintext tcp/ Zenoh on address '$_h' — forbidden; use obfs/ or TLS." >&2
-				exit 1
-				;;
+# MATRIX_HS_LISTEN gate: a wildcard host (with or without :port) and any host
+# in STAND_FORBIDDEN_LISTEN_HOSTS (space- or ':'-separated, a [v6] entry is
+# kept whole; env file or environment; nothing is hardcoded, default empty).
+listen_gate() {
+	case "$1" in
+		'['*']'*) _lh="${1%%]*}]" ;;
+		*:*:*)    _lh=$1 ;; # bare v6 (or v6 + :port): wildcard checked both ways
+		*:*)      _lh=${1%:*} ;;
+		*)        _lh=$1 ;;
+	esac
+	if is_wild "$_lh" || { case "$1" in
+		[!\[]*:*:*) is_wild "${1%:*}" ;;
+		*) false ;;
+		esac; }; then
+		echo "stand-lift: MATRIX_HS_LISTEN='$1' — наружу слушать нельзя." >&2
+		return 1
+	fi
+	_lhn=$(hostnorm "$_lh")
+	_ftok=
+	set -f
+	for _f in $(printf '%s' "${STAND_FORBIDDEN_LISTEN_HOSTS:-}" | tr -s '[:space:]' ' '); do
+		case "$_f" in
+			*'['*) _ftok="$_ftok$_f
+" ;;
+			*)     _ftok="$_ftok$(printf '%s' "$_f" | tr ':' '\n')
+" ;;
 		esac
 	done
-done
-unset _zen _ep _h
+	set +f
+	while IFS= read -r _f; do
+		[ -n "$_f" ] || continue
+		if [ "$_lhn" = "$(hostnorm "$_f")" ]; then
+			echo "stand-lift: MATRIX_HS_LISTEN='$1' — host '$_lh' is in STAND_FORBIDDEN_LISTEN_HOSTS." >&2
+			return 1
+		fi
+	done <<-EOF
+	$_ftok
+	EOF
+	return 0
+}
+listen_gate "$MATRIX_HS_LISTEN" || exit 1
 
-# Wildcard listen, ANY protocol (tcp/udp/tls/obfs...): 0.0.0.0 and [::] open the
-# node on every interface, obfs or not — a public host must name its interface.
-for _ep in $(echo "${MATRIX_HS_ZENOH_LISTEN:-}" | tr ',' ' '); do
-	_a=${_ep#*/}
-	_a=${_a%%#*}
-	case "$_a" in
-		0.0.0.0|0.0.0.0:*|'[::]'|'[::]:'*|'[0:0:0:0:0:0:0:0]'|'[0:0:0:0:0:0:0:0]:'*|::|::0)
-			echo "stand-lift: MATRIX_HS_ZENOH_LISTEN endpoint '$_ep' listens on all interfaces — forbidden; name a loopback/private address." >&2
-			exit 1
-			;;
-	esac
-done
-unset _ep _a
+# ── Гейт 5: Zenoh endpoints — ALLOW-LIST, not a block-list ─────────────────
+# Fleet rule (.env.example): "never plaintext Zenoh on a public interface."
+# MATRIX_HS_ZENOH_LISTEN and _CONNECT, per comma-separated element, allow ONLY:
+#   obfs/<host>:<port>[#...], tls/..., quic/...  — a named host (a wildcard
+#                                                  host is refused in LISTEN);
+#   tcp/ on loopback only (127.0.0.1, [::1], localhost).
+# Everything else is refused with the endpoint named: udp/, ws/,
+# unixsock-stream/, serial/, vsock/, an unknown scheme, an empty element,
+# a malformed host:port. Same rules as rc.d/mrgd_node (deploy/bsdos).
+# ZENOH_* are OPTIONAL: under `set -u` a bare "$VAR" aborts the lift with
+# "parameter not set" when the env file omits them, hence ${VAR:-} throughout.
+zenoh_gate() { # $1 variable name, $2 listen|connect, $3 comma-separated value
+	_zrest=$3
+	while :; do
+		_ep=${_zrest%%,*}
+		_ep=$(printf '%s' "$_ep" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+		if [ -z "$_ep" ]; then
+			echo "stand-lift: $1 has an empty endpoint element in '$3' — refusing." >&2
+			return 1
+		fi
+		case "$_ep" in
+			*/*) ;;
+			*) echo "stand-lift: $1 endpoint '$_ep' is not allowed (obfs/ tls/ quic/ with a host, tcp/ on loopback only)." >&2
+			   return 1 ;;
+		esac
+		_za=${_ep#*/}
+		_za=${_za%%#*}
+		case "${_ep%%/*}" in
+			obfs|tls|quic)
+				_zbad=0
+				case "$_za" in
+					'['*']:'?*) _zh="${_za%%]*}]" ;;
+					*:?*)
+						_zh=${_za%:*}
+						case "$_za" in *:*:*|'['*) _zbad=1; _zh=$_za ;; esac ;;
+					*) _zbad=1; _zh=$_za ;;
+				esac
+				if [ "$2" = listen ] && is_wild "$_zh"; then
+					echo "stand-lift: $1 endpoint '$_ep' listens on all interfaces — forbidden; name a loopback/private address." >&2
+					return 1
+				fi
+				if [ "$_zbad" = 1 ] || [ -z "$_zh" ]; then
+					echo "stand-lift: $1 endpoint '$_ep' is not allowed (needs <host>:<port>)." >&2
+					return 1
+				fi ;;
+			tcp)
+				case "$_za" in
+					127.0.0.1:?*|localhost:?*|'[::1]:'?*) ;;
+					*) echo "stand-lift: plaintext tcp/ Zenoh in $1 endpoint '$_ep' — forbidden except on loopback; use obfs/, tls/ or quic/." >&2
+					   return 1 ;;
+				esac ;;
+			*)
+				echo "stand-lift: $1 endpoint '$_ep' is not allowed (obfs/ tls/ quic/ with a host, tcp/ on loopback only)." >&2
+				return 1 ;;
+		esac
+		case "$_zrest" in
+			*,*) _zrest=${_zrest#*,} ;;
+			*) break ;;
+		esac
+	done
+	return 0
+}
+[ -z "${MATRIX_HS_ZENOH_LISTEN:-}" ] || zenoh_gate MATRIX_HS_ZENOH_LISTEN listen "$MATRIX_HS_ZENOH_LISTEN" || exit 1
+[ -z "${MATRIX_HS_ZENOH_CONNECT:-}" ] || zenoh_gate MATRIX_HS_ZENOH_CONNECT connect "$MATRIX_HS_ZENOH_CONNECT" || exit 1
 
 # Peer mode with CONNECT but no explicit LISTEN: zenoh peers open a
 # listener on all interfaces by default (tcp/[::]:0, zenoh-config defaults.rs). Refuse before

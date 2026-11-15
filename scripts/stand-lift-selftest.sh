@@ -22,7 +22,16 @@
 # «Живой» в этих случаях — tmp-каталог из STAND_LIVE_HUB_PATHS.
 #   f  ZENOH_CONNECT без LISTEN, peer  -> отказ гейта 5 (неявный wildcard), rc=1
 #   g  ZENOH_LISTEN=obfs/0.0.0.0:...   -> отказ гейта 5 (wildcard, любой протокол)
-#   h  ZENOH_LISTEN=udp/[::]:...       -> то же
+#   h  ZENOH_LISTEN=udp/[::]:...       -> отказ гейта 5 (udp/ не в белом списке)
+#   Гейт 5 — белый список (LISTEN и CONNECT, поэлементно): obfs/ tls/ quic/ с
+#   именованным хостом и tcp/ только на loopback; прочее — отказ с названием
+#   эндпоинта:
+#   z1 udp/  z2 ws/  z3 unixsock-stream/  z4 serial/  z5 vsock/  z6 неизвестная
+#   схема  z7 пустой элемент  z8 tcp/ не на loopback  z9 то же в CONNECT
+#   y1..y3 tls/ quic/ obfs/ на 127.0.0.1 -> гейт 5 пройден (дальше на
+#   некластерном бинаре — отказ гейта 4; на кластерном SKIP)
+#   w1..w5 MATRIX_HS_LISTEN: '*', '::', '[::]:p', '0:p', хост из
+#   STAND_FORBIDDEN_LISTEN_HOSTS -> отказ; w6 то же значение без запрета -> поднят
 #   i  ZENOH_SCOUTING=on, кластерный бинарь -> отказ гейта 4b (на некластерном SKIP)
 # f/g/h — отказ ДО запуска бинаря: ни pid-файла, ни слушателя на порту.
 # Случай d пропускается (SKIP), если бинарь кластерный.
@@ -210,8 +219,72 @@ write_env "MATRIX_HS_ZENOH_LISTEN=obfs/0.0.0.0:7999#obfs_psk_base64=AAECAw=="
 run g 1 'listens on all interfaces'
 refused_before_start
 write_env "MATRIX_HS_ZENOH_LISTEN=udp/[::]:7999"
-run h 1 'listens on all interfaces'
+run h 1 "not allowed"
 refused_before_start
+
+# Белый список Zenoh: отказ ДО запуска, эндпоинт назван в сообщении.
+write_env "MATRIX_HS_ZENOH_LISTEN=udp/127.0.0.1:7999"
+run z1 1 "'udp/127.0.0.1:7999'"
+refused_before_start
+write_env "MATRIX_HS_ZENOH_LISTEN=ws/127.0.0.1:7999"
+run z2 1 "'ws/127.0.0.1:7999'"
+refused_before_start
+write_env "MATRIX_HS_ZENOH_LISTEN=unixsock-stream//tmp/z.sock"
+run z3 1 "'unixsock-stream//tmp/z.sock'"
+refused_before_start
+write_env "MATRIX_HS_ZENOH_LISTEN=serial//dev/ttyS0#baudrate=9600"
+run z4 1 "'serial//dev/ttyS0#baudrate=9600'"
+refused_before_start
+write_env "MATRIX_HS_ZENOH_CONNECT=vsock/2:7999"
+run z5 1 "'vsock/2:7999'"
+refused_before_start
+write_env "MATRIX_HS_ZENOH_LISTEN=pigeon/127.0.0.1:7999"
+run z6 1 "'pigeon/127.0.0.1:7999'"
+refused_before_start
+write_env "MATRIX_HS_ZENOH_LISTEN=obfs/127.0.0.1:7999,,tls/127.0.0.1:7998"
+run z7 1 "empty endpoint element"
+refused_before_start
+write_env "MATRIX_HS_ZENOH_LISTEN=tcp/127.0.0.1:7999,tcp/203.0.113.9:7999"
+run z8 1 "'tcp/203.0.113.9:7999'"
+refused_before_start
+write_env "MATRIX_HS_ZENOH_LISTEN=obfs/127.0.0.1:7999
+MATRIX_HS_ZENOH_CONNECT=tcp/203.0.113.9:7998"
+run z9 1 "'tcp/203.0.113.9:7998'"
+refused_before_start
+
+# Разрешённые схемы: гейт 5 пропускает. На некластерном бинаре следом отказ
+# гейта 4 (значит, до него дошли); кластерный бинарь поднялся бы — SKIP.
+if strings -a "$H/bin/matrix-hs" | grep -q 'cluster mode: connect='; then
+	echo "(y1-y3) SKIP: бинарь кластерный, дальше гейта 5 пошёл бы запуск"
+else
+	for _sch in tls quic obfs; do
+		write_env "MATRIX_HS_ZENOH_LISTEN=$_sch/127.0.0.1:7999"
+		run "y-$_sch" 1 'нет кластерного слоя'
+		refused_before_start
+	done
+fi
+
+# MATRIX_HS_LISTEN: wildcard-формы и запрещённые хосты (последняя строка env
+# побеждает при source, поэтому переопределение идёт в конце).
+write_env "MATRIX_HS_LISTEN=*:$PORT"
+run w1 1 "наружу слушать нельзя"
+refused_before_start
+write_env "MATRIX_HS_LISTEN=::"
+run w2 1 "наружу слушать нельзя"
+refused_before_start
+write_env "MATRIX_HS_LISTEN=[::]:$PORT"
+run w3 1 "наружу слушать нельзя"
+refused_before_start
+write_env "MATRIX_HS_LISTEN=0:$PORT"
+run w4 1 "наружу слушать нельзя"
+refused_before_start
+write_env "STAND_FORBIDDEN_LISTEN_HOSTS=\"203.0.113.9 127.0.0.1\"
+MATRIX_HS_LISTEN=127.0.0.1:$PORT"
+run w5 1 "STAND_FORBIDDEN_LISTEN_HOSTS"
+refused_before_start
+write_env "STAND_FORBIDDEN_LISTEN_HOSTS=203.0.113.9:192.0.2.9"
+run w6 0 'ПОДНЯТ'
+_pid=$(cat "$PIDFILE"); kill "$_pid" 2>/dev/null || :; sleep 1; rm -f "$PIDFILE"
 
 # Базовый env несёт SCOUTING=off, чтобы самотест сам ничего не биндил вне
 # loopback; последняя строка env побеждает при source, поэтому on идёт после.
