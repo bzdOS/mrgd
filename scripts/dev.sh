@@ -10,7 +10,8 @@
 # VARIABLES: CARGO_TARGET_DIR  build/test output dir (default: a dir under the
 #                              cargo-target root, see DEV_TARGET_ROOT)
 #            DEV_TARGET_ROOT   root of per-track cargo target dirs
-#            DEV_LOG_DIR       where per-command logs go (default: under TMPDIR)
+#            DEV_LOG_DIR       where per-command logs go (default: outbox/dev-logs
+#                              in the repo; override via env, e.g. a tmp dir)
 #            DEV_BASE_REF      ref the privacy diff is taken against (default main)
 #            DEV_JOBS          cargo -j value for build (default 6)
 #            DEV_PRIVGATE_ALLOW  regex of known pre-existing checker findings
@@ -35,12 +36,14 @@ export CARGO_TARGET_DIR
 # No downloads, ever: the vendored/locked tree must build from what is present.
 CARGO_NET_OFFLINE="${CARGO_NET_OFFLINE:-true}"
 export CARGO_NET_OFFLINE
-DEV_LOG_DIR="${DEV_LOG_DIR:-${TMPDIR:-/tmp}/track-dev-logs}"
 DEV_BASE_REF="${DEV_BASE_REF:-main}"
 DEV_JOBS="${DEV_JOBS:-6}"
 
 REPO="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 cd "$REPO" || exit 2
+# Default log dir lives in the repo (outbox/dev-logs) so long/background runs
+# survive ephemeral tmp cleanup across turns; DEV_LOG_DIR env still overrides.
+DEV_LOG_DIR="${DEV_LOG_DIR:-$REPO/outbox/dev-logs}"
 mkdir -p "$DEV_LOG_DIR"
 
 # cmd_build:start
